@@ -1,5 +1,7 @@
 # Qwen3-TTS Finetune Studio
 
+> **Warning:** This project is under active development and currently in an experimental/testing phase. APIs, CLI interfaces, and default behaviors may change without notice. Use at your own risk.
+
 A unified fine-tuning and operations toolkit for **Qwen3-TTS**, built on top of the official [`QwenLM/Qwen3-TTS` finetuning scripts](https://github.com/QwenLM/Qwen3-TTS). It provides a Gradio-based web UI and a CLI for the full lifecycle: data curation, quality validation, training orchestration, inference, and checkpoint export.
 
 > **Note:** Only **single-speaker fine-tuning** is supported per the official specification.
@@ -282,7 +284,7 @@ python3 qwen_finetune_cli.py infer \
 # Post-generation review (ASR + speaker cosine + speed profile)
 python3 qwen_finetune_cli.py review-generation \
   --generated-wav /path/to/output.wav \
-  --target-text "안녕하세요. 오늘 시장 이야기를 간단하게 말씀드리겠습니다." \
+  --target-text "Good morning. Let me give you a brief market update for today." \
   --reference-audio /path/to/ref.wav \
   --profile-raw-jsonl /path/to/train_raw.jsonl \
   --base-speaker-model /path/to/Qwen3-TTS-12Hz-0.6B-Base \
