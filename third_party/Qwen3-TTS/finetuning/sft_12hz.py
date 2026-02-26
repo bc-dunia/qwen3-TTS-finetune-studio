@@ -23,6 +23,7 @@ import torch
 from accelerate import Accelerator
 from dataset import TTSDataset
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+from safetensors import safe_open
 from safetensors.torch import save_file
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
@@ -72,6 +73,9 @@ def train():
     parser.add_argument("--save_every_n_epochs", type=int, default=1)
     parser.add_argument("--max_steps", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--speaker_encoder_model_path", type=str, default="",
+                        help="Separate model path to load speaker_encoder from, "
+                             "when init_model_path lacks one (e.g. CustomVoice models).")
     args = parser.parse_args()
 
     if args.gradient_accumulation_steps <= 0:
@@ -133,6 +137,38 @@ def train():
         weight_decay=float(args.weight_decay),
     )
 
+    # ------------------------------------------------------------------
+    # Resolve speaker_encoder: if the main model lacks one (e.g. CustomVoice),
+    # optionally load it from a separate Base model.
+    # ------------------------------------------------------------------
+    _speaker_encoder_fn = getattr(qwen3tts.model, "speaker_encoder", None)
+    _se_aux_model = None  # keep alive while needed
+    if _speaker_encoder_fn is None or not callable(_speaker_encoder_fn):
+        se_path = (args.speaker_encoder_model_path or "").strip()
+        if not se_path:
+            # Auto-detect: swap CustomVoice → Base variant for speaker_encoder
+            se_path = init_model_raw.replace("-CustomVoice", "-Base")
+            if se_path == init_model_raw:
+                raise RuntimeError(
+                    "Model has no speaker_encoder and --speaker_encoder_model_path was not provided."
+                )
+            accelerator.print(f"[INFO] Auto-loading speaker_encoder from: {se_path}")
+        se_model_path = Path(se_path).expanduser()
+        if se_model_path.exists():
+            se_resolved = str(se_model_path.resolve())
+        else:
+            from huggingface_hub import snapshot_download
+            try:
+                se_resolved = snapshot_download(repo_id=se_path)
+            except Exception:
+                se_resolved = snapshot_download(repo_id=se_path, token=False)
+        _se_aux_model = Qwen3TTSModel.from_pretrained(se_resolved, torch_dtype=torch_dtype)
+        _speaker_encoder_fn = _se_aux_model.model.speaker_encoder
+        if _speaker_encoder_fn is None or not callable(_speaker_encoder_fn):
+            raise RuntimeError(f"speaker_encoder still None after loading {se_resolved}")
+        accelerator.print("[INFO] speaker_encoder loaded from auxiliary model.")
+    # ------------------------------------------------------------------
+
     model, optimizer, train_dataloader = accelerator.prepare(
         qwen3tts.model, optimizer, train_dataloader
     )
@@ -156,7 +192,21 @@ def train():
                 codec_0_labels = batch['codec_0_labels']
                 codec_mask = batch['codec_mask']
 
-                speaker_embedding = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype)).detach()
+                # Use the resolved speaker_encoder (may be from aux model).
+                # If the encoder lives on a different device, move input to it,
+                # then move the result back to the training device.
+                _train_device = next(iter(model.parameters())).device
+                _train_dtype = next(iter(model.parameters())).dtype
+                try:
+                    _se_param = next(_speaker_encoder_fn.parameters())
+                    _se_device = _se_param.device
+                    _se_dtype = _se_param.dtype
+                except StopIteration:
+                    _se_device = _train_device
+                    _se_dtype = _train_dtype
+                speaker_embedding = _speaker_encoder_fn(
+                    ref_mels.to(_se_device).to(_se_dtype)
+                ).detach().to(_train_device).to(_train_dtype)
                 if target_speaker_embedding is None:
                     target_speaker_embedding = speaker_embedding
 
@@ -259,7 +309,33 @@ def train():
             weight = state_dict['talker.model.codec_embedding.weight']
             state_dict['talker.model.codec_embedding.weight'][int(args.speaker_id)] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
             save_path = os.path.join(output_dir, "model.safetensors")
-            save_file(state_dict, save_path)
+            fallback_path = os.path.join(output_dir, "pytorch_model.bin")
+            saved_with_safetensors = False
+            try:
+                save_file(state_dict, save_path)
+                # Guard against partial/corrupt safetensors files (e.g. interrupted writes).
+                with safe_open(save_path, framework="pt") as f:
+                    _ = f.keys()
+                saved_with_safetensors = True
+            except Exception as e:
+                accelerator.print(
+                    f"[WARN] Failed to save `{save_path}` via safetensors: {e}. "
+                    f"Falling back to `{fallback_path}`."
+                )
+                try:
+                    if os.path.exists(save_path):
+                        os.remove(save_path)
+                except Exception:
+                    pass
+
+            if not saved_with_safetensors:
+                torch.save(state_dict, fallback_path)
+
+            if not os.path.exists(save_path) and not os.path.exists(fallback_path):
+                raise RuntimeError(
+                    "Checkpoint weights were not written. Expected one of: "
+                    f"`{save_path}` or `{fallback_path}`."
+                )
 
         if max_steps > 0 and global_step >= max_steps:
             break

@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import importlib.util
 import math
+import re
 import shutil
+import statistics
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -1105,6 +1107,310 @@ def save_quality_report(report: dict[str, Any], output_path: str | Path) -> str:
 
 
 def save_preflight_report(report: dict[str, Any], output_path: str | Path) -> str:
+    out = Path(output_path).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    return str(out)
+
+
+def _normalize_text_for_compare(text: str) -> str:
+    return re.sub(r"[^0-9a-zA-Z가-힣]+", "", (text or "").lower())
+
+
+def _levenshtein_ratio(a: str, b: str) -> float:
+    if a == b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    n = len(b)
+    prev = list(range(n + 1))
+    for i, ca in enumerate(a, start=1):
+        curr = [i] + [0] * n
+        for j, cb in enumerate(b, start=1):
+            cost = 0 if ca == cb else 1
+            curr[j] = min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
+        prev = curr
+    dist = prev[n]
+    return 1.0 - (dist / max(len(a), len(b), 1))
+
+
+def _safe_transcribe_whisper(audio_path: Path, model_name: str = "base") -> tuple[str | None, str | None]:
+    try:
+        from faster_whisper import WhisperModel
+    except Exception as e:
+        return None, f"faster-whisper unavailable: {e}"
+
+    try:
+        model = WhisperModel(model_name, device="cpu", compute_type="int8")
+        segments, _ = model.transcribe(
+            str(audio_path),
+            language="ko",
+            beam_size=3,
+            vad_filter=True,
+            condition_on_previous_text=False,
+        )
+        text = "".join(seg.text for seg in segments).strip()
+        return text, None
+    except Exception as e:
+        return None, f"whisper transcription failed: {e}"
+
+
+def _safe_profile_target_duration(
+    profile_raw_jsonl: str | Path, target_text: str, max_items: int = 200
+) -> tuple[float | None, dict[str, Any]]:
+    try:
+        rows = load_raw_jsonl(profile_raw_jsonl)
+    except Exception as e:
+        return None, {"error": f"failed to load profile jsonl: {e}"}
+
+    sampled = _sample_rows(rows, max_items=max_items)
+    cps_values: list[float] = []
+    for row in sampled:
+        text = str(row.get("text", "")).strip()
+        audio = Path(str(row.get("audio", ""))).expanduser()
+        if not text or not audio.exists():
+            continue
+        _, dur = _safe_audio_info(audio)
+        n_chars = len(_normalize_text_for_compare(text))
+        if dur <= 0.4 or n_chars < 4:
+            continue
+        cps_values.append(float(n_chars / dur))
+
+    if not cps_values:
+        return None, {"error": "no valid rows for speaking-rate profile"}
+
+    cps_med = float(statistics.median(cps_values))
+    target_chars = len(_normalize_text_for_compare(target_text))
+    target_duration = float(target_chars / max(cps_med, 1e-6))
+    return target_duration, {
+        "sampled_rows": len(sampled),
+        "valid_rows": len(cps_values),
+        "median_chars_per_sec": cps_med,
+        "target_chars": target_chars,
+    }
+
+
+def _safe_speaker_cosine(
+    generated_audio_path: Path,
+    reference_audio_path: Path,
+    base_speaker_model: str,
+) -> tuple[float | None, str | None]:
+    try:
+        import librosa
+        import torch
+        from qwen_tts import Qwen3TTSModel
+    except Exception as e:
+        return None, f"speaker cosine dependencies unavailable: {e}"
+
+    def _resolve_local_base_model_path(raw: str) -> str:
+        val = (raw or "").strip()
+        if not val:
+            return val
+        p = Path(val).expanduser()
+        if p.exists():
+            return str(p.resolve())
+        # Prefer locally cached 0.6B base snapshot in offline environments.
+        if val == "Qwen/Qwen3-TTS-12Hz-0.6B-Base":
+            root = (
+                Path.home()
+                / ".cache"
+                / "huggingface"
+                / "hub"
+                / "models--Qwen--Qwen3-TTS-12Hz-0.6B-Base"
+                / "snapshots"
+            )
+            if root.exists():
+                snaps = sorted([d for d in root.iterdir() if d.is_dir()], key=lambda x: x.name)
+                if snaps:
+                    return str(snaps[-1].resolve())
+        return val
+
+    try:
+        resolved_model = _resolve_local_base_model_path(base_speaker_model)
+        model = Qwen3TTSModel.from_pretrained(resolved_model, device_map="cpu", dtype=torch.float32)
+        gen_wav, _ = librosa.load(str(generated_audio_path), sr=24000, mono=True)
+        ref_wav, _ = librosa.load(str(reference_audio_path), sr=24000, mono=True)
+        gen_emb = model.model.extract_speaker_embedding(gen_wav.astype(np.float32), 24000).float().cpu().numpy()
+        ref_emb = model.model.extract_speaker_embedding(ref_wav.astype(np.float32), 24000).float().cpu().numpy()
+        den = (float(np.linalg.norm(gen_emb)) * float(np.linalg.norm(ref_emb))) + 1e-12
+        val = float(np.dot(gen_emb, ref_emb) / den)
+        return val, None
+    except Exception as e:
+        return None, f"speaker cosine failed: {e}"
+
+
+def run_generation_review(
+    *,
+    generated_audio_path: str | Path,
+    target_text: str,
+    reference_audio_path: str | Path = "",
+    profile_raw_jsonl: str | Path = "",
+    base_speaker_model: str = "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+    whisper_model: str = "base",
+) -> dict[str, Any]:
+    audio_path = Path(generated_audio_path).expanduser().resolve()
+    if not audio_path.exists():
+        raise FileNotFoundError(f"Generated audio not found: {audio_path}")
+    if not str(target_text).strip():
+        raise ValueError("target_text is required.")
+
+    sr, duration = _safe_audio_info(audio_path)
+
+    asr_text, asr_err = _safe_transcribe_whisper(audio_path, model_name=whisper_model)
+    if asr_text is None:
+        asr_sim = None
+    else:
+        asr_sim = float(
+            _levenshtein_ratio(
+                _normalize_text_for_compare(target_text),
+                _normalize_text_for_compare(asr_text),
+            )
+        )
+
+    speaker_cos = None
+    speaker_err = None
+    ref_path = Path(str(reference_audio_path)).expanduser() if str(reference_audio_path).strip() else None
+    if ref_path and ref_path.exists():
+        speaker_cos, speaker_err = _safe_speaker_cosine(
+            generated_audio_path=audio_path,
+            reference_audio_path=ref_path,
+            base_speaker_model=base_speaker_model,
+        )
+
+    target_duration = None
+    profile_info: dict[str, Any] = {}
+    if str(profile_raw_jsonl).strip():
+        target_duration, profile_info = _safe_profile_target_duration(
+            profile_raw_jsonl=profile_raw_jsonl,
+            target_text=target_text,
+        )
+    speed_ratio = float(duration / target_duration) if target_duration and target_duration > 0 else None
+
+    checks: list[dict[str, Any]] = []
+    if asr_sim is None:
+        checks.append({"name": "asr_similarity", "status": "unknown", "value": None, "target": ">=0.98"})
+    elif asr_sim >= 0.98:
+        checks.append({"name": "asr_similarity", "status": "pass", "value": asr_sim, "target": ">=0.98"})
+    elif asr_sim >= 0.90:
+        checks.append({"name": "asr_similarity", "status": "warn", "value": asr_sim, "target": ">=0.98"})
+    else:
+        checks.append({"name": "asr_similarity", "status": "fail", "value": asr_sim, "target": ">=0.98"})
+
+    if speaker_cos is None:
+        checks.append({"name": "speaker_cosine", "status": "unknown", "value": None, "target": ">=0.982"})
+    elif speaker_cos >= 0.982:
+        checks.append({"name": "speaker_cosine", "status": "pass", "value": speaker_cos, "target": ">=0.982"})
+    elif speaker_cos >= 0.970:
+        checks.append({"name": "speaker_cosine", "status": "warn", "value": speaker_cos, "target": ">=0.982"})
+    else:
+        checks.append({"name": "speaker_cosine", "status": "fail", "value": speaker_cos, "target": ">=0.982"})
+
+    if speed_ratio is None:
+        checks.append({"name": "speed_ratio", "status": "unknown", "value": None, "target": "0.90~1.15"})
+    elif 0.90 <= speed_ratio <= 1.15:
+        checks.append({"name": "speed_ratio", "status": "pass", "value": speed_ratio, "target": "0.90~1.15"})
+    elif 0.80 <= speed_ratio <= 1.30:
+        checks.append({"name": "speed_ratio", "status": "warn", "value": speed_ratio, "target": "0.90~1.15"})
+    else:
+        checks.append({"name": "speed_ratio", "status": "fail", "value": speed_ratio, "target": "0.90~1.15"})
+
+    has_fail = any(c["status"] == "fail" for c in checks)
+    has_warn = any(c["status"] == "warn" for c in checks)
+    if has_fail:
+        decision = "fail"
+    elif has_warn:
+        decision = "warn"
+    else:
+        decision = "pass"
+
+    recommendations: list[str] = []
+    if speed_ratio is not None and speed_ratio > 1.15:
+        recommendations.append(
+            "Speech is slower than profile target. Prefer punctuation-light text and run seed sweep; if needed, apply mild tempo-up postprocess."
+        )
+    if speed_ratio is not None and speed_ratio < 0.90:
+        recommendations.append(
+            "Speech is faster than profile target. Add short pauses via punctuation or reduce tempo in postprocess."
+        )
+    if asr_sim is not None and asr_sim < 0.98:
+        recommendations.append(
+            "ASR similarity is low. Re-run with lower sampling randomness and verify punctuation/token limits."
+        )
+    if speaker_cos is not None and speaker_cos < 0.982:
+        recommendations.append(
+            "Speaker cosine is below target. Re-run speaker-embedding selection and multi-seed sampling."
+        )
+    if not recommendations:
+        recommendations.append("Quality is within target range for current checks.")
+
+    return {
+        "decision": decision,
+        "input": {
+            "generated_audio_path": str(audio_path),
+            "reference_audio_path": str(ref_path) if ref_path else "",
+            "profile_raw_jsonl": str(profile_raw_jsonl) if str(profile_raw_jsonl).strip() else "",
+            "base_speaker_model": base_speaker_model,
+            "whisper_model": whisper_model,
+        },
+        "metrics": {
+            "sample_rate": sr,
+            "duration_sec": duration,
+            "target_duration_sec": target_duration,
+            "speed_ratio": speed_ratio,
+            "speaker_cosine": speaker_cos,
+            "asr_similarity": asr_sim,
+            "asr_text": asr_text,
+        },
+        "checks": checks,
+        "recommendations": recommendations,
+        "diagnostics": {
+            "profile_info": profile_info,
+            "asr_error": asr_err,
+            "speaker_error": speaker_err,
+        },
+    }
+
+
+def format_generation_review(report: dict[str, Any]) -> str:
+    decision = str(report.get("decision", "unknown")).upper()
+    metrics = report.get("metrics", {})
+    checks = report.get("checks", [])
+    recs = report.get("recommendations", [])
+
+    lines = [
+        f"## Generation Review: `{decision}`",
+        "",
+        "### Metrics",
+        f"- duration(sec): `{metrics.get('duration_sec', 'n/a')}`",
+        f"- target duration(sec): `{metrics.get('target_duration_sec', 'n/a')}`",
+        f"- speed ratio: `{metrics.get('speed_ratio', 'n/a')}`",
+        f"- speaker cosine: `{metrics.get('speaker_cosine', 'n/a')}`",
+        f"- asr similarity: `{metrics.get('asr_similarity', 'n/a')}`",
+        f"- asr text: {metrics.get('asr_text', '')}",
+        "",
+        "### Checks",
+    ]
+    if not checks:
+        lines.append("- none")
+    else:
+        for item in checks:
+            lines.append(
+                f"- [{str(item.get('status', 'unknown')).upper()}] "
+                f"{item.get('name', 'check')}: `{item.get('value', 'n/a')}` "
+                f"(target `{item.get('target', 'n/a')}`)"
+            )
+
+    lines.append("")
+    lines.append("### Recommendations")
+    if not recs:
+        lines.append("- none")
+    else:
+        lines.extend([f"- {r}" for r in recs])
+    return "\n".join(lines)
+
+
+def save_generation_review(report: dict[str, Any], output_path: str | Path) -> str:
     out = Path(output_path).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", encoding="utf-8") as f:

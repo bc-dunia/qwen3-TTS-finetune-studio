@@ -14,7 +14,9 @@ from typing import Any, Generator
 
 from .paths import (
     THIRD_PARTY_FINETUNE_DIR,
+    checkpoint_epoch,
     ensure_unique_dir,
+    is_loadable_checkpoint_dir,
     list_checkpoint_paths,
     list_coded_jsonl_paths,
     list_run_paths,
@@ -566,18 +568,27 @@ def run_training(
         success = return_code == 0
 
         checkpoints = [
-            str(p.resolve())
+            p.resolve()
             for p in output_dir.glob("checkpoint-epoch-*")
             if p.is_dir()
         ]
-        checkpoints = sorted(checkpoints, key=lambda p: Path(p).stat().st_mtime)
-        last_checkpoint = checkpoints[-1] if checkpoints else ""
+        checkpoints = sorted(checkpoints, key=lambda p: (checkpoint_epoch(p), p.name))
+        loadable_checkpoints = [str(p) for p in checkpoints if is_loadable_checkpoint_dir(p)]
+        all_checkpoints = [str(p) for p in checkpoints]
+        last_checkpoint = loadable_checkpoints[-1] if loadable_checkpoints else ""
 
         stopped = return_code in {-15, 143, -9, 137}
-        if success:
+        if success and not loadable_checkpoints:
+            status = (
+                "Training process finished, but no loadable checkpoint was found "
+                "(missing `model.safetensors` / `pytorch_model*.bin`)."
+            )
+            final_status = "failed"
+            success = False
+        elif success:
             status = (
                 f"Training completed in {elapsed / 60:.1f} min. "
-                f"{len(checkpoints)} checkpoints saved."
+                f"{len(loadable_checkpoints)} loadable checkpoints saved."
             )
             final_status = "completed"
         elif stopped:
@@ -596,8 +607,11 @@ def run_training(
                 "last_step": current_step,
                 "last_loss": current_loss,
                 "progress": "100.0%" if success else progress,
-                "checkpoints": len(checkpoints),
+                "checkpoints": len(loadable_checkpoints),
+                "checkpoints_all_dirs": len(all_checkpoints),
                 "last_checkpoint": last_checkpoint,
+                "all_checkpoints": all_checkpoints,
+                "loadable_checkpoints": loadable_checkpoints,
                 "exit_code": return_code,
                 "process_pid": None,
                 "process_script": str((THIRD_PARTY_FINETUNE_DIR / "sft_12hz.py").resolve()),
@@ -614,7 +628,8 @@ def run_training(
             "done": True,
             "success": success,
             "stopped": stopped,
-            "checkpoints": checkpoints,
+            "checkpoints": loadable_checkpoints,
+            "all_checkpoints": all_checkpoints,
             "last_checkpoint": last_checkpoint,
             "run_choices": list_run_paths(),
             "checkpoint_choices": list_checkpoint_paths(),

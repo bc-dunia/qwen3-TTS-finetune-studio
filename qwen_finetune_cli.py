@@ -187,30 +187,92 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
 def cmd_infer(args: argparse.Namespace) -> int:
     from finetune_studio.inference_ops import synthesize_single
 
-    wav_path, status = synthesize_single(
-        checkpoint_path=args.checkpoint,
-        device=args.device,
-        speaker_name=args.speaker_name,
-        text=args.text,
-        params={
-            "temperature": args.temperature,
-            "top_k": args.top_k,
-            "top_p": args.top_p,
-            "repetition_penalty": args.repetition_penalty,
-            "max_new_tokens": args.max_new_tokens,
-            "subtalker_temperature": args.subtalker_temperature,
-            "subtalker_top_k": args.subtalker_top_k,
-            "subtalker_top_p": args.subtalker_top_p,
-        },
-        language=args.language,
-        instruct=args.instruct,
-    )
+    try:
+        wav_path, status = synthesize_single(
+            checkpoint_path=args.checkpoint,
+            device=args.device,
+            speaker_name=args.speaker_name,
+            text=args.text,
+            params={
+                "temperature": args.temperature,
+                "top_k": args.top_k,
+                "top_p": args.top_p,
+                "repetition_penalty": args.repetition_penalty,
+                "max_new_tokens": args.max_new_tokens,
+                "subtalker_temperature": args.subtalker_temperature,
+                "subtalker_top_k": args.subtalker_top_k,
+                "subtalker_top_p": args.subtalker_top_p,
+            },
+            language=args.language,
+            instruct=args.instruct,
+            seed=args.seed,
+        )
+    except Exception as e:
+        print(f"Inference failed: {e}", file=sys.stderr)
+        return 1
     print(status)
+    final_wav_path = str(wav_path)
     if args.output_path:
         target = Path(args.output_path).resolve()
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(str(wav_path), target)
         print(f"Copied output: {target}")
+        final_wav_path = str(target)
+
+    if bool(args.review_after_generation):
+        from finetune_studio.quality import (
+            format_generation_review,
+            run_generation_review,
+            save_generation_review,
+        )
+
+        report = run_generation_review(
+            generated_audio_path=final_wav_path,
+            target_text=args.text,
+            reference_audio_path=args.review_reference_audio,
+            profile_raw_jsonl=args.review_profile_raw_jsonl,
+            base_speaker_model=args.review_base_speaker_model,
+            whisper_model=args.review_whisper_model,
+        )
+        print("")
+        print(format_generation_review(report))
+        if args.review_output_report:
+            out = save_generation_review(report, args.review_output_report)
+            print(f"\nSaved generation review report: {out}")
+
+        decision = str(report.get("decision", "")).lower()
+        if decision == "fail":
+            return 2
+        if decision == "warn":
+            return 1
+    return 0
+
+
+def cmd_review_generation(args: argparse.Namespace) -> int:
+    from finetune_studio.quality import (
+        format_generation_review,
+        run_generation_review,
+        save_generation_review,
+    )
+
+    report = run_generation_review(
+        generated_audio_path=args.generated_wav,
+        target_text=args.target_text,
+        reference_audio_path=args.reference_audio,
+        profile_raw_jsonl=args.profile_raw_jsonl,
+        base_speaker_model=args.base_speaker_model,
+        whisper_model=args.whisper_model,
+    )
+    print(format_generation_review(report))
+    if args.output_report:
+        out = save_generation_review(report, args.output_report)
+        print(f"\nSaved generation review report: {out}")
+
+    decision = str(report.get("decision", "")).lower()
+    if decision == "fail":
+        return 2
+    if decision == "warn":
+        return 1
     return 0
 
 
@@ -312,14 +374,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--text", required=True)
     p.add_argument("--output-path", default="")
     p.add_argument("--temperature", type=float, default=0.9)
+    p.add_argument("--seed", type=int, default=42)
     p.add_argument("--top-k", type=int, default=50)
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--repetition-penalty", type=float, default=1.05)
-    p.add_argument("--max-new-tokens", type=int, default=2048)
+    p.add_argument("--max-new-tokens", type=int, default=512)
     p.add_argument("--subtalker-temperature", type=float, default=0.9)
     p.add_argument("--subtalker-top-k", type=int, default=50)
     p.add_argument("--subtalker-top-p", type=float, default=1.0)
+    p.add_argument(
+        "--review-after-generation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    p.add_argument("--review-reference-audio", default="")
+    p.add_argument("--review-profile-raw-jsonl", default="")
+    p.add_argument("--review-base-speaker-model", default="Qwen/Qwen3-TTS-12Hz-0.6B-Base")
+    p.add_argument("--review-whisper-model", default="base")
+    p.add_argument("--review-output-report", default="")
     p.set_defaults(func=cmd_infer)
+
+    p = sub.add_parser("review-generation", help="Run post-generation quality checks")
+    p.add_argument("--generated-wav", required=True)
+    p.add_argument("--target-text", required=True)
+    p.add_argument("--reference-audio", default="")
+    p.add_argument("--profile-raw-jsonl", default="")
+    p.add_argument("--base-speaker-model", default="Qwen/Qwen3-TTS-12Hz-0.6B-Base")
+    p.add_argument("--whisper-model", default="base")
+    p.add_argument("--output-report", default="")
+    p.set_defaults(func=cmd_review_generation)
 
     return parser
 

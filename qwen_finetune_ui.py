@@ -19,21 +19,32 @@ from finetune_studio.dataset_ops import (
     preview_table,
 )
 from finetune_studio.export_ops import package_checkpoint
-from finetune_studio.inference_ops import synthesize_batch, synthesize_single, unload_model
+from finetune_studio.inference_ops import (
+    synthesize_batch,
+    synthesize_single,
+    synthesize_voice_clone,
+    synthesize_voice_clone_batch,
+    unload_model,
+)
 from finetune_studio.pipeline_ops import run_full_pipeline
 from finetune_studio.paths import (
     EXPORTS_DIR,
     THIRD_PARTY_FINETUNE_DIR,
     WORKSPACE_ROOT,
+    is_loadable_checkpoint_dir,
     list_checkpoint_paths,
     list_coded_jsonl_paths,
     list_raw_jsonl_paths,
     list_run_paths,
+    sort_checkpoint_paths,
 )
 from finetune_studio.quality import (
+    format_generation_review,
     format_preflight_report,
     format_quality_report,
+    run_generation_review,
     run_preflight_review,
+    save_generation_review,
     save_preflight_report,
     save_quality_report,
     validate_preflight_gate,
@@ -61,11 +72,25 @@ INFER_DEFAULT_PARAMS: dict[str, Any] = {
     "top_k": 50,
     "top_p": 1.0,
     "repetition_penalty": 1.05,
+    "max_new_tokens": 512,
+    "subtalker_temperature": 0.9,
+    "subtalker_top_k": 50,
+    "subtalker_top_p": 1.0,
+}
+
+INFER_ICL_DEFAULT_PARAMS: dict[str, Any] = {
+    "temperature": 0.9,
+    "top_k": 50,
+    "top_p": 1.0,
+    "repetition_penalty": 1.05,
     "max_new_tokens": 2048,
     "subtalker_temperature": 0.9,
     "subtalker_top_k": 50,
     "subtalker_top_p": 1.0,
 }
+
+INFER_MODE_CHECKPOINT = "Fine-tuned Checkpoint"
+INFER_MODE_ICL = "ICL Voice Clone (No Training Needed)"
 
 INFER_PARAM_PRESETS: dict[str, dict[str, Any]] = {
     "fast": {
@@ -73,10 +98,21 @@ INFER_PARAM_PRESETS: dict[str, dict[str, Any]] = {
         "top_k": 30,
         "top_p": 0.9,
         "repetition_penalty": 1.0,
-        "max_new_tokens": 1024,
+        "max_new_tokens": 256,
         "subtalker_temperature": 0.7,
         "subtalker_top_k": 30,
         "subtalker_top_p": 0.9,
+    },
+    "similarity": {
+        # Conservative decoding profile to maximize speaker consistency.
+        "temperature": 0.45,
+        "top_k": 24,
+        "top_p": 0.88,
+        "repetition_penalty": 1.03,
+        "max_new_tokens": 384,
+        "subtalker_temperature": 0.55,
+        "subtalker_top_k": 24,
+        "subtalker_top_p": 0.88,
     },
     "balanced": dict(INFER_DEFAULT_PARAMS),
     "quality": {
@@ -84,7 +120,7 @@ INFER_PARAM_PRESETS: dict[str, dict[str, Any]] = {
         "top_k": 80,
         "top_p": 1.0,
         "repetition_penalty": 1.1,
-        "max_new_tokens": 4096,
+        "max_new_tokens": 1024,
         "subtalker_temperature": 1.0,
         "subtalker_top_k": 80,
         "subtalker_top_p": 1.0,
@@ -96,7 +132,7 @@ INFER_PARAM_TOOLTIPS: dict[str, str] = {
     "top_k": "Number of candidates for next token. Lower = stable, Higher = diverse. Recommended: 30-50",
     "top_p": "Probability-based token selection range. 1.0 = full range, lower = more certain. Recommended: 0.9-1.0",
     "repetition_penalty": "Prevents sound/word repetition. 1.0 = no penalty, higher = less repetition. Recommended: 1.0-1.1",
-    "max_new_tokens": "Upper limit on generation length. If you see truncated speech, increase this.",
+    "max_new_tokens": "Upper limit on generation length. Excessively high values can create long noisy tails; increase gradually only when speech is truncated.",
     "subtalker_temperature": "Voice rhythm/accent control. Default recommended, adjust if needed",
     "subtalker_top_k": "Intonation diversity control. Default recommended",
     "subtalker_top_p": "Intonation selection range. Default recommended",
@@ -452,6 +488,15 @@ def ui_infer_on_params_change(
     return _infer_save_indicator_html("Settings saved")
 
 
+def ui_infer_on_seed_change(seed: int) -> str:
+    try:
+        final_seed = int(seed)
+    except Exception:
+        final_seed = 42
+    _save_inference_cfg({"seed": final_seed})
+    return _infer_save_indicator_html("Seed saved")
+
+
 def ui_infer_apply_preset(
     preset_key: str,
 ) -> tuple[float, int, float, float, int, float, int, float, str]:
@@ -473,18 +518,79 @@ def ui_infer_apply_preset(
     )
 
 
+def ui_infer_on_mode_change(
+    infer_mode: str,
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    float,
+    int,
+    float,
+    float,
+    int,
+    float,
+    int,
+    float,
+    str,
+]:
+    mode = (infer_mode or "").strip() or INFER_MODE_CHECKPOINT
+    is_icl_mode = mode == INFER_MODE_ICL
+    patch: dict[str, Any] = {"generation_mode": mode}
+
+    if is_icl_mode:
+        patch["params"] = dict(INFER_ICL_DEFAULT_PARAMS)
+    _save_inference_cfg(patch)
+
+    params = INFER_ICL_DEFAULT_PARAMS if is_icl_mode else INFER_DEFAULT_PARAMS
+    status_text = "ICL defaults applied" if is_icl_mode else "Fine-tuned mode active"
+    return (
+        gr.update(visible=not is_icl_mode),
+        gr.update(visible=not is_icl_mode),
+        gr.update(visible=not is_icl_mode),
+        gr.update(visible=is_icl_mode),
+        float(params["temperature"]),
+        int(params["top_k"]),
+        float(params["top_p"]),
+        float(params["repetition_penalty"]),
+        int(params["max_new_tokens"]),
+        float(params["subtalker_temperature"]),
+        int(params["subtalker_top_k"]),
+        float(params["subtalker_top_p"]),
+        _infer_save_indicator_html(status_text),
+    )
+
+
 def ui_infer_on_checkpoint_change(
     checkpoint_path: str,
     current_speaker_name: str,
-) -> tuple[str, str]:
+    current_review_reference_audio: str,
+    current_review_profile_raw_jsonl: str,
+) -> tuple[str, str, str, str]:
     final_ckpt = (checkpoint_path or "").strip()
     speaker = (current_speaker_name or "").strip()
+    review_reference_audio = (current_review_reference_audio or "").strip()
+    review_profile_raw_jsonl = (current_review_profile_raw_jsonl or "").strip()
     if final_ckpt:
         try:
             run_dir = Path(final_ckpt).resolve().parent
             summary = read_run_summary(run_dir)
-            if isinstance(summary, dict) and str(summary.get("speaker_name", "")).strip():
+            if (
+                isinstance(summary, dict)
+                and str(summary.get("speaker_name", "")).strip()
+            ):
                 speaker = str(summary["speaker_name"]).strip()
+            if isinstance(summary, dict):
+                # Use run metadata to prefill review defaults when available.
+                summary_ref_audio = str(summary.get("ref_audio", "")).strip()
+                if summary_ref_audio:
+                    review_reference_audio = summary_ref_audio
+                train_jsonl = str(summary.get("train_jsonl", "")).strip()
+                if train_jsonl:
+                    raw_from_train = expected_raw_jsonl_for_train_jsonl(train_jsonl)
+                    if raw_from_train:
+                        review_profile_raw_jsonl = raw_from_train
         except Exception:
             pass
 
@@ -492,35 +598,103 @@ def ui_infer_on_checkpoint_change(
     if speaker:
         infer_patch["speaker_name"] = speaker
         save_ui_settings({"speaker_name": speaker})
+    infer_patch["review_reference_audio"] = review_reference_audio
+    infer_patch["review_profile_raw_jsonl"] = review_profile_raw_jsonl
     _save_inference_cfg(infer_patch)
-    return speaker, _infer_save_indicator_html("Checkpoint selected")
+    return (
+        speaker,
+        review_reference_audio,
+        review_profile_raw_jsonl,
+        _infer_save_indicator_html("Checkpoint selected"),
+    )
 
 
-def _refresh_raw_updates(selected: str | None = None) -> gr.Dropdown:
+def ui_infer_on_review_cfg_change(
+    review_after_generation: bool,
+    review_reference_audio: str,
+    review_profile_raw_jsonl: str,
+    review_base_speaker_model: str,
+    review_whisper_model: str,
+) -> tuple[dict[str, Any], str]:
+    profile = (review_profile_raw_jsonl or "").strip()
+    patch = {
+        "review_after_generation": bool(review_after_generation),
+        "review_reference_audio": (review_reference_audio or "").strip(),
+        "review_profile_raw_jsonl": profile,
+        "review_base_speaker_model": (review_base_speaker_model or "").strip()
+        or "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+        "review_whisper_model": (review_whisper_model or "").strip() or "base",
+    }
+    _save_inference_cfg(patch)
+    return (
+        gr.update(choices=list_raw_jsonl_paths(), value=profile),
+        _infer_save_indicator_html("Review settings saved"),
+    )
+
+
+def _run_generation_review_for_ui(
+    *,
+    generated_wav: str | None,
+    target_text: str,
+    review_after_generation: bool,
+    review_reference_audio: str,
+    review_profile_raw_jsonl: str,
+    review_base_speaker_model: str,
+    review_whisper_model: str,
+) -> tuple[str, str | None]:
+    if not bool(review_after_generation):
+        return "Post-generation review skipped (`disabled`).", None
+    wav_path = (generated_wav or "").strip()
+    target = (target_text or "").strip()
+    if not wav_path or not target:
+        return "Post-generation review skipped (`missing generated wav/text`).", None
+    try:
+        report = run_generation_review(
+            generated_audio_path=wav_path,
+            target_text=target,
+            reference_audio_path=(review_reference_audio or "").strip(),
+            profile_raw_jsonl=(review_profile_raw_jsonl or "").strip(),
+            base_speaker_model=(review_base_speaker_model or "").strip()
+            or "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+            whisper_model=(review_whisper_model or "").strip() or "base",
+        )
+        report_path = (
+            Path(wav_path).resolve().with_name(f"{Path(wav_path).stem}_review.json")
+        )
+        saved = save_generation_review(report, report_path)
+        md = format_generation_review(report)
+        return f"{md}\n\nSaved generation review report: `{saved}`", saved
+    except Exception as e:
+        return f"Post-generation review failed: `{e}`", None
+
+
+def _refresh_raw_updates(selected: str | None = None) -> dict[str, Any]:
     raws = list_raw_jsonl_paths()
     value = selected if selected in raws else _first_or_none(raws)
     return gr.update(choices=raws, value=value)
 
 
-def _refresh_coded_updates(selected: str | None = None) -> gr.Dropdown:
+def _refresh_coded_updates(selected: str | None = None) -> dict[str, Any]:
     coded = list_coded_jsonl_paths()
     value = selected if selected in coded else _first_or_none(coded)
     return gr.update(choices=coded, value=value)
 
 
-def _refresh_run_updates(selected: str | None = None) -> gr.Dropdown:
+def _refresh_run_updates(selected: str | None = None) -> dict[str, Any]:
     runs = list_run_paths()
     value = selected if selected in runs else _first_or_none(runs)
     return gr.update(choices=runs, value=value)
 
 
-def _refresh_checkpoint_updates(selected: str | None = None) -> gr.Dropdown:
+def _refresh_checkpoint_updates(selected: str | None = None) -> dict[str, Any]:
     checkpoints = list_checkpoint_paths()
     value = selected if selected in checkpoints else _first_or_none(checkpoints)
     return gr.update(choices=checkpoints, value=value)
 
 
-def ui_refresh_everything() -> tuple[gr.Dropdown, gr.Dropdown, gr.Dropdown, gr.Dropdown]:
+def ui_refresh_everything() -> tuple[
+    dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]
+]:
     return (
         _refresh_raw_updates(),
         _refresh_coded_updates(),
@@ -542,33 +716,42 @@ def ui_refresh_all_dropdowns(
     checkpoint_train_selected: str | None = None,
     checkpoint_infer_selected: str | None = None,
     export_ckpt_selected: str | None = None,
+    review_profile_raw_selected: str | None = None,
 ) -> tuple[
-    gr.Dropdown,
-    gr.Dropdown,
-    gr.Dropdown,
-    gr.Dropdown,
-    gr.Dropdown,
-    gr.Dropdown,
-    gr.Dropdown,
-    gr.Dropdown,
-    gr.Dropdown,
-    gr.Dropdown,
-    gr.Dropdown,
-    gr.Dropdown,
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
 ]:
     return (
-        _refresh_raw_updates(inspect_raw_selected),        # inspect_raw_path
-        _refresh_raw_updates(quality_raw_selected),        # quality_raw_jsonl
-        _refresh_raw_updates(normalize_raw_selected),      # normalize_raw_jsonl
-        _refresh_raw_updates(prepare_raw_selected),        # prepare_raw_jsonl
-        _refresh_coded_updates(prepared_jsonl_selected),   # prepared_jsonl_dropdown
-        _refresh_coded_updates(train_jsonl_selected),      # train_jsonl_dropdown
-        _refresh_raw_updates(pipeline_raw_selected),       # pipeline_raw_jsonl
-        _refresh_run_updates(run_selected),                # run_dropdown
-        _refresh_run_updates(run_manage_selected),         # run_dropdown_manage
-        _refresh_checkpoint_updates(checkpoint_train_selected), # checkpoint_dropdown_train
-        _refresh_checkpoint_updates(checkpoint_infer_selected), # checkpoint_dropdown_infer
-        _refresh_checkpoint_updates(export_ckpt_selected), # export_ckpt_dropdown
+        _refresh_raw_updates(inspect_raw_selected),  # inspect_raw_path
+        _refresh_raw_updates(quality_raw_selected),  # quality_raw_jsonl
+        _refresh_raw_updates(normalize_raw_selected),  # normalize_raw_jsonl
+        _refresh_raw_updates(prepare_raw_selected),  # prepare_raw_jsonl
+        _refresh_coded_updates(prepared_jsonl_selected),  # prepared_jsonl_dropdown
+        _refresh_coded_updates(train_jsonl_selected),  # train_jsonl_dropdown
+        _refresh_raw_updates(pipeline_raw_selected),  # pipeline_raw_jsonl
+        _refresh_run_updates(run_selected),  # run_dropdown
+        _refresh_run_updates(run_manage_selected),  # run_dropdown_manage
+        _refresh_checkpoint_updates(
+            checkpoint_train_selected
+        ),  # checkpoint_dropdown_train
+        _refresh_checkpoint_updates(
+            checkpoint_infer_selected
+        ),  # checkpoint_dropdown_infer
+        _refresh_checkpoint_updates(export_ckpt_selected),  # export_ckpt_dropdown
+        gr.update(
+            choices=list_raw_jsonl_paths(), value=review_profile_raw_selected
+        ),  # review_profile_raw_jsonl
     )
 
 
@@ -581,11 +764,11 @@ def ui_build_dataset(
     str,
     str,
     list[list[Any]],
-    gr.Dropdown,
-    gr.Dropdown,
-    gr.Dropdown,
-    gr.Dropdown,
-    gr.Dropdown,
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
 ]:
     try:
         dataset_path, raw_jsonl = build_dataset_from_uploads(
@@ -631,11 +814,11 @@ def ui_import_raw_jsonl(
     str,
     str,
     list[list[Any]],
-    gr.Dropdown,
-    gr.Dropdown,
-    gr.Dropdown,
-    gr.Dropdown,
-    gr.Dropdown,
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
 ]:
     try:
         dataset_path, raw_jsonl = import_existing_raw_jsonl(
@@ -694,7 +877,9 @@ def ui_validate_dataset_for_plan(
         report_md = format_quality_report(report)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_path = Path(raw_jsonl_path).resolve().parent / f"quality_report_{ts}.json"
+        report_path = (
+            Path(raw_jsonl_path).resolve().parent / f"quality_report_{ts}.json"
+        )
         report_file = save_quality_report(report, report_path)
 
         rec = report.get("recommendation", {})
@@ -741,7 +926,14 @@ def ui_normalize_dataset(
     normalized_dataset_name: str,
     target_sr: int,
     peak_normalize: bool,
-) -> tuple[str, gr.Dropdown, gr.Dropdown, gr.Dropdown, gr.Dropdown, gr.Dropdown]:
+) -> tuple[
+    str,
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+]:
     if not raw_jsonl_path:
         return (
             "Select raw JSONL first.",
@@ -913,10 +1105,12 @@ def ui_run_training(
     if preflight_report_path:
         if isinstance(preflight_report_path, str):
             preflight_path = preflight_report_path
-        elif isinstance(preflight_report_path, dict) and "name" in preflight_report_path:
+        elif (
+            isinstance(preflight_report_path, dict) and "name" in preflight_report_path
+        ):
             preflight_path = str(preflight_report_path["name"])
-        elif hasattr(preflight_report_path, "name"):
-            preflight_path = str(preflight_report_path.name)
+        else:
+            preflight_path = str(getattr(preflight_report_path, "name", "") or "")
 
     ok, reason = validate_preflight_gate(
         preflight_report_path=preflight_path or None,
@@ -937,7 +1131,10 @@ def ui_run_training(
         return
 
     final_attn = (attn_implementation or "").strip()
-    if final_attn.lower() == "flash_attention_2" and importlib.util.find_spec("flash_attn") is None:
+    if (
+        final_attn.lower() == "flash_attention_2"
+        and importlib.util.find_spec("flash_attn") is None
+    ):
         yield (
             "flash_attn is not installed. Choose `attn_implementation=auto/sdpa/eager` or install flash-attn.",
             "",
@@ -974,8 +1171,12 @@ def ui_run_training(
         ):
             run_dir = event.get("run_dir")
             run_choices = event.get("run_choices", list_run_paths())
-            checkpoint_choices = event.get("checkpoint_choices", list_checkpoint_paths())
-            selected_run = run_dir if run_dir in run_choices else _first_or_none(run_choices)
+            checkpoint_choices = event.get(
+                "checkpoint_choices", list_checkpoint_paths()
+            )
+            selected_run = (
+                run_dir if run_dir in run_choices else _first_or_none(run_choices)
+            )
             selected_ckpt = event.get("last_checkpoint")
             if selected_ckpt not in checkpoint_choices:
                 selected_ckpt = _first_or_none(checkpoint_choices)
@@ -1103,10 +1304,12 @@ def ui_run_pipeline(
     if preflight_report_path:
         if isinstance(preflight_report_path, str):
             preflight_path = preflight_report_path
-        elif isinstance(preflight_report_path, dict) and "name" in preflight_report_path:
+        elif (
+            isinstance(preflight_report_path, dict) and "name" in preflight_report_path
+        ):
             preflight_path = str(preflight_report_path["name"])
-        elif hasattr(preflight_report_path, "name"):
-            preflight_path = str(preflight_report_path.name)
+        else:
+            preflight_path = str(getattr(preflight_report_path, "name", "") or "")
 
     ok, reason = validate_preflight_gate(
         preflight_report_path=preflight_path or None,
@@ -1129,7 +1332,10 @@ def ui_run_pipeline(
         return
 
     final_attn = (attn_implementation or "").strip()
-    if final_attn.lower() == "flash_attention_2" and importlib.util.find_spec("flash_attn") is None:
+    if (
+        final_attn.lower() == "flash_attention_2"
+        and importlib.util.find_spec("flash_attn") is None
+    ):
         yield (
             "flash_attn is not installed. Choose `attn_implementation=auto/sdpa/eager` or install flash-attn.",
             "",
@@ -1177,7 +1383,9 @@ def ui_run_pipeline(
 
             coded_choices = event.get("coded_jsonl_choices", list_coded_jsonl_paths())
             run_choices = event.get("run_choices", list_run_paths())
-            checkpoint_choices = event.get("checkpoint_choices", list_checkpoint_paths())
+            checkpoint_choices = event.get(
+                "checkpoint_choices", list_checkpoint_paths()
+            )
 
             selected_coded = event.get("output_jsonl")
             if selected_coded not in coded_choices:
@@ -1243,14 +1451,17 @@ def ui_stop_pipeline() -> str:
     )
 
 
-def ui_load_run_checkpoints(run_path: str) -> tuple[gr.Dropdown, gr.Dropdown, gr.Dropdown]:
+def ui_load_run_checkpoints(
+    run_path: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     if not run_path:
         update = _refresh_checkpoint_updates()
         return update, update, update
 
     run_dir = Path(run_path)
     checkpoints = [p for p in run_dir.glob("checkpoint-epoch-*") if p.is_dir()]
-    checkpoints = sorted(checkpoints, key=lambda p: p.stat().st_mtime, reverse=True)
+    checkpoints = sort_checkpoint_paths(checkpoints)
+    checkpoints = [p for p in checkpoints if is_loadable_checkpoint_dir(p)]
     values = [str(p.resolve()) for p in checkpoints]
     value = _first_or_none(values)
     update = gr.update(choices=values, value=value)
@@ -1280,12 +1491,17 @@ def _generation_params(
 
 
 def ui_generate_single(
+    infer_mode: str,
     checkpoint_path: str,
     device: str,
     speaker_name: str,
     language: str,
     instruct: str,
     text: str,
+    icl_ref_audio: str,
+    icl_ref_text: str,
+    icl_use_icl: bool,
+    seed: int,
     temperature: float,
     top_k: int,
     top_p: float,
@@ -1294,6 +1510,11 @@ def ui_generate_single(
     subtalker_temperature: float,
     subtalker_top_k: int,
     subtalker_top_p: float,
+    review_after_generation: bool,
+    review_reference_audio: str,
+    review_profile_raw_jsonl: str,
+    review_base_speaker_model: str,
+    review_whisper_model: str,
 ) -> tuple[str, str | None]:
     params = _generation_params(
         temperature=temperature,
@@ -1306,40 +1527,94 @@ def ui_generate_single(
         subtalker_top_p=subtalker_top_p,
     )
     final_speaker = (speaker_name or "").strip()
+    final_language = (language or "").strip() or "auto"
+    final_instruct = (instruct or "").strip()
+    final_mode = (infer_mode or "").strip() or INFER_MODE_CHECKPOINT
+    is_icl_mode = final_mode == INFER_MODE_ICL
+    final_icl_ref_audio = (icl_ref_audio or "").strip()
+    final_icl_ref_text = (icl_ref_text or "").strip()
+    final_icl_use_icl = bool(icl_use_icl)
+    final_review_reference_audio = (review_reference_audio or "").strip()
+    final_review_profile_raw_jsonl = (review_profile_raw_jsonl or "").strip()
+    try:
+        final_seed = int(seed)
+    except Exception:
+        final_seed = 42
+    final_review_base_speaker_model = (
+        review_base_speaker_model or ""
+    ).strip() or "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+    final_review_whisper_model = (review_whisper_model or "").strip() or "base"
     if final_speaker:
         save_ui_settings({"speaker_name": final_speaker})
     _save_inference_cfg(
         {
             "checkpoint_path": (checkpoint_path or "").strip(),
             "device": (device or "").strip() or "auto",
+            "generation_mode": final_mode,
             "speaker_name": final_speaker,
-            "language": (language or "").strip() or "auto",
-            "instruct": (instruct or "").strip(),
+            "language": final_language,
+            "instruct": final_instruct,
+            "icl_ref_audio": final_icl_ref_audio,
+            "icl_ref_text": final_icl_ref_text,
+            "icl_use_icl": final_icl_use_icl,
+            "seed": final_seed,
             "params": params,
+            "review_after_generation": bool(review_after_generation),
+            "review_reference_audio": final_review_reference_audio,
+            "review_profile_raw_jsonl": final_review_profile_raw_jsonl,
+            "review_base_speaker_model": final_review_base_speaker_model,
+            "review_whisper_model": final_review_whisper_model,
         }
     )
     try:
-        wav_path, status = synthesize_single(
-            checkpoint_path=checkpoint_path,
-            device=device,
-            speaker_name=speaker_name,
-            text=text,
-            params=params,
-            language=language,
-            instruct=instruct,
+        if is_icl_mode:
+            wav_path, status = synthesize_voice_clone(
+                device=device,
+                text=text,
+                ref_audio_path=final_icl_ref_audio,
+                ref_text=final_icl_ref_text,
+                use_icl=final_icl_use_icl,
+                params=params,
+                language=final_language,
+                seed=final_seed,
+            )
+        else:
+            wav_path, status = synthesize_single(
+                checkpoint_path=checkpoint_path,
+                device=device,
+                speaker_name=final_speaker,
+                text=text,
+                params=params,
+                language=final_language,
+                instruct=final_instruct,
+                seed=final_seed,
+            )
+        review_md, _ = _run_generation_review_for_ui(
+            generated_wav=wav_path,
+            target_text=text,
+            review_after_generation=bool(review_after_generation),
+            review_reference_audio=final_review_reference_audio,
+            review_profile_raw_jsonl=final_review_profile_raw_jsonl,
+            review_base_speaker_model=final_review_base_speaker_model,
+            review_whisper_model=final_review_whisper_model,
         )
-        return status, wav_path
+        return f"{status}\n\n---\n\n{review_md}", wav_path
     except Exception as e:
         return f"Single generation failed: `{e}`", None
 
 
 def ui_generate_batch(
+    infer_mode: str,
     checkpoint_path: str,
     device: str,
     speaker_name: str,
     language: str,
     instruct: str,
     batch_text: str,
+    icl_ref_audio: str,
+    icl_ref_text: str,
+    icl_use_icl: bool,
+    seed: int,
     temperature: float,
     top_k: int,
     top_p: float,
@@ -1348,6 +1623,11 @@ def ui_generate_batch(
     subtalker_temperature: float,
     subtalker_top_k: int,
     subtalker_top_p: float,
+    review_after_generation: bool,
+    review_reference_audio: str,
+    review_profile_raw_jsonl: str,
+    review_base_speaker_model: str,
+    review_whisper_model: str,
 ) -> tuple[str, str | None, str | None]:
     params = _generation_params(
         temperature=temperature,
@@ -1359,30 +1639,83 @@ def ui_generate_batch(
         subtalker_top_k=subtalker_top_k,
         subtalker_top_p=subtalker_top_p,
     )
+    final_mode = (infer_mode or "").strip() or INFER_MODE_CHECKPOINT
+    is_icl_mode = final_mode == INFER_MODE_ICL
     final_speaker = (speaker_name or "").strip()
+    final_language = (language or "").strip() or "auto"
+    final_instruct = (instruct or "").strip()
+    final_icl_ref_audio = (icl_ref_audio or "").strip()
+    final_icl_ref_text = (icl_ref_text or "").strip()
+    final_icl_use_icl = bool(icl_use_icl)
+    final_review_reference_audio = (review_reference_audio or "").strip()
+    final_review_profile_raw_jsonl = (review_profile_raw_jsonl or "").strip()
+    try:
+        final_seed = int(seed)
+    except Exception:
+        final_seed = 42
+    final_review_base_speaker_model = (
+        review_base_speaker_model or ""
+    ).strip() or "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+    final_review_whisper_model = (review_whisper_model or "").strip() or "base"
     if final_speaker:
         save_ui_settings({"speaker_name": final_speaker})
     _save_inference_cfg(
         {
             "checkpoint_path": (checkpoint_path or "").strip(),
             "device": (device or "").strip() or "auto",
+            "generation_mode": final_mode,
             "speaker_name": final_speaker,
-            "language": (language or "").strip() or "auto",
-            "instruct": (instruct or "").strip(),
+            "language": final_language,
+            "instruct": final_instruct,
+            "icl_ref_audio": final_icl_ref_audio,
+            "icl_ref_text": final_icl_ref_text,
+            "icl_use_icl": final_icl_use_icl,
+            "seed": final_seed,
             "params": params,
+            "review_after_generation": bool(review_after_generation),
+            "review_reference_audio": final_review_reference_audio,
+            "review_profile_raw_jsonl": final_review_profile_raw_jsonl,
+            "review_base_speaker_model": final_review_base_speaker_model,
+            "review_whisper_model": final_review_whisper_model,
         }
     )
     try:
-        first_wav, zip_path, status = synthesize_batch(
-            checkpoint_path=checkpoint_path,
-            device=device,
-            speaker_name=speaker_name,
-            multiline_text=batch_text,
-            params=params,
-            language=language,
-            instruct=instruct,
+        if is_icl_mode:
+            first_wav, zip_path, status = synthesize_voice_clone_batch(
+                device=device,
+                multiline_text=batch_text,
+                ref_audio_path=final_icl_ref_audio,
+                ref_text=final_icl_ref_text,
+                use_icl=final_icl_use_icl,
+                params=params,
+                language=final_language,
+                seed=final_seed,
+            )
+        else:
+            first_wav, zip_path, status = synthesize_batch(
+                checkpoint_path=checkpoint_path,
+                device=device,
+                speaker_name=final_speaker,
+                multiline_text=batch_text,
+                params=params,
+                language=final_language,
+                instruct=final_instruct,
+                seed=final_seed,
+            )
+        batch_lines = [
+            line.strip() for line in (batch_text or "").splitlines() if line.strip()
+        ]
+        review_target_text = batch_lines[0] if batch_lines else ""
+        review_md, _ = _run_generation_review_for_ui(
+            generated_wav=first_wav,
+            target_text=review_target_text,
+            review_after_generation=bool(review_after_generation),
+            review_reference_audio=final_review_reference_audio,
+            review_profile_raw_jsonl=final_review_profile_raw_jsonl,
+            review_base_speaker_model=final_review_base_speaker_model,
+            review_whisper_model=final_review_whisper_model,
         )
-        return status, first_wav, zip_path
+        return f"{status}\n\n---\n\n{review_md}", first_wav, zip_path
     except Exception as e:
         return f"Batch generation failed: `{e}`", None, None
 
@@ -1515,12 +1848,59 @@ def ui_environment_check() -> str:
 def build_app() -> gr.Blocks:
     ui_settings = load_ui_settings()
     default_speaker_name = str(ui_settings.get("speaker_name", "") or "").strip()
-    infer_cfg = ui_settings.get("inference", {}) if isinstance(ui_settings.get("inference", {}), dict) else {}
-    infer_params = infer_cfg.get("params", {}) if isinstance(infer_cfg.get("params", {}), dict) else {}
+    infer_cfg = (
+        ui_settings.get("inference", {})
+        if isinstance(ui_settings.get("inference", {}), dict)
+        else {}
+    )
+    infer_params = (
+        infer_cfg.get("params", {})
+        if isinstance(infer_cfg.get("params", {}), dict)
+        else {}
+    )
     infer_device_default = str(infer_cfg.get("device", "auto") or "auto")
     infer_language_default = str(infer_cfg.get("language", "auto") or "auto")
     infer_instruct_default = str(infer_cfg.get("instruct", "") or "")
     infer_ckpt_default = str(infer_cfg.get("checkpoint_path", "") or "")
+    infer_mode_default = str(
+        infer_cfg.get("generation_mode", INFER_MODE_CHECKPOINT) or INFER_MODE_CHECKPOINT
+    )
+    if infer_mode_default not in {INFER_MODE_CHECKPOINT, INFER_MODE_ICL}:
+        infer_mode_default = INFER_MODE_CHECKPOINT
+    try:
+        infer_seed_default = int(infer_cfg.get("seed", 42) or 42)
+    except Exception:
+        infer_seed_default = 42
+    infer_review_after_default = bool(infer_cfg.get("review_after_generation", True))
+    infer_review_reference_default = str(
+        infer_cfg.get("review_reference_audio", "") or ""
+    )
+    infer_review_profile_default = str(
+        infer_cfg.get("review_profile_raw_jsonl", "") or ""
+    )
+    infer_review_base_model_default = str(
+        infer_cfg.get("review_base_speaker_model", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
+        or "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+    )
+    infer_review_whisper_default = str(
+        infer_cfg.get("review_whisper_model", "base") or "base"
+    )
+    _icl_ref_audio_raw = str(infer_cfg.get("icl_ref_audio", "") or "")
+    _icl_ref_text_raw = str(infer_cfg.get("icl_ref_text", "") or "")
+    # Auto-discover best ref audio if not previously configured
+    if not _icl_ref_audio_raw:
+        _best_ref_v2 = (
+            WORKSPACE_ROOT / "imports" / "quality_test_quick"
+            / "ref_bank" / "best_ref_v2_seg_0026.wav"
+        )
+        if _best_ref_v2.exists():
+            _icl_ref_audio_raw = str(_best_ref_v2)
+            _icl_ref_text_raw = _icl_ref_text_raw or (
+                "새로운 역사의 전환점의 입구에 있는 것 같아요."
+            )
+    infer_icl_ref_audio_default = _icl_ref_audio_raw
+    infer_icl_ref_text_default = _icl_ref_text_raw
+    infer_icl_use_icl_default = bool(infer_cfg.get("icl_use_icl", True))
 
     with gr.Blocks(title=APP_TITLE, css=CUSTOM_CSS) as demo:
         gr.HTML(
@@ -1557,9 +1937,13 @@ def build_app() -> gr.Blocks:
                             label="Global reference audio (recommended single reference)",
                             file_types=["audio"],
                         )
-                        build_dataset_button = gr.Button("Build train_raw.jsonl", variant="primary")
+                        build_dataset_button = gr.Button(
+                            "Build train_raw.jsonl", variant="primary"
+                        )
 
-                        gr.HTML('<div class="section-header" style="margin-top:1rem;">Import Existing</div>')
+                        gr.HTML(
+                            '<div class="section-header" style="margin-top:1rem;">Import Existing</div>'
+                        )
                         import_raw_jsonl_file = gr.File(
                             label="Raw JSONL file",
                             file_types=[".jsonl"],
@@ -1594,9 +1978,13 @@ def build_app() -> gr.Blocks:
                             choices=list_raw_jsonl_paths(),
                             value=_first_or_none(list_raw_jsonl_paths()),
                         )
-                        validate_button = gr.Button("Run Quality Validation", variant="primary")
+                        validate_button = gr.Button(
+                            "Run Quality Validation", variant="primary"
+                        )
                         quality_report_file = gr.File(label="Quality Report JSON")
-                        gr.HTML('<div class="section-header" style="margin-top:1rem;">Preflight Go/No-Go</div>')
+                        gr.HTML(
+                            '<div class="section-header" style="margin-top:1rem;">Preflight Go/No-Go</div>'
+                        )
                         gr.Markdown(
                             "- REQUIRED: zero blocking dataset errors, valid model path, available device, enough disk\n"
                             "- RECOMMENDED: >=10 min clean speech, single reference audio, high text diversity, low noise/clipping"
@@ -1621,12 +2009,15 @@ def build_app() -> gr.Blocks:
                                 value=3,
                                 precision=0,
                             )
-                        preflight_button = gr.Button("Run Preflight Go/No-Go Check", variant="secondary")
+                        preflight_button = gr.Button(
+                            "Run Preflight Go/No-Go Check", variant="secondary"
+                        )
                         preflight_report_file = gr.File(label="Preflight Report JSON")
-                        gr.HTML('<div class="section-header" style="margin-top:1rem;">Normalize Audio</div>')
+                        gr.HTML(
+                            '<div class="section-header" style="margin-top:1rem;">Normalize Audio</div>'
+                        )
                         gr.Markdown(
-                            "- Resample to 24kHz mono\n"
-                            "- Optional peak normalization"
+                            "- Resample to 24kHz mono\n- Optional peak normalization"
                         )
                         normalize_raw_jsonl = gr.Dropdown(
                             label="Raw JSONL for normalization",
@@ -1683,8 +2074,12 @@ def build_app() -> gr.Blocks:
                             step=1,
                         )
                         with gr.Row():
-                            run_prepare_button = gr.Button("Run prepare_data.py", variant="primary")
-                            stop_prepare_button = gr.Button("Stop Prepare", variant="stop")
+                            run_prepare_button = gr.Button(
+                                "Run prepare_data.py", variant="primary"
+                            )
+                            stop_prepare_button = gr.Button(
+                                "Stop Prepare", variant="stop"
+                            )
                     with gr.Column(scale=1, elem_classes=["params-panel"]):
                         gr.HTML('<div class="section-header">Logs & Output</div>')
                         prepare_status = gr.Markdown()
@@ -1730,7 +2125,9 @@ def build_app() -> gr.Blocks:
                             value=_first_or_none(list_coded_jsonl_paths()),
                         )
                         with gr.Row():
-                            run_name = gr.Textbox(label="Run Name", value=default_run_name())
+                            run_name = gr.Textbox(
+                                label="Run Name", value=default_run_name()
+                            )
                             new_run_name_button = gr.Button("New Name")
                         speaker_name = gr.Textbox(
                             label="Speaker Name",
@@ -1783,8 +2180,12 @@ def build_app() -> gr.Blocks:
                                 choices=["auto", "flash_attention_2", "sdpa", "eager"],
                                 value="auto",
                             )
-                            weight_decay_train = gr.Number(label="Weight decay", value=0.01)
-                            max_grad_norm_train = gr.Number(label="Max grad norm", value=1.0)
+                            weight_decay_train = gr.Number(
+                                label="Weight decay", value=0.01
+                            )
+                            max_grad_norm_train = gr.Number(
+                                label="Max grad norm", value=1.0
+                            )
                             subtalker_loss_weight_train = gr.Number(
                                 label="Subtalker loss weight",
                                 value=0.3,
@@ -1808,10 +2209,16 @@ def build_app() -> gr.Blocks:
                                 value=0,
                                 precision=0,
                             )
-                            seed_train = gr.Number(label="Random seed", value=42, precision=0)
+                            seed_train = gr.Number(
+                                label="Random seed", value=42, precision=0
+                            )
                         with gr.Row():
-                            run_train_button = gr.Button("Run sft_12hz.py", variant="primary")
-                            stop_train_button = gr.Button("Stop Training", variant="stop")
+                            run_train_button = gr.Button(
+                                "Run sft_12hz.py", variant="primary"
+                            )
+                            stop_train_button = gr.Button(
+                                "Stop Training", variant="stop"
+                            )
                     with gr.Column(scale=1, elem_classes=["params-panel"]):
                         gr.HTML('<div class="section-header">Logs & Checkpoints</div>')
                         train_status = gr.Markdown()
@@ -1933,8 +2340,12 @@ def build_app() -> gr.Blocks:
                                 choices=["auto", "flash_attention_2", "sdpa", "eager"],
                                 value="auto",
                             )
-                            weight_decay_pipeline = gr.Number(label="Weight decay", value=0.01)
-                            max_grad_norm_pipeline = gr.Number(label="Max grad norm", value=1.0)
+                            weight_decay_pipeline = gr.Number(
+                                label="Weight decay", value=0.01
+                            )
+                            max_grad_norm_pipeline = gr.Number(
+                                label="Max grad norm", value=1.0
+                            )
                             subtalker_loss_weight_pipeline = gr.Number(
                                 label="Subtalker loss weight",
                                 value=0.3,
@@ -1958,7 +2369,9 @@ def build_app() -> gr.Blocks:
                                 value=0,
                                 precision=0,
                             )
-                            seed_pipeline = gr.Number(label="Random seed", value=42, precision=0)
+                            seed_pipeline = gr.Number(
+                                label="Random seed", value=42, precision=0
+                            )
                         with gr.Row():
                             run_pipeline_button = gr.Button(
                                 "Run Full Pipeline",
@@ -1989,7 +2402,9 @@ def build_app() -> gr.Blocks:
                 )
                 infer_device_choices = ["auto", "cuda:0", "mps", "cpu"]
                 infer_device_value = (
-                    infer_device_default if infer_device_default in infer_device_choices else "auto"
+                    infer_device_default
+                    if infer_device_default in infer_device_choices
+                    else "auto"
                 )
                 infer_language_choices = [
                     "auto",
@@ -2010,14 +2425,42 @@ def build_app() -> gr.Blocks:
                     else "auto"
                 )
                 infer_speaker_value = str(
-                    (infer_cfg.get("speaker_name") if isinstance(infer_cfg, dict) else None)
+                    (
+                        infer_cfg.get("speaker_name")
+                        if isinstance(infer_cfg, dict)
+                        else None
+                    )
                     or default_speaker_name
                     or ""
                 ).strip()
+                infer_review_profile_choices = list_raw_jsonl_paths()
+                infer_review_profile_value = (
+                    infer_review_profile_default
+                    or _first_or_none(infer_review_profile_choices)
+                )
+                infer_review_whisper_choices = [
+                    "tiny",
+                    "base",
+                    "small",
+                    "medium",
+                    "large-v3",
+                ]
+                infer_review_whisper_value = (
+                    infer_review_whisper_default
+                    if infer_review_whisper_default in infer_review_whisper_choices
+                    else "base"
+                )
 
                 def _infer_param_value(name: str) -> Any:
                     value = infer_params.get(name, INFER_DEFAULT_PARAMS.get(name))
                     return INFER_DEFAULT_PARAMS.get(name) if value is None else value
+
+                infer_mode = gr.Radio(
+                    label="Generation Mode",
+                    choices=[INFER_MODE_CHECKPOINT, INFER_MODE_ICL],
+                    value=INFER_MODE_CHECKPOINT,
+                    info="ICL mode uses reference audio to clone voice without fine-tuning. Often produces better results.",
+                )
 
                 with gr.Row():
                     with gr.Column(scale=2, elem_classes=["params-panel"]):
@@ -2055,6 +2498,31 @@ def build_app() -> gr.Blocks:
                             value=infer_instruct_default,
                             placeholder="e.g. calm and warm narration style",
                         )
+                        with gr.Group(visible=False) as icl_group:
+                            gr.HTML('<div class="section-header">ICL Voice Clone</div>')
+                            gr.Markdown(
+                                "**Tip:** Choose a reference clip that ends on a "
+                                "**complete sentence** (e.g. \u2018...니다.\u2019, \u2018...요.\u2019). "
+                                "Clips ending mid-sentence can cause the ref content to bleed "
+                                "into the generated audio.",
+                                elem_classes=["info-note"],
+                            )
+                            icl_ref_audio = gr.Audio(
+                                label="Reference Audio (3-10s of target speaker)",
+                                type="filepath",
+                                value=infer_icl_ref_audio_default or None,
+                            )
+                            icl_ref_text = gr.Textbox(
+                                label="Reference Audio Transcript",
+                                lines=2,
+                                value=infer_icl_ref_text_default,
+                                placeholder="Exact transcript of the reference audio above",
+                            )
+                            icl_use_icl = gr.Checkbox(
+                                label="Use ICL mode (recommended)",
+                                value=infer_icl_use_icl_default,
+                                info="ICL uses audio tokens as context. Disable for x-vector only mode.",
+                            )
 
                     with gr.Column(scale=3, elem_classes=["params-panel"]):
                         gr.HTML('<div class="section-header">Generate</div>')
@@ -2069,7 +2537,9 @@ def build_app() -> gr.Blocks:
                             variant="primary",
                             elem_classes=["generate-btn"],
                         )
-                        single_audio_output = gr.Audio(label="Single Audio", type="filepath")
+                        single_audio_output = gr.Audio(
+                            label="Single Audio", type="filepath"
+                        )
 
                         batch_text = gr.Textbox(
                             label="Batch Generation (one line = one utterance)",
@@ -2083,7 +2553,9 @@ def build_app() -> gr.Blocks:
                         batch_zip_output = gr.File(label="Batch ZIP")
                         unload_model_button = gr.Button("Unload Inference Model Cache")
 
-                    with gr.Column(scale=1, elem_classes=["params-panel", "compact-params-panel"]):
+                    with gr.Column(
+                        scale=1, elem_classes=["params-panel", "compact-params-panel"]
+                    ):
                         gr.HTML('<div class="section-header">Parameters</div>')
                         infer_save_indicator = gr.HTML(
                             value="<span class='save-indicator'>Settings saved</span>"
@@ -2097,7 +2569,14 @@ def build_app() -> gr.Blocks:
                                     "Fast", size="sm", elem_classes=["preset-btn-lg"]
                                 )
                                 preset_balanced = gr.Button(
-                                    "Balanced", size="sm", elem_classes=["preset-btn-lg"]
+                                    "Balanced",
+                                    size="sm",
+                                    elem_classes=["preset-btn-lg"],
+                                )
+                                preset_similarity = gr.Button(
+                                    "Similarity",
+                                    size="sm",
+                                    elem_classes=["preset-btn-lg"],
                                 )
                                 preset_quality = gr.Button(
                                     "Quality", size="sm", elem_classes=["preset-btn-lg"]
@@ -2108,11 +2587,19 @@ def build_app() -> gr.Blocks:
                                 variant="secondary",
                             )
 
+                        infer_seed = gr.Number(
+                            label="seed",
+                            value=infer_seed_default,
+                            precision=0,
+                            info="Keep fixed for reproducibility. Sweep this value to search better similarity.",
+                        )
                         temperature = gr.Slider(
                             label="temperature",
                             minimum=0.1,
                             maximum=1.5,
-                            value=min(1.5, max(0.1, float(_infer_param_value("temperature")))),
+                            value=min(
+                                1.5, max(0.1, float(_infer_param_value("temperature")))
+                            ),
                             step=0.05,
                             info=INFER_PARAM_TOOLTIPS["temperature"],
                         )
@@ -2128,7 +2615,9 @@ def build_app() -> gr.Blocks:
                             label="top_p",
                             minimum=0.1,
                             maximum=1.0,
-                            value=min(1.0, max(0.1, float(_infer_param_value("top_p")))),
+                            value=min(
+                                1.0, max(0.1, float(_infer_param_value("top_p")))
+                            ),
                             step=0.05,
                             info=INFER_PARAM_TOOLTIPS["top_p"],
                         )
@@ -2138,7 +2627,9 @@ def build_app() -> gr.Blocks:
                             maximum=1.5,
                             value=min(
                                 1.5,
-                                max(0.8, float(_infer_param_value("repetition_penalty"))),
+                                max(
+                                    0.8, float(_infer_param_value("repetition_penalty"))
+                                ),
                             ),
                             step=0.01,
                             info=INFER_PARAM_TOOLTIPS["repetition_penalty"],
@@ -2160,7 +2651,10 @@ def build_app() -> gr.Blocks:
                             maximum=1.5,
                             value=min(
                                 1.5,
-                                max(0.1, float(_infer_param_value("subtalker_temperature"))),
+                                max(
+                                    0.1,
+                                    float(_infer_param_value("subtalker_temperature")),
+                                ),
                             ),
                             step=0.05,
                             info=INFER_PARAM_TOOLTIPS["subtalker_temperature"],
@@ -2187,6 +2681,35 @@ def build_app() -> gr.Blocks:
                             step=0.05,
                             info=INFER_PARAM_TOOLTIPS["subtalker_top_p"],
                         )
+                        gr.HTML(
+                            '<div class="section-header" style="margin-top:1rem;">Post-Generation Review</div>'
+                        )
+                        review_after_generation = gr.Checkbox(
+                            label="Run review after generation",
+                            value=infer_review_after_default,
+                            info="Enabled by default for inference quality gate.",
+                        )
+                        review_reference_audio = gr.Textbox(
+                            label="Reference audio path (speaker cosine)",
+                            value=infer_review_reference_default,
+                            placeholder="e.g. /Users/.../ref_8s.wav",
+                        )
+                        review_profile_raw_jsonl = gr.Dropdown(
+                            label="Profile raw JSONL (speed target)",
+                            choices=infer_review_profile_choices,
+                            value=infer_review_profile_value,
+                            allow_custom_value=True,
+                        )
+                        review_base_speaker_model = gr.Textbox(
+                            label="Base speaker model for cosine",
+                            value=infer_review_base_model_default,
+                        )
+                        review_whisper_model = gr.Dropdown(
+                            label="Whisper model",
+                            choices=infer_review_whisper_choices,
+                            value=infer_review_whisper_value,
+                            allow_custom_value=True,
+                        )
 
             with gr.Tab("7) Runs & Export"):
                 with gr.Row():
@@ -2195,7 +2718,7 @@ def build_app() -> gr.Blocks:
                         run_table = gr.Dataframe(
                             label="Run Registry",
                             headers=RUN_TABLE_HEADERS,
-                            datatype=["str"] * len(RUN_TABLE_HEADERS),
+                            datatype="str",
                             value=ui_refresh_run_table(),
                             interactive=False,
                             wrap=True,
@@ -2210,7 +2733,9 @@ def build_app() -> gr.Blocks:
                         )
                         show_run_summary_button = gr.Button("Show Run Summary")
                         run_summary_view = gr.Markdown()
-                        gr.HTML('<div class="section-header" style="margin-top:1rem;">Export</div>')
+                        gr.HTML(
+                            '<div class="section-header" style="margin-top:1rem;">Export</div>'
+                        )
                         export_ckpt_dropdown = gr.Dropdown(
                             label="Checkpoint path",
                             choices=list_checkpoint_paths(),
@@ -2229,13 +2754,20 @@ def build_app() -> gr.Blocks:
                     gr.HTML('<div class="section-header">Workspace</div>')
                     workspace_overview = gr.Markdown(value=ui_workspace_overview())
                     with gr.Row():
-                        refresh_workspace_button = gr.Button("Refresh Workspace Overview")
+                        refresh_workspace_button = gr.Button(
+                            "Refresh Workspace Overview"
+                        )
                         env_check_button = gr.Button("Run Environment Check")
                     env_check_view = gr.Markdown()
 
         build_dataset_button.click(
             fn=ui_build_dataset,
-            inputs=[dataset_name, uploaded_audios, transcript_file, reference_audio_file],
+            inputs=[
+                dataset_name,
+                uploaded_audios,
+                transcript_file,
+                reference_audio_file,
+            ],
             outputs=[
                 dataset_status,
                 dataset_stats_view,
@@ -2305,7 +2837,12 @@ def build_app() -> gr.Blocks:
 
         normalize_button.click(
             fn=ui_normalize_dataset,
-            inputs=[normalize_raw_jsonl, normalized_dataset_name, normalize_target_sr, normalize_peak],
+            inputs=[
+                normalize_raw_jsonl,
+                normalized_dataset_name,
+                normalize_target_sr,
+                normalize_peak,
+            ],
             outputs=[
                 normalize_status,
                 inspect_raw_path,
@@ -2325,7 +2862,12 @@ def build_app() -> gr.Blocks:
                 output_filename,
                 prepare_batch_infer_num,
             ],
-            outputs=[prepare_status, prepare_logs, prepared_jsonl_dropdown, train_jsonl_dropdown],
+            outputs=[
+                prepare_status,
+                prepare_logs,
+                prepared_jsonl_dropdown,
+                train_jsonl_dropdown,
+            ],
         )
 
         stop_prepare_button.click(
@@ -2464,10 +3006,41 @@ def build_app() -> gr.Blocks:
             queue=False,
         )
 
+        infer_mode.change(
+            fn=ui_infer_on_mode_change,
+            inputs=[infer_mode],
+            outputs=[
+                checkpoint_dropdown_infer,
+                infer_speaker_name,
+                infer_instruct,
+                icl_group,
+                temperature,
+                top_k,
+                top_p,
+                repetition_penalty,
+                max_new_tokens,
+                subtalker_temperature,
+                subtalker_top_k,
+                subtalker_top_p,
+                infer_save_indicator,
+            ],
+            queue=False,
+        )
+
         checkpoint_dropdown_infer.change(
             fn=ui_infer_on_checkpoint_change,
-            inputs=[checkpoint_dropdown_infer, infer_speaker_name],
-            outputs=[infer_speaker_name, infer_save_indicator],
+            inputs=[
+                checkpoint_dropdown_infer,
+                infer_speaker_name,
+                review_reference_audio,
+                review_profile_raw_jsonl,
+            ],
+            outputs=[
+                infer_speaker_name,
+                review_reference_audio,
+                review_profile_raw_jsonl,
+                infer_save_indicator,
+            ],
             queue=False,
         )
 
@@ -2496,6 +3069,22 @@ def build_app() -> gr.Blocks:
         )
         preset_balanced.click(
             fn=lambda: ui_infer_apply_preset("balanced"),
+            inputs=[],
+            outputs=[
+                temperature,
+                top_k,
+                top_p,
+                repetition_penalty,
+                max_new_tokens,
+                subtalker_temperature,
+                subtalker_top_k,
+                subtalker_top_p,
+                infer_save_indicator,
+            ],
+            queue=False,
+        )
+        preset_similarity.click(
+            fn=lambda: ui_infer_apply_preset("similarity"),
             inputs=[],
             outputs=[
                 temperature,
@@ -2570,15 +3159,49 @@ def build_app() -> gr.Blocks:
                 queue=False,
             )
 
+        infer_seed.change(
+            fn=ui_infer_on_seed_change,
+            inputs=[infer_seed],
+            outputs=[infer_save_indicator],
+            show_progress="hidden",
+            queue=False,
+        )
+
+        for component in [
+            review_after_generation,
+            review_reference_audio,
+            review_profile_raw_jsonl,
+            review_base_speaker_model,
+            review_whisper_model,
+        ]:
+            component.change(
+                fn=ui_infer_on_review_cfg_change,
+                inputs=[
+                    review_after_generation,
+                    review_reference_audio,
+                    review_profile_raw_jsonl,
+                    review_base_speaker_model,
+                    review_whisper_model,
+                ],
+                outputs=[review_profile_raw_jsonl, infer_save_indicator],
+                show_progress="hidden",
+                queue=False,
+            )
+
         single_generate_button.click(
             fn=ui_generate_single,
             inputs=[
+                infer_mode,
                 checkpoint_dropdown_infer,
                 infer_device,
                 infer_speaker_name,
                 infer_language,
                 infer_instruct,
                 single_text,
+                icl_ref_audio,
+                icl_ref_text,
+                icl_use_icl,
+                infer_seed,
                 temperature,
                 top_k,
                 top_p,
@@ -2587,6 +3210,11 @@ def build_app() -> gr.Blocks:
                 subtalker_temperature,
                 subtalker_top_k,
                 subtalker_top_p,
+                review_after_generation,
+                review_reference_audio,
+                review_profile_raw_jsonl,
+                review_base_speaker_model,
+                review_whisper_model,
             ],
             outputs=[infer_status, single_audio_output],
         )
@@ -2594,12 +3222,17 @@ def build_app() -> gr.Blocks:
         batch_generate_button.click(
             fn=ui_generate_batch,
             inputs=[
+                infer_mode,
                 checkpoint_dropdown_infer,
                 infer_device,
                 infer_speaker_name,
                 infer_language,
                 infer_instruct,
                 batch_text,
+                icl_ref_audio,
+                icl_ref_text,
+                icl_use_icl,
+                infer_seed,
                 temperature,
                 top_k,
                 top_p,
@@ -2608,6 +3241,11 @@ def build_app() -> gr.Blocks:
                 subtalker_temperature,
                 subtalker_top_k,
                 subtalker_top_p,
+                review_after_generation,
+                review_reference_audio,
+                review_profile_raw_jsonl,
+                review_base_speaker_model,
+                review_whisper_model,
             ],
             outputs=[infer_status, batch_preview_audio, batch_zip_output],
         )
@@ -2686,6 +3324,7 @@ def build_app() -> gr.Blocks:
                 checkpoint_dropdown_train,
                 checkpoint_dropdown_infer,
                 export_ckpt_dropdown,
+                review_profile_raw_jsonl,
             ],
             outputs=[
                 inspect_raw_path,
@@ -2700,6 +3339,7 @@ def build_app() -> gr.Blocks:
                 checkpoint_dropdown_train,
                 checkpoint_dropdown_infer,
                 export_ckpt_dropdown,
+                review_profile_raw_jsonl,
             ],
             queue=False,
         ).then(

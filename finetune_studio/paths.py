@@ -19,6 +19,8 @@ THIRD_PARTY_FINETUNE_DIR = (
     PROJECT_ROOT / "third_party" / "Qwen3-TTS" / "finetuning"
 ).resolve()
 
+_CHECKPOINT_EPOCH_RE = re.compile(r"checkpoint-epoch-(\d+)$")
+
 
 def ensure_workspace_dirs() -> None:
     WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
@@ -101,8 +103,71 @@ def list_run_paths() -> list[str]:
     return [str(p.resolve()) for p in runs]
 
 
+def checkpoint_epoch(path: str | Path) -> int:
+    p = Path(path)
+    m = _CHECKPOINT_EPOCH_RE.search(p.name)
+    if not m:
+        return -1
+    try:
+        return int(m.group(1))
+    except Exception:
+        return -1
+
+
+def _is_valid_safetensors_file(path: Path) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
+    try:
+        from safetensors import safe_open
+
+        with safe_open(str(path), framework="pt") as f:
+            _ = f.keys()
+        return True
+    except Exception:
+        return False
+
+
+def is_loadable_checkpoint_dir(path: str | Path) -> bool:
+    p = Path(path)
+    if not p.exists() or not p.is_dir():
+        return False
+
+    safe_file = p / "model.safetensors"
+    if safe_file.exists() and _is_valid_safetensors_file(safe_file):
+        return True
+
+    if (p / "pytorch_model.bin").exists():
+        return True
+    if (p / "model.safetensors.index.json").exists():
+        return True
+    if (p / "pytorch_model.bin.index.json").exists():
+        return True
+
+    # Sharded checkpoints can be saved without the single-file names above.
+    safe_shards = [x for x in p.glob("model-*.safetensors") if x.is_file()]
+    if safe_shards and all(_is_valid_safetensors_file(x) for x in safe_shards):
+        return True
+    if any(p.glob("pytorch_model-*.bin")):
+        return True
+    return False
+
+
+def sort_checkpoint_paths(paths: list[Path]) -> list[Path]:
+    def _key(p: Path) -> tuple[float, int, str]:
+        try:
+            mtime = float(p.stat().st_mtime)
+        except Exception:
+            mtime = 0.0
+        return (mtime, checkpoint_epoch(p), p.name)
+
+    return sorted(paths, key=_key, reverse=True)
+
+
 def list_checkpoint_paths() -> list[str]:
     ensure_workspace_dirs()
     checkpoints = [p for p in RUNS_DIR.glob("**/checkpoint-epoch-*") if p.is_dir()]
-    checkpoints = sorted(checkpoints, key=lambda p: p.stat().st_mtime, reverse=True)
+    checkpoints = sort_checkpoint_paths(checkpoints)
+    # Only expose loadable checkpoints by default to avoid selecting directories
+    # that cannot be loaded for inference/export.
+    checkpoints = [p for p in checkpoints if is_loadable_checkpoint_dir(p)]
     return [str(p.resolve()) for p in checkpoints]
