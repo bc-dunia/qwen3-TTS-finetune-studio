@@ -73,6 +73,10 @@ class JobConfig:
     job_token: str | None = None
 
 
+class UnrecoverableError(Exception):
+    pass
+
+
 class WorkerReporter:
     def __init__(self, worker_url: str, job_id: str, job_token: str) -> None:
         self.worker_url = worker_url.rstrip("/")
@@ -330,12 +334,20 @@ def parse_job_config(raw: dict[str, Any]) -> JobConfig:
 
 
 def parse_dataset_prefix(prefix: str) -> tuple[str, str]:
+    """Parse dataset_r2_prefix into (voice_id, dataset_name).
+
+    Accepts both:
+      datasets/{voice_id}/{name} -> (voice_id, name)
+      datasets/{voice_id}         -> (voice_id, "")  # root-level dataset
+    """
     parts = [p for p in prefix.strip("/").split("/") if p]
-    if len(parts) < 3 or parts[0] != "datasets":
+    if len(parts) < 2 or parts[0] != "datasets":
         raise ValueError(
-            f"dataset_r2_prefix must look like datasets/{{voice_id}}/{{name}}, got: {prefix}"
+            f"dataset_r2_prefix must start with datasets/{{voice_id}}, got: {prefix}"
         )
-    return parts[1], "/".join(parts[2:])
+    voice_id = parts[1]
+    dataset_name = "/".join(parts[2:]) if len(parts) > 2 else ""
+    return voice_id, dataset_name
 
 
 def _resolve_hf_model(model_name: str, label: str) -> str:
@@ -415,12 +427,16 @@ def stream_subprocess(
 def rewrite_jsonl_paths(jsonl_path: Path, dataset_dir: Path) -> None:
     """Rewrite audio/ref_audio paths in JSONL to be absolute under dataset_dir.
 
-    Extracts just the filename from whatever path is in the field,
-    then sets it to dataset_dir / filename. Handles:
-      /tmp/dataset/foo.wav -> /tmp/dataset/foo.wav (no change)
-      foo.wav -> /tmp/dataset/foo.wav
-      /some/other/path/foo.wav -> /tmp/dataset/foo.wav
+    Builds a filename -> absolute-path lookup by scanning dataset_dir recursively,
+    then resolves each audio/ref_audio field by filename match. This handles files
+    in subdirectories (e.g., segments/seg_000001.wav).
     """
+    # Build filename -> path lookup (last one wins if duplicates)
+    file_lookup: dict[str, str] = {}
+    for fpath in dataset_dir.rglob("*"):
+        if fpath.is_file():
+            file_lookup[fpath.name] = str(fpath)
+
     rows: list[dict[str, Any]] = []
     with jsonl_path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -435,11 +451,11 @@ def rewrite_jsonl_paths(jsonl_path: Path, dataset_dir: Path) -> None:
             if key in row and row[key]:
                 original = str(row[key])
                 filename = Path(original).name
-                new_path = str(dataset_dir / filename)
-                if new_path != original:
+                # Try lookup first, fall back to dataset_dir / filename
+                resolved = file_lookup.get(filename, str(dataset_dir / filename))
+                if resolved != original:
                     rewritten += 1
-                row[key] = new_path
-
+                row[key] = resolved
     with jsonl_path.open("w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -681,7 +697,13 @@ def preprocess_raw_audio(
     dataset_dir: Path, output_jsonl: Path, status: StatusWriter
 ) -> None:
     import torch
-    from faster_whisper import WhisperModel
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        raise UnrecoverableError(
+            "faster-whisper is not installed in this image. "
+            "Preprocessing requires faster-whisper. Please provide a pre-built train_raw.jsonl in the dataset."
+        )
 
     status.write(
         {
@@ -1110,9 +1132,7 @@ def upload_checkpoints(
     return uploaded
 
 
-def _verify_checkpoint_upload(
-    r2: R2Storage, r2_prefix: str, local_dir: Path
-) -> None:
+def _verify_checkpoint_upload(r2: R2Storage, r2_prefix: str, local_dir: Path) -> None:
     """Verify uploaded checkpoint is complete by comparing local vs R2 file counts."""
     local_files: dict[str, int] = {}
     for fpath in local_dir.rglob("*"):
@@ -1148,9 +1168,7 @@ def _verify_checkpoint_upload(
     for rel_path, local_size in local_files.items():
         r2_size = r2_files.get(rel_path, -1)
         if r2_size != local_size:
-            size_mismatches.append(
-                f"{rel_path}: local={local_size} r2={r2_size}"
-            )
+            size_mismatches.append(f"{rel_path}: local={local_size} r2={r2_size}")
     if size_mismatches:
         raise RuntimeError(
             f"Checkpoint verification FAILED: {len(size_mismatches)} file(s) size mismatch: "
@@ -1195,11 +1213,15 @@ def main() -> int:
     status = StatusWriter(r2, job_id)
     log_buffer: LogBuffer | None = None
     upload_verified = False
+    training_started = False
     try:
         raw_cfg = r2.read_job_config(job_id)
         if raw_cfg is None:
-            raise RuntimeError(f"Job config not found for job_id={job_id}")
-        cfg = parse_job_config(raw_cfg)
+            raise UnrecoverableError(f"Job config not found for job_id={job_id}")
+        try:
+            cfg = parse_job_config(raw_cfg)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise UnrecoverableError(f"Invalid job config: {exc}") from exc
 
         worker_api_url = (
             os.environ.get(WORKER_API_URL_ENV, "").strip() or cfg.worker_api_url or ""
@@ -1217,7 +1239,10 @@ def main() -> int:
             )
         log_buffer = LogBuffer(r2, job_id, reporter)
 
-        dataset_voice_id, dataset_name = parse_dataset_prefix(cfg.dataset_r2_prefix)
+        try:
+            dataset_voice_id, dataset_name = parse_dataset_prefix(cfg.dataset_r2_prefix)
+        except ValueError as exc:
+            raise UnrecoverableError(f"Invalid dataset_r2_prefix: {exc}") from exc
         if dataset_voice_id != cfg.voice_id:
             LOGGER.warning(
                 "voice_id mismatch: config=%s dataset=%s (using config voice_id for uploads)",
@@ -1232,7 +1257,10 @@ def main() -> int:
         if DATASET_DIR.exists():
             shutil.rmtree(DATASET_DIR)
         DATASET_DIR.mkdir(parents=True, exist_ok=True)
-        r2.download_dataset(dataset_voice_id, dataset_name, DATASET_DIR)
+        try:
+            r2.download_dataset(dataset_voice_id, dataset_name, DATASET_DIR)
+        except Exception as exc:
+            raise UnrecoverableError(f"Dataset download failed: {exc}") from exc
 
         train_raw_jsonl = DATASET_DIR / "train_raw.jsonl"
         generated_train_raw = False
@@ -1243,7 +1271,10 @@ def main() -> int:
                     "message": "Segmenting and transcribing audio...",
                 }
             )
-            preprocess_raw_audio(DATASET_DIR, train_raw_jsonl, status)
+            try:
+                preprocess_raw_audio(DATASET_DIR, train_raw_jsonl, status)
+            except (FileNotFoundError, RuntimeError) as exc:
+                raise UnrecoverableError(f"Preprocessing failed: {exc}") from exc
             generated_train_raw = True
 
         # Rewrite JSONL paths to match downloaded file locations
@@ -1252,14 +1283,20 @@ def main() -> int:
 
         # Validate dataset integrity (all files exist, required keys present)
         status.write({"status": "validating", "message": "Validating dataset..."})
-        validate_dataset(train_raw_jsonl)
+        try:
+            validate_dataset(train_raw_jsonl)
+        except ValueError as exc:
+            raise UnrecoverableError(f"Dataset validation failed: {exc}") from exc
 
         # Ensure all audio is 24kHz (resample if needed)
         validate_audio_format(train_raw_jsonl)
 
         status.heartbeat(message="Resolving base model and tokenizer")
-        base_model = resolve_base_model(cfg.model_size)
-        tokenizer_model = resolve_tokenizer_model()
+        try:
+            base_model = resolve_base_model(cfg.model_size)
+            tokenizer_model = resolve_tokenizer_model()
+        except Exception as exc:
+            raise UnrecoverableError(f"Model resolution failed: {exc}") from exc
         finetune_dir = resolve_finetune_dir()
         train_with_codes = DATASET_DIR / "train_with_codes.jsonl"
         run_prepare(
@@ -1276,6 +1313,7 @@ def main() -> int:
         if output_dir.exists():
             LOGGER.warning("Removing existing output directory: %s", output_dir)
             shutil.rmtree(output_dir)
+        training_started = True
         run_training(
             finetune_dir=finetune_dir,
             base_model=base_model,
@@ -1293,6 +1331,13 @@ def main() -> int:
         status.write({"status": "completed", "checkpoints": checkpoints})
         LOGGER.info("Job completed successfully — checkpoint uploaded and verified")
         return 0
+    except UnrecoverableError as exc:
+        LOGGER.error("Unrecoverable error (pod will terminate): %s", exc)
+        try:
+            status.write({"status": "failed", "error": str(exc)})
+        except Exception:
+            LOGGER.exception("Failed to write failed status")
+        return 1
     except Exception as exc:
         LOGGER.exception("Job failed: %s", exc)
         try:
@@ -1306,17 +1351,20 @@ def main() -> int:
                 log_buffer.close()
             except Exception:
                 LOGGER.exception("Failed to flush log buffer")
-        # SAFETY: Only terminate pod if checkpoint upload was verified.
-        # If upload failed or was never reached, keep the pod alive so
-        # the checkpoint can be manually recovered from ephemeral storage.
         if upload_verified:
+            terminate_pod()
+        elif not training_started:
+            LOGGER.info(
+                "Pre-training failure — no checkpoints to recover. Terminating pod."
+            )
             terminate_pod()
         else:
             LOGGER.warning(
-                "SKIPPING pod termination — checkpoint upload was NOT verified. "
+                "SKIPPING pod termination — training started but checkpoint upload was NOT verified. "
                 "Pod will remain alive for manual recovery. "
                 "Use RunPod dashboard or API to terminate manually after recovery."
             )
+
 
 if __name__ == "__main__":
     sys.exit(main())

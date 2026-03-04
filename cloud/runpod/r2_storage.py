@@ -364,7 +364,7 @@ class R2Storage:
         local_dir: str | Path,
     ) -> Path:
         """Download a dataset from R2 to a local directory."""
-        prefix = f"{PREFIX_DATASETS}/{voice_id}/{dataset_name}/"
+        prefix = f"{PREFIX_DATASETS}/{voice_id}/{dataset_name}/" if dataset_name else f"{PREFIX_DATASETS}/{voice_id}/"
         local_dir = Path(local_dir)
         local_dir.mkdir(parents=True, exist_ok=True)
 

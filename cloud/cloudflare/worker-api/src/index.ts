@@ -35,7 +35,13 @@ app.onError((err, c) => {
     return c.json({ detail: { status: "error", message: "Invalid JSON in request body" } }, 400);
   }
   console.error("Unhandled error:", err);
-  return c.json({ detail: { status: "error", message: "Internal server error" } }, 500);
+  // Pass through useful error messages from upstream services (RunPod, R2, etc.)
+  const message = err instanceof Error ? err.message : "Internal server error";
+  // Detect RunPod supply constraint errors
+  if (message.includes("no longer any instances available") || message.includes("SUPPLY_CONSTRAINT")) {
+    return c.json({ detail: { status: "error", message: "No GPU instances currently available. Please try again later or use a different GPU type.", gpu_error: message } }, 503);
+  }
+  return c.json({ detail: { status: "error", message } }, 500);
 });
 
 export default app;

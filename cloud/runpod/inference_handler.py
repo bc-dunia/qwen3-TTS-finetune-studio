@@ -254,6 +254,8 @@ def _ensure_merged_checkpoint(
         normalized_prefix = r2_prefix.strip().strip("/")
         if not normalized_prefix:
             raise ValueError("Missing checkpoint_info.r2_prefix for full checkpoint")
+        if ".." in normalized_prefix.split("/"):
+            raise ValueError("Invalid r2_prefix: path traversal not allowed")
         root = CHECKPOINT_ROOT / voice_id / "full" / normalized_prefix
         merged_dir = root / f"merged-{model_id}"
         merge_key = f"{voice_id}/full/{normalized_prefix}/{model_id}"
@@ -572,6 +574,10 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         run_name = str(ck.get("run_name", "")).strip()
         epoch = _to_int(ck.get("epoch"))
         r2_prefix = str(ck.get("r2_prefix", "")).strip()
+        if r2_prefix and (".." in r2_prefix.split("/") or r2_prefix.startswith("/")):
+            return {
+                "error": "Invalid checkpoint_info.r2_prefix: path traversal not allowed"
+            }
 
         if checkpoint_type == "full":
             if not r2_prefix:

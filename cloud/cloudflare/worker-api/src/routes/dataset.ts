@@ -88,8 +88,10 @@ app.post("/:voice_id", async (c) => {
   // Copy all audio files to dataset directory and build JSONL lines
   const jsonlLines: string[] = [];
 
-  for (const item of body.items) {
-    const audioFilename = extractFilename(item.audio_r2_key);
+  for (let i = 0; i < body.items.length; i++) {
+    const item = body.items[i];
+    const rawFilename = extractFilename(item.audio_r2_key);
+    const audioFilename = `${String(i).padStart(6, "0")}_${rawFilename}`;
 
     // Copy audio file into dataset directory
     const audioObj = await c.env.R2.get(item.audio_r2_key);

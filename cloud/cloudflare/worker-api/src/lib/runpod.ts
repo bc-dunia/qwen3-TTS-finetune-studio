@@ -74,6 +74,10 @@ export const createPod = async (
   const input: Record<string, unknown> = {
     templateId,
     env: envVars,
+    cloudType: "ALL",
+    gpuCount: 1,
+    containerDiskInGb: 50,
+    volumeInGb: 0,
   };
   if (gpuTypeId) {
     input.gpuTypeId = gpuTypeId;

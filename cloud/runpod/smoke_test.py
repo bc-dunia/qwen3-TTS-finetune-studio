@@ -22,11 +22,16 @@ def main() -> int:
         "huggingface_hub",
         "soundfile",
         "numpy",
-        "librosa",
         "boto3",
         "botocore",
         "runpod",
         "qwen_tts",
+    ]
+
+    # Optional modules (only needed for preprocessing, not training)
+    optional_modules = [
+        "librosa",
+        "faster_whisper",
     ]
 
     for module in required_modules:
@@ -35,6 +40,11 @@ def main() -> int:
         except ImportError as e:
             errors.append(f"Missing module: {module} ({e})")
 
+    for module in optional_modules:
+        try:
+            __import__(module)
+        except ImportError:
+            print(f"INFO: Optional module not installed: {module}")
     # System binaries
     for binary in ["ffmpeg", "python3"]:
         if not shutil.which(binary):

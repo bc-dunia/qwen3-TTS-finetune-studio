@@ -1,0 +1,28 @@
+# Training handler dependencies (lighter than full requirements.txt)
+# Does NOT include faster-whisper (preprocessing uses it, but our dataset
+# already has train_raw.jsonl so preprocessing is skipped)
+
+# RunPod SDK
+runpod>=1.7.0
+
+# Qwen3-TTS model
+qwen-tts>=0.1.1
+
+# PyTorch (provided by base Docker image, listed for reference)
+# torch>=2.1.0
+
+# HuggingFace
+transformers>=4.40.0
+accelerate>=0.30.0
+safetensors>=0.4.0
+huggingface-hub>=0.23.0
+
+# Audio processing
+soundfile>=0.12.0
+numpy>=1.24.0
+
+# R2 / S3 client
+boto3>=1.34.0
+
+# HTTP client (used by WorkerReporter and pod termination)
+requests>=2.31.0

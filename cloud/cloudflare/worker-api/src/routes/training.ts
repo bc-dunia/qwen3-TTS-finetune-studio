@@ -101,14 +101,39 @@ app.post("/start", async (c) => {
     return c.json({ detail: { message: "Voice not found" } }, 404);
   }
 
+  const activeJobs = await listTrainingJobs(c.env.DB, { voice_id: body.voice_id, limit: 10 });
+  const hasActiveJob = activeJobs.some((j) =>
+    ["pending", "provisioning", "downloading", "preprocessing", "preparing", "training", "uploading"].includes(j.status)
+  );
+  if (hasActiveJob) {
+    return c.json(
+      { detail: { message: "A training job is already active for this voice. Cancel it first or wait for completion." } },
+      409
+    );
+  }
+
   const now = Date.now();
   const jobId = crypto.randomUUID();
   const jobToken = crypto.randomUUID();
   const workerUrl = new URL(c.req.url).origin;
   const runName = `run_${jobId.slice(0, 8)}`;
-  const datasetPrefix = `datasets/${body.voice_id}/${body.dataset_name ?? "default"}`;
-  const jobDatasetPrefix = `${datasetPrefix}/${runName}`;
+  const datasetPrefix = body.dataset_name ? `datasets/${body.voice_id}/${body.dataset_name}` : `datasets/${body.voice_id}`;
   const config = body.config ?? {};
+  const cfg = config as Record<string, unknown>;
+
+  const numEpochs = Number(config.num_epochs ?? cfg.epochs ?? 5);
+  const batchSize = Number(config.batch_size ?? 2);
+  const maxSteps = Number(cfg.max_steps ?? 0);
+
+  if (numEpochs < 1 || numEpochs > 30) {
+    return c.json({ detail: { message: "num_epochs must be between 1 and 30" } }, 400);
+  }
+  if (batchSize < 1 || batchSize > 16) {
+    return c.json({ detail: { message: "batch_size must be between 1 and 16" } }, 400);
+  }
+  if (maxSteps < 0 || maxSteps > 100000) {
+    return c.json({ detail: { message: "max_steps must be between 0 and 100000" } }, 400);
+  }
 
   const job: TrainingJob = {
     job_id: jobId,
@@ -120,7 +145,7 @@ app.post("/start", async (c) => {
     progress: {},
     summary: {},
     metrics: {},
-    dataset_r2_prefix: jobDatasetPrefix,
+    dataset_r2_prefix: datasetPrefix,
     log_r2_prefix: null,
     error_message: null,
     last_heartbeat_at: null,
@@ -131,7 +156,6 @@ app.post("/start", async (c) => {
   };
 
   await createTrainingJob(c.env.DB, job);
-  const cfg = config as Record<string, unknown>;
   const jobConfig = {
     voice_id: body.voice_id,
     dataset_r2_prefix: datasetPrefix,
@@ -160,13 +184,43 @@ app.post("/start", async (c) => {
     httpMetadata: { contentType: "application/json" },
   });
 
-  const gpuTypeId = typeof config.gpu_type_id === "string" ? config.gpu_type_id : "";
-  const pod = await createPod(c.env, c.env.RUNPOD_TRAINING_TEMPLATE_ID, gpuTypeId, [
-    { key: "JOB_ID", value: jobId },
-    { key: "VOICE_ID", value: body.voice_id },
-    { key: "WORKER_API_URL", value: workerUrl },
-    { key: "JOB_TOKEN", value: jobToken },
-  ]);
+  // Default GPU based on model size: 1.7B needs ≥40GB VRAM, 0.6B fits on 24GB
+  const modelSize = typeof config.model_size === "string" ? config.model_size : "1.7B";
+  const defaultGpu = modelSize.includes("0.6") ? "NVIDIA GeForce RTX 4090" : "NVIDIA L40S";
+  const gpuTypeId = typeof config.gpu_type_id === "string" && config.gpu_type_id ? config.gpu_type_id : defaultGpu;
+
+  const datasetListing = await c.env.R2.list({ prefix: `${datasetPrefix}/`, limit: 1 });
+  if (!datasetListing.objects || datasetListing.objects.length === 0) {
+    await updateTrainingJob(c.env.DB, jobId, {
+      status: "failed",
+      error_message: `Dataset not found at R2 prefix: ${datasetPrefix}/`,
+      completed_at: Date.now(),
+    });
+    return c.json(
+      { detail: { message: `Dataset not found at R2 prefix: ${datasetPrefix}/. Upload audio files first.` } },
+      400
+    );
+  }
+
+  let pod: { podId: string; desiredStatus: string };
+  try {
+    pod = await createPod(c.env, c.env.RUNPOD_TRAINING_TEMPLATE_ID, gpuTypeId, [
+      { key: "JOB_ID", value: jobId },
+      { key: "VOICE_ID", value: body.voice_id },
+      { key: "WORKER_API_URL", value: workerUrl },
+      { key: "JOB_TOKEN", value: jobToken },
+    ]);
+  } catch (podError) {
+    // Pod creation failed (e.g., GPU supply constraint) — mark job as failed
+    const errMsg = podError instanceof Error ? podError.message : String(podError);
+    await updateTrainingJob(c.env.DB, jobId, {
+      status: "failed",
+      error_message: errMsg,
+      completed_at: Date.now(),
+    });
+    // Re-throw to let the global error handler return appropriate status
+    throw podError;
+  }
 
   await updateTrainingJob(c.env.DB, jobId, {
     runpod_pod_id: pod.podId,
@@ -265,6 +319,14 @@ app.get("/:job_id", async (c) => {
     return c.json({ detail: { message: "Training job not found" } }, 404);
   }
 
+  if (job.status !== "completed" && job.status !== "failed" && job.status !== "cancelled") {
+    await reconcileJobStatus(c, job);
+    const updated = await getTrainingJob(c.env.DB, jobId);
+    if (updated) {
+      return c.json(serializeTrainingJob(updated));
+    }
+  }
+
   return c.json(serializeTrainingJob(job));
 });
 
@@ -277,7 +339,11 @@ app.post("/:job_id/cancel", async (c) => {
   }
 
   if (job.runpod_pod_id) {
-    await terminatePod(c.env, job.runpod_pod_id);
+    try {
+      await terminatePod(c.env, job.runpod_pod_id);
+    } catch {
+      // Pod may already be terminated — safe to ignore
+    }
   }
 
   await updateTrainingJob(c.env.DB, jobId, {

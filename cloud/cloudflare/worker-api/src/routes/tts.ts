@@ -44,6 +44,9 @@ const runTtsRequest = async (c: Context<AppContext>): Promise<Response> => {
   if (!body.text || !body.text.trim()) {
     return c.json({ detail: { message: "text is required" } }, 400);
   }
+  if (body.text.length > 5000) {
+    return c.json({ detail: { message: "text must be 5000 characters or less" } }, 400);
+  }
 
   const voice = await getVoice(c.env.DB, voiceId);
   if (!voice || voice.status !== "ready") {

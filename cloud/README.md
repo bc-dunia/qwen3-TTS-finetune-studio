@@ -49,6 +49,7 @@ npx wrangler d1 create qwen-tts-db
 
 # Run database migrations
 npx wrangler d1 execute qwen-tts-db --file=schema.sql
+npx wrangler d1 execute qwen-tts-db --file=schema-v2.sql
 
 # Create KV namespace
 npx wrangler kv namespace create TTS_CACHE

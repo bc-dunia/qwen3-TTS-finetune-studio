@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { authMiddleware } from "../middleware/auth";
-import { createVoice, deleteVoice, getVoice, listVoices } from "../lib/d1";
+import { createVoice, deleteVoice, getVoice, listTrainingJobs, listVoices } from "../lib/d1";
 import type { AppContext, Voice } from "../types";
 
 const app = new Hono<AppContext>();
@@ -147,6 +147,17 @@ app.post("/add", async (c) => {
 
 app.delete("/:voice_id", async (c) => {
   const voiceId = c.req.param("voice_id");
+
+  const activeJobs = await listTrainingJobs(c.env.DB, { voice_id: voiceId, limit: 5 });
+  const hasActiveJob = activeJobs.some((j) =>
+    ["pending", "provisioning", "downloading", "preprocessing", "preparing", "training", "uploading"].includes(j.status)
+  );
+  if (hasActiveJob) {
+    return c.json(
+      { detail: { message: "Cannot delete voice while training is active. Cancel the training job first." } },
+      409
+    );
+  }
 
   await deleteVoice(c.env.DB, voiceId);
 
