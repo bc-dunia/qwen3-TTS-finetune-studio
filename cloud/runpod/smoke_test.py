@@ -24,12 +24,12 @@ def main() -> int:
         "numpy",
         "boto3",
         "botocore",
-        "qwen_tts",
         "einops",
     ]
 
-    # Optional modules (not in slim training image)
+    # Optional: installed but may have missing transitive deps (--no-deps)
     optional_modules = [
+        "qwen_tts",  # installed --no-deps, top-level import needs librosa
         "runpod",
         "librosa",
         "faster_whisper",
@@ -46,6 +46,18 @@ def main() -> int:
             __import__(module)
         except ImportError:
             print(f"INFO: Optional module not installed: {module}")
+
+    # Verify qwen_tts submodules used by training scripts work
+    qwen_submodules = [
+        "qwen_tts.core.models.configuration_qwen3_tts",
+        "qwen_tts.core.models.modeling_qwen3_tts",
+    ]
+    for submod in qwen_submodules:
+        try:
+            __import__(submod)
+        except ImportError as e:
+            # May fail at build time due to missing CUDA — warn only
+            print(f"WARNING: {submod} import failed: {e}")
     # System binaries
     for binary in ["ffmpeg", "python3"]:
         if not shutil.which(binary):
