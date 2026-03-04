@@ -1,28 +1,26 @@
-# Training handler dependencies (lighter than full requirements.txt)
-# Does NOT include faster-whisper (preprocessing uses it, but our dataset
-# already has train_raw.jsonl so preprocessing is skipped)
+# Training handler dependencies — MINIMAL for smallest Docker image
+# The base image (runpod/pytorch) already provides: torch, numpy, CUDA libs
+#
+# Key size optimizations:
+# - qwen-tts installed with --no-deps (avoids gradio, torchaudio, onnxruntime, sox)
+# - No faster-whisper/CTranslate2 (preprocessing skipped if train_raw.jsonl exists)
+# - No librosa (only needed for resampling, our audio is already 24kHz)
 
-# RunPod SDK
+# RunPod SDK (~small)
 runpod>=1.7.0
 
-# Qwen3-TTS model
-qwen-tts>=0.1.1
-
-# PyTorch (provided by base Docker image, listed for reference)
-# torch>=2.1.0
-
-# HuggingFace
+# HuggingFace stack (required by training scripts)
 transformers>=4.40.0
 accelerate>=0.30.0
 safetensors>=0.4.0
 huggingface-hub>=0.23.0
+einops
 
-# Audio processing
+# Audio processing (~small, needed by dataset.py mel_spectrogram)
 soundfile>=0.12.0
-numpy>=1.24.0
 
 # R2 / S3 client
 boto3>=1.34.0
 
-# HTTP client (used by WorkerReporter and pod termination)
+# HTTP client (WorkerReporter + pod termination)
 requests>=2.31.0

@@ -209,6 +209,11 @@ app.post("/start", async (c) => {
       { key: "VOICE_ID", value: body.voice_id },
       { key: "WORKER_API_URL", value: workerUrl },
       { key: "JOB_TOKEN", value: jobToken },
+      { key: "R2_ENDPOINT_URL", value: c.env.R2_ENDPOINT_URL },
+      { key: "R2_ACCESS_KEY_ID", value: c.env.R2_ACCESS_KEY_ID },
+      { key: "R2_SECRET_ACCESS_KEY", value: c.env.R2_SECRET_ACCESS_KEY },
+      { key: "R2_BUCKET", value: "qwen-tts-studio" },
+      { key: "RUNPOD_API_KEY", value: c.env.RUNPOD_API_KEY },
     ]);
   } catch (podError) {
     // Pod creation failed (e.g., GPU supply constraint) — mark job as failed
