@@ -59,6 +59,9 @@ jobs:
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo rm -rf /usr/share/swift /usr/share/miniconda /opt/hostedtoolcache
+          sudo rm -rf /usr/local/share/powershell /usr/local/share/chromium
+          sudo docker system prune -af --volumes || true
           df -h
 
       - name: Set up Docker Buildx

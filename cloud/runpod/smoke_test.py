@@ -13,7 +13,7 @@ import sys
 def main() -> int:
     errors: list[str] = []
 
-    # Core Python modules required by training and inference handlers
+    # Core modules needed by training handler and scripts
     required_modules = [
         "torch",
         "transformers",
@@ -24,12 +24,13 @@ def main() -> int:
         "numpy",
         "boto3",
         "botocore",
-        "runpod",
         "qwen_tts",
+        "einops",
     ]
 
-    # Optional modules (only needed for preprocessing, not training)
+    # Optional modules (not in slim training image)
     optional_modules = [
+        "runpod",
         "librosa",
         "faster_whisper",
     ]
