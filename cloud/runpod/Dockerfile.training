@@ -35,7 +35,7 @@ COPY cloud/runpod/training_handler.py /app/training_handler.py
 
 # Pre-download tokenizer into image (required for prepare_data.py)
 # The tokenizer is separate from the base model and is ~200MB
-RUN python3 -c "\
+RUN HF_HUB_ENABLE_HF_TRANSFER=0 python3 -c "\
 from huggingface_hub import snapshot_download; \
 snapshot_download('Qwen/Qwen3-TTS-Tokenizer-12Hz', local_dir='/models/Qwen3-TTS-Tokenizer-12Hz')"
 
