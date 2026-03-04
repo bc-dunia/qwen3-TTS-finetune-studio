@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import json
 import random
 import shutil
@@ -24,6 +25,7 @@ class LoadedModel:
 
 _MODEL_CACHE: LoadedModel | None = None
 _BASE_MODEL_CACHE: LoadedModel | None = None
+_CACHE_LOCK = threading.Lock()
 MIN_NEW_TOKENS_DEFAULT = int(os.environ.get("QWEN_TTS_MIN_NEW_TOKENS", "0"))
 _ADAPTIVE_MAX_TOKENS_DISABLED = (
     os.environ.get("QWEN_TTS_DISABLE_ADAPTIVE_MAX_TOKENS", "0") == "1"
@@ -177,19 +179,8 @@ def _resolve_dtype(device: str) -> Any:
     return torch.float32
 
 
-def _load_model(model_path: str, device: str) -> tuple[Any, str]:
-    global _MODEL_CACHE
-
-    resolved_path = _resolve_model_path(model_path)
-    resolved_device = _resolve_device(device)
-
-    if (
-        _MODEL_CACHE is not None
-        and _MODEL_CACHE.model_path == resolved_path
-        and _MODEL_CACHE.device == resolved_device
-    ):
-        return _MODEL_CACHE.model, resolved_device
-
+def _try_load_pretrained(resolved_path: str, resolved_device: str, err_prefix: str) -> Any:
+    """Load Qwen3TTSModel with 4-candidate fallback. Returns loaded model."""
     from qwen_tts import Qwen3TTSModel
 
     dtype = _resolve_dtype(resolved_device)
@@ -223,33 +214,53 @@ def _load_model(model_path: str, device: str) -> tuple[Any, str]:
 
     if model is None:
         if last_error:
-            raise RuntimeError(f"Failed to load model: {last_error}") from last_error
-        raise RuntimeError("Failed to load model.")
+            raise RuntimeError(f"{err_prefix}: {last_error}") from last_error
+        raise RuntimeError(f"{err_prefix}.")
 
     try:
         model.model.eval()
     except Exception:
         pass
-    _patch_generate_min_tokens(model)
+    return model
 
-    _set_model_cache(
-        LoadedModel(
-            model_path=resolved_path,
-            device=resolved_device,
-            model=model,
+
+def _load_model(model_path: str, device: str) -> tuple[Any, str]:
+    global _MODEL_CACHE
+
+    resolved_path = _resolve_model_path(model_path)
+    resolved_device = _resolve_device(device)
+
+    with _CACHE_LOCK:
+        if (
+            _MODEL_CACHE is not None
+            and _MODEL_CACHE.model_path == resolved_path
+            and _MODEL_CACHE.device == resolved_device
+        ):
+            return _MODEL_CACHE.model, resolved_device
+
+        model = _try_load_pretrained(resolved_path, resolved_device, "Failed to load model")
+        _patch_generate_min_tokens(model)
+
+        _set_model_cache(
+            LoadedModel(
+                model_path=resolved_path,
+                device=resolved_device,
+                model=model,
+            )
         )
-    )
-    return model, resolved_device
+        return model, resolved_device
 
 
 def _load_base_model(device: str) -> tuple[Any, str]:
     global _BASE_MODEL_CACHE
 
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+        hub_cache = Path(HF_HUB_CACHE)
+    except Exception:
+        hub_cache = Path.home() / ".cache" / "huggingface" / "hub"
     snapshots_dir = (
-        Path.home()
-        / ".cache"
-        / "huggingface"
-        / "hub"
+        hub_cache
         / "models--Qwen--Qwen3-TTS-12Hz-0.6B-Base"
         / "snapshots"
     )
@@ -265,64 +276,24 @@ def _load_base_model(device: str) -> tuple[Any, str]:
     resolved_path = _resolve_model_path(base_source)
     resolved_device = _resolve_device(device)
 
-    if (
-        _BASE_MODEL_CACHE is not None
-        and _BASE_MODEL_CACHE.model_path == resolved_path
-        and _BASE_MODEL_CACHE.device == resolved_device
-    ):
-        return _BASE_MODEL_CACHE.model, resolved_device
+    with _CACHE_LOCK:
+        if (
+            _BASE_MODEL_CACHE is not None
+            and _BASE_MODEL_CACHE.model_path == resolved_path
+            and _BASE_MODEL_CACHE.device == resolved_device
+        ):
+            return _BASE_MODEL_CACHE.model, resolved_device
 
-    from qwen_tts import Qwen3TTSModel
+        model = _try_load_pretrained(resolved_path, resolved_device, "Failed to load base model")
 
-    dtype = _resolve_dtype(resolved_device)
-    attn = "flash_attention_2" if resolved_device.startswith("cuda") else None
-
-    candidates = [
-        {
-            "device_map": resolved_device,
-            "dtype": dtype,
-            "attn_implementation": attn,
-        },
-        {
-            "device_map": resolved_device,
-            "torch_dtype": dtype,
-            "attn_implementation": attn,
-        },
-        {"device_map": resolved_device, "dtype": dtype},
-        {"device_map": resolved_device},
-    ]
-
-    last_error: Exception | None = None
-    model = None
-    for kwargs in candidates:
-        kwargs = {k: v for k, v in kwargs.items() if v is not None}
-        try:
-            model = Qwen3TTSModel.from_pretrained(resolved_path, **kwargs)
-            break
-        except Exception as e:
-            last_error = e
-            continue
-
-    if model is None:
-        if last_error:
-            raise RuntimeError(
-                f"Failed to load base model: {last_error}"
-            ) from last_error
-        raise RuntimeError("Failed to load base model.")
-
-    try:
-        model.model.eval()
-    except Exception:
-        pass
-
-    _set_base_model_cache(
-        LoadedModel(
-            model_path=resolved_path,
-            device=resolved_device,
-            model=model,
+        _set_base_model_cache(
+            LoadedModel(
+                model_path=resolved_path,
+                device=resolved_device,
+                model=model,
+            )
         )
-    )
-    return model, resolved_device
+        return model, resolved_device
 
 
 def _seed_everything(seed: int | None) -> int | None:
@@ -347,8 +318,9 @@ def _seed_everything(seed: int | None) -> int | None:
 
 
 def unload_model() -> str:
-    _set_model_cache(None)
-    _set_base_model_cache(None)
+    with _CACHE_LOCK:
+        _set_model_cache(None)
+        _set_base_model_cache(None)
     try:
         import gc
         import torch
@@ -365,6 +337,20 @@ def unload_model() -> str:
     except Exception:
         pass
     return "Model cache cleared."
+
+
+def _reraise_nan_inf(e: RuntimeError) -> None:
+    """Re-raise with a user-friendly hint if the error is a NaN/Inf sampling failure."""
+    msg = str(e)
+    if "probability tensor contains either" in msg and (
+        "nan" in msg.lower() or "inf" in msg.lower()
+    ):
+        raise RuntimeError(
+            f"{msg}\n"
+            "Hint: this often happens due to unstable sampling on some devices/dtypes. "
+            "Try `device=cpu`, reduce `temperature`, or use a smaller `max_new_tokens`."
+        ) from e
+
 
 
 def _generate_audio(
@@ -401,15 +387,7 @@ def _generate_audio(
         )
         return wavs[0], sr
     except RuntimeError as e:
-        msg = str(e)
-        if "probability tensor contains either" in msg and (
-            "nan" in msg.lower() or "inf" in msg.lower()
-        ):
-            raise RuntimeError(
-                f"{msg}\n"
-                "Hint: this often happens due to unstable sampling on some devices/dtypes. "
-                "Try `device=cpu`, reduce `temperature`, or use a smaller `max_new_tokens`."
-            ) from e
+        _reraise_nan_inf(e)
         raise
     except TypeError:
         pass
@@ -432,15 +410,7 @@ def _generate_audio(
         )
         return wavs[0], sr
     except RuntimeError as e:
-        msg = str(e)
-        if "probability tensor contains either" in msg and (
-            "nan" in msg.lower() or "inf" in msg.lower()
-        ):
-            raise RuntimeError(
-                f"{msg}\n"
-                "Hint: this often happens due to unstable sampling on some devices/dtypes. "
-                "Try `device=cpu`, reduce `temperature`, or use a smaller `max_new_tokens`."
-            ) from e
+        _reraise_nan_inf(e)
         raise
     except TypeError:
         wavs, sr = model.generate_custom_voice(
@@ -554,15 +524,7 @@ def synthesize_voice_clone(
         )
         audio = wavs[0]
     except RuntimeError as e:
-        msg = str(e)
-        if "probability tensor contains either" in msg and (
-            "nan" in msg.lower() or "inf" in msg.lower()
-        ):
-            raise RuntimeError(
-                f"{msg}\n"
-                "Hint: this often happens due to unstable sampling on some devices/dtypes. "
-                "Try `device=cpu`, reduce `temperature`, or use a smaller `max_new_tokens`."
-            ) from e
+        _reraise_nan_inf(e)
         raise
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -644,15 +606,7 @@ def synthesize_voice_clone_batch(
                 )
                 audio = wavs[0]
             except RuntimeError as e:
-                msg = str(e)
-                if "probability tensor contains either" in msg and (
-                    "nan" in msg.lower() or "inf" in msg.lower()
-                ):
-                    raise RuntimeError(
-                        f"{msg}\n"
-                        "Hint: this often happens due to unstable sampling on some devices/dtypes. "
-                        "Try `device=cpu`, reduce `temperature`, or use a smaller `max_new_tokens`."
-                    ) from e
+                _reraise_nan_inf(e)
                 raise
 
             out_path = wav_dir / f"{i:03d}.wav"

@@ -11,6 +11,7 @@ import soundfile as sf
 from .dataset_ops import load_raw_jsonl
 from .paths import dataset_dir, ensure_unique_dir, sanitize_name
 
+SAMPLE_RATE_HZ = 24000
 
 def _normalize_peak(wav: np.ndarray, peak: float = 0.98) -> np.ndarray:
     max_abs = float(np.max(np.abs(wav))) if wav.size else 0.0
@@ -29,7 +30,7 @@ def normalize_dataset_audio(
     raw_jsonl_path: str,
     normalized_dataset_name: str,
     *,
-    target_sr: int = 24000,
+    target_sr: int = SAMPLE_RATE_HZ,
     peak_normalize: bool = True,
 ) -> tuple[str, str]:
     rows = load_raw_jsonl(raw_jsonl_path)

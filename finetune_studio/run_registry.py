@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import json
-import os
-import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .paths import RUNS_DIR, ensure_workspace_dirs
+from .process_runner import pid_alive, pid_matches_script
 
 
 def run_summary_path(run_dir: str | Path) -> Path:
@@ -42,30 +41,6 @@ def read_run_summary(run_dir: str | Path) -> dict[str, Any]:
         return json.load(f)
 
 
-def _pid_is_alive(pid: int | None) -> bool:
-    if not isinstance(pid, int) or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-
-
-def _pid_matches_script(pid: int | None, script: str | None) -> bool:
-    if not script or not isinstance(pid, int) or pid <= 0:
-        return True
-    try:
-        cmdline = subprocess.check_output(
-            ["ps", "-p", str(pid), "-o", "command="],
-            text=True,
-        ).strip()
-    except Exception:
-        return False
-    return str(script) in cmdline
-
 
 def list_run_summaries(limit: int = 200) -> list[dict[str, Any]]:
     ensure_workspace_dirs()
@@ -93,8 +68,8 @@ def list_run_summaries(limit: int = 200) -> list[dict[str, Any]]:
                 script = summary.get("process_script")
                 is_stale = (
                     pid is None
-                    or not _pid_is_alive(pid)
-                    or not _pid_matches_script(pid, str(script) if script else None)
+                    or not pid_alive(pid)
+                    or not pid_matches_script(pid, str(script) if script else None)
                 )
                 if is_stale:
                     summary["status"] = "interrupted"

@@ -1,0 +1,22 @@
+# Ignore everything not needed for Docker builds
+.git
+.venv
+.env
+.ruff_cache
+.pytest_cache
+.mypy_cache
+.pyright
+__pycache__
+*.pyc
+workspace/
+gradio_cached_examples/
+.DS_Store
+*.egg-info
+
+# Cloud configs (not needed in RunPod images)
+cloud/cloudflare/
+cloud/runpod/.wrangler/
+
+# Node modules
+node_modules/
+.next/

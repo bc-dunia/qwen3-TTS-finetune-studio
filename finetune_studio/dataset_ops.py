@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import logging
 import json
 import shutil
 from pathlib import Path
@@ -9,6 +10,8 @@ from typing import Any
 import soundfile as sf
 
 from .paths import DATASETS_DIR, dataset_dir, ensure_unique_dir, sanitize_name
+
+logger = logging.getLogger(__name__)
 
 
 def _to_uploaded_path(item: Any) -> Path:
@@ -32,11 +35,14 @@ def _read_transcript_rows(transcript_path: Path) -> list[dict[str, Any]]:
     if suffix == ".jsonl":
         rows: list[dict[str, Any]] = []
         with transcript_path.open("r", encoding="utf-8") as f:
-            for line in f:
+            for line_num, line in enumerate(f, start=1):
                 line = line.strip()
                 if not line:
                     continue
-                rows.append(json.loads(line))
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError as exc:
+                    logger.warning("Skipping malformed JSONL line %d in %s: %s", line_num, transcript_path, exc)
         return rows
     if suffix == ".json":
         with transcript_path.open("r", encoding="utf-8") as f:
@@ -246,11 +252,14 @@ def load_raw_jsonl(path: str | Path) -> list[dict[str, Any]]:
         raise FileNotFoundError(f"JSONL not found: {p}")
     rows: list[dict[str, Any]] = []
     with p.open("r", encoding="utf-8") as f:
-        for line in f:
+        for line_num, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
-            rows.append(json.loads(line))
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                logger.warning("Skipping malformed JSONL line %d in %s: %s", line_num, p, exc)
     return rows
 
 

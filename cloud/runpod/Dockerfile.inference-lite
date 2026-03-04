@@ -1,0 +1,38 @@
+# RunPod Serverless Inference — Qwen3-TTS (Lite)
+#
+# Lighter image without baked base models.
+# Downloads full fine-tuned checkpoint from R2 on first request.
+# Cold start is ~30-60s (downloads 4.3GB model from R2).
+# Subsequent requests use cached model (warm instance).
+#
+# Build (from project root):
+#   docker build -f cloud/runpod/Dockerfile.inference-lite -t qwen3-tts-inference-lite .
+#
+# Recommended GPU: RTX 4090 (24GB) — inference uses ~4GB VRAM
+
+FROM runpod/pytorch:1.0.3-cu1281-torch271-ubuntu2204
+
+WORKDIR /app
+
+# System dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ffmpeg && \
+    rm -rf /var/lib/apt/lists/*
+
+# Python dependencies
+COPY cloud/runpod/requirements.txt /app/requirements.txt
+RUN python3 -m pip install --no-cache-dir -r requirements.txt
+
+# Copy handler code
+COPY cloud/runpod/r2_storage.py /app/r2_storage.py
+COPY cloud/runpod/inference_handler.py /app/inference_handler.py
+
+# Smoke test — skipped during build (QEMU emulation hangs on torch imports)
+# Validated at runtime instead
+COPY cloud/runpod/smoke_test.py /app/smoke_test.py
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
+
+# RunPod serverless entry point
+CMD ["python3", "-u", "inference_handler.py"]

@@ -10,3 +10,18 @@ __pycache__/
 
 workspace/
 gradio_cached_examples/
+
+# Cloud deployment
+cloud/cloudflare/worker-api/node_modules/
+cloud/cloudflare/worker-api/.wrangler/
+cloud/cloudflare/worker-api/dist/
+cloud/cloudflare/frontend/node_modules/
+cloud/cloudflare/frontend/.next/
+cloud/cloudflare/frontend/.wrangler/
+cloud/cloudflare/frontend/dist/
+cloud/cloudflare/frontend/tsconfig.tsbuildinfo
+.wrangler/
+
+# RunPod local testing
+cloud/runpod/__pycache__/
+cloud/runpod/*.egg-info/

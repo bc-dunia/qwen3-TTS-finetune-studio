@@ -23,6 +23,7 @@ class DatasetIssue:
     message: str
     row_index: int | None = None
 
+SAMPLE_RATE_HZ = 24000
 
 def _safe_audio_info(path: Path) -> tuple[int | None, float]:
     try:
@@ -244,7 +245,7 @@ def _estimate_required_disk_gb(
     checkpoint_count = max(1, num_epochs)
     checkpoints_gb = base_ckpt_gb * checkpoint_count
 
-    data_gb = (total_audio_sec * 24000 * 2) / (1024**3)  # mono 16-bit WAV rough
+    data_gb = (total_audio_sec * SAMPLE_RATE_HZ * 2) / (1024**3)  # mono 16-bit WAV rough
     # data_gb is usually small; include preprocessing/export overhead.
     overhead_gb = max(2.0, data_gb * 2.0)
     return round(checkpoints_gb + overhead_gb, 2)
@@ -532,7 +533,7 @@ def run_preflight_review(
             requirement="All train audio should be 24kHz mono.",
             passed="NON_24K_SAMPLE_RATE" not in issue_codes,
             current=f"sample_rates={summary.get('sample_rates', {})}",
-            target="{24000: N}",
+            target=f"{{{SAMPLE_RATE_HZ}: N}}",
             impact="Resampling at runtime may lower consistency and quality.",
             action="Run Normalize step before prepare/train.",
         ),
@@ -839,14 +840,14 @@ def validate_dataset(raw_jsonl_path: str | Path) -> dict[str, Any]:
                 ref_audio_counts.get(str(ref_path.resolve()), 0) + 1
             )
             ref_sr, ref_dur = _safe_audio_info(ref_path)
-            if ref_sr is not None and ref_sr != 24000:
+            if ref_sr is not None and ref_sr != SAMPLE_RATE_HZ:
                 # Training dataset (official) asserts ref_audio is 24kHz when extracting mels.
                 issues.append(
                     DatasetIssue(
                         severity="error",
                         code="REF_NON_24K_SAMPLE_RATE",
                         row_index=idx,
-                        message=f"ref_audio sample rate is {ref_sr}Hz (required 24000Hz). Use Normalize step.",
+                        message=f"ref_audio sample rate is {ref_sr}Hz (required {SAMPLE_RATE_HZ}Hz). Use Normalize step.",
                     )
                 )
             if ref_dur > 0 and ref_dur < 2.0:
@@ -861,13 +862,13 @@ def validate_dataset(raw_jsonl_path: str | Path) -> dict[str, Any]:
 
         if sr is not None:
             sample_rates[sr] = sample_rates.get(sr, 0) + 1
-            if sr != 24000:
+            if sr != SAMPLE_RATE_HZ:
                 issues.append(
                     DatasetIssue(
                         severity="warning",
                         code="NON_24K_SAMPLE_RATE",
                         row_index=idx,
-                        message=f"Sample rate is {sr}Hz (recommended 24000Hz).",
+                        message=f"Sample rate is {sr}Hz (recommended {SAMPLE_RATE_HZ}Hz).",
                     )
                 )
 
@@ -1098,20 +1099,20 @@ def format_preflight_report(report: dict[str, Any], max_lines: int = 280) -> str
     return "\n".join(lines)
 
 
-def save_quality_report(report: dict[str, Any], output_path: str | Path) -> str:
+def _save_json_report(report: dict[str, Any], output_path: str | Path) -> str:
     out = Path(output_path).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
     return str(out)
+
+
+def save_quality_report(report: dict[str, Any], output_path: str | Path) -> str:
+    return _save_json_report(report, output_path)
 
 
 def save_preflight_report(report: dict[str, Any], output_path: str | Path) -> str:
-    out = Path(output_path).resolve()
-    out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
-    return str(out)
+    return _save_json_report(report, output_path)
 
 
 def _normalize_text_for_compare(text: str) -> str:
@@ -1212,32 +1213,55 @@ def _safe_speaker_cosine(
             return str(p.resolve())
         # Prefer locally cached 0.6B base snapshot in offline environments.
         if val == "Qwen/Qwen3-TTS-12Hz-0.6B-Base":
+            try:
+                from huggingface_hub.constants import HF_HUB_CACHE
+                hub_cache = Path(HF_HUB_CACHE)
+            except Exception:
+                hub_cache = Path.home() / ".cache" / "huggingface" / "hub"
             root = (
-                Path.home()
-                / ".cache"
-                / "huggingface"
-                / "hub"
+                hub_cache
                 / "models--Qwen--Qwen3-TTS-12Hz-0.6B-Base"
                 / "snapshots"
             )
             if root.exists():
-                snaps = sorted([d for d in root.iterdir() if d.is_dir()], key=lambda x: x.name)
+                snaps = sorted([d for d in root.iterdir() if d.is_dir()], key=lambda x: x.stat().st_mtime, reverse=True)
                 if snaps:
-                    return str(snaps[-1].resolve())
+                    return str(snaps[0].resolve())
         return val
 
     try:
         resolved_model = _resolve_local_base_model_path(base_speaker_model)
         model = Qwen3TTSModel.from_pretrained(resolved_model, device_map="cpu", dtype=torch.float32)
-        gen_wav, _ = librosa.load(str(generated_audio_path), sr=24000, mono=True)
-        ref_wav, _ = librosa.load(str(reference_audio_path), sr=24000, mono=True)
-        gen_emb = model.model.extract_speaker_embedding(gen_wav.astype(np.float32), 24000).float().cpu().numpy()
-        ref_emb = model.model.extract_speaker_embedding(ref_wav.astype(np.float32), 24000).float().cpu().numpy()
+        gen_wav, _ = librosa.load(str(generated_audio_path), sr=SAMPLE_RATE_HZ, mono=True)
+        ref_wav, _ = librosa.load(str(reference_audio_path), sr=SAMPLE_RATE_HZ, mono=True)
+        gen_emb = model.model.extract_speaker_embedding(gen_wav.astype(np.float32), SAMPLE_RATE_HZ).float().cpu().numpy()
+        ref_emb = model.model.extract_speaker_embedding(ref_wav.astype(np.float32), SAMPLE_RATE_HZ).float().cpu().numpy()
         den = (float(np.linalg.norm(gen_emb)) * float(np.linalg.norm(ref_emb))) + 1e-12
         val = float(np.dot(gen_emb, ref_emb) / den)
         return val, None
     except Exception as e:
         return None, f"speaker cosine failed: {e}"
+
+
+def _metric_check(
+    name: str,
+    value: float | None,
+    target: str,
+    pass_lo: float,
+    warn_lo: float,
+    pass_hi: float | None = None,
+    warn_hi: float | None = None,
+) -> dict[str, Any]:
+    """Return a pass/warn/fail/unknown check dict for a single metric."""
+    if value is None:
+        return {"name": name, "status": "unknown", "value": None, "target": target}
+    phi = float("inf") if pass_hi is None else pass_hi
+    whi = float("inf") if warn_hi is None else warn_hi
+    if pass_lo <= value <= phi:
+        return {"name": name, "status": "pass", "value": value, "target": target}
+    if warn_lo <= value <= whi:
+        return {"name": name, "status": "warn", "value": value, "target": target}
+    return {"name": name, "status": "fail", "value": value, "target": target}
 
 
 def run_generation_review(
@@ -1288,32 +1312,12 @@ def run_generation_review(
     speed_ratio = float(duration / target_duration) if target_duration and target_duration > 0 else None
 
     checks: list[dict[str, Any]] = []
-    if asr_sim is None:
-        checks.append({"name": "asr_similarity", "status": "unknown", "value": None, "target": ">=0.98"})
-    elif asr_sim >= 0.98:
-        checks.append({"name": "asr_similarity", "status": "pass", "value": asr_sim, "target": ">=0.98"})
-    elif asr_sim >= 0.90:
-        checks.append({"name": "asr_similarity", "status": "warn", "value": asr_sim, "target": ">=0.98"})
-    else:
-        checks.append({"name": "asr_similarity", "status": "fail", "value": asr_sim, "target": ">=0.98"})
-
-    if speaker_cos is None:
-        checks.append({"name": "speaker_cosine", "status": "unknown", "value": None, "target": ">=0.982"})
-    elif speaker_cos >= 0.982:
-        checks.append({"name": "speaker_cosine", "status": "pass", "value": speaker_cos, "target": ">=0.982"})
-    elif speaker_cos >= 0.970:
-        checks.append({"name": "speaker_cosine", "status": "warn", "value": speaker_cos, "target": ">=0.982"})
-    else:
-        checks.append({"name": "speaker_cosine", "status": "fail", "value": speaker_cos, "target": ">=0.982"})
-
-    if speed_ratio is None:
-        checks.append({"name": "speed_ratio", "status": "unknown", "value": None, "target": "0.90~1.15"})
-    elif 0.90 <= speed_ratio <= 1.15:
-        checks.append({"name": "speed_ratio", "status": "pass", "value": speed_ratio, "target": "0.90~1.15"})
-    elif 0.80 <= speed_ratio <= 1.30:
-        checks.append({"name": "speed_ratio", "status": "warn", "value": speed_ratio, "target": "0.90~1.15"})
-    else:
-        checks.append({"name": "speed_ratio", "status": "fail", "value": speed_ratio, "target": "0.90~1.15"})
+    checks.append(_metric_check("asr_similarity", asr_sim, ">=0.98", 0.98, 0.90))
+    checks.append(_metric_check("speaker_cosine", speaker_cos, ">=0.982", 0.982, 0.970))
+    checks.append(_metric_check(
+        "speed_ratio", speed_ratio, "0.90~1.15",
+        pass_lo=0.90, warn_lo=0.80, pass_hi=1.15, warn_hi=1.30,
+    ))
 
     has_fail = any(c["status"] == "fail" for c in checks)
     has_warn = any(c["status"] == "warn" for c in checks)
@@ -1411,8 +1415,4 @@ def format_generation_review(report: dict[str, Any]) -> str:
 
 
 def save_generation_review(report: dict[str, Any], output_path: str | Path) -> str:
-    out = Path(output_path).resolve()
-    out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
-    return str(out)
+    return _save_json_report(report, output_path)

@@ -21,7 +21,7 @@ class AlreadyRunningError(RuntimeError):
     pass
 
 
-def _pid_alive(pid: int | None) -> bool:
+def pid_alive(pid: int | None) -> bool:
     if not isinstance(pid, int) or pid <= 0:
         return False
     try:
@@ -31,6 +31,18 @@ def _pid_alive(pid: int | None) -> bool:
         return False
     except PermissionError:
         return True
+
+def pid_matches_script(pid: int | None, script: str | None) -> bool:
+    if not script or not isinstance(pid, int) or pid <= 0:
+        return True
+    try:
+        cmdline = subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "command="],
+            text=True,
+        ).strip()
+    except Exception:
+        return False
+    return str(script) in cmdline
 
 
 def _lock_path(key: str) -> Path:
@@ -108,23 +120,22 @@ def start_process(
         if current and current.poll() is None:
             raise AlreadyRunningError(f"A process is already running for key='{key}'.")
         lock_pid = _read_lock_pid(key)
-        if _pid_alive(lock_pid):
+        if pid_alive(lock_pid):
             raise AlreadyRunningError(f"A process is already running for key='{key}' (pid={lock_pid}).")
         if lock_pid is not None:
             _clear_lock(key)
 
-    proc = subprocess.Popen(
-        command,
-        cwd=str(cwd) if cwd else None,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        universal_newlines=True,
-    )
+        proc = subprocess.Popen(
+            command,
+            cwd=str(cwd) if cwd else None,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+        )
 
-    with _LOCK:
         _ACTIVE[key] = proc
         _write_lock_pid(key, int(proc.pid), command)
     return proc
@@ -156,7 +167,7 @@ def stop_process(key: str) -> str:
             _clear_lock(key, expected_pid=int(proc.pid))
 
     lock_pid = _read_lock_pid(key)
-    if not _pid_alive(lock_pid):
+    if not pid_alive(lock_pid):
         _clear_lock(key)
         return "No running process."
 
@@ -164,22 +175,14 @@ def stop_process(key: str) -> str:
     assert lock_pid is not None
     info = _read_lock_info(key) or {}
     script = info.get("script")
-    if script:
-        try:
-            cmdline = subprocess.check_output(
-                ["ps", "-p", str(lock_pid), "-o", "command="],
-                text=True,
-            ).strip()
-        except Exception:
-            cmdline = ""
-        if script not in cmdline:
-            _clear_lock(key)
-            return f"Refusing to stop pid={lock_pid} due to lock mismatch."
+    if not pid_matches_script(lock_pid, script):
+        _clear_lock(key)
+        return f"Refusing to stop pid={lock_pid} due to lock mismatch."
 
     os.kill(lock_pid, signal.SIGTERM)
     deadline = time.time() + 10.0
     while time.time() < deadline:
-        if not _pid_alive(lock_pid):
+        if not pid_alive(lock_pid):
             _clear_lock(key, expected_pid=lock_pid)
             return f"Process terminated (pid={lock_pid})."
         time.sleep(0.2)
@@ -187,7 +190,7 @@ def stop_process(key: str) -> str:
     os.kill(lock_pid, signal.SIGKILL)
     deadline = time.time() + 5.0
     while time.time() < deadline:
-        if not _pid_alive(lock_pid):
+        if not pid_alive(lock_pid):
             _clear_lock(key, expected_pid=lock_pid)
             return f"Process killed after timeout (pid={lock_pid})."
         time.sleep(0.2)
@@ -201,7 +204,7 @@ def is_running(key: str) -> bool:
     if proc and proc.poll() is None:
         return True
     pid = _read_lock_pid(key)
-    alive = _pid_alive(pid)
+    alive = pid_alive(pid)
     if not alive and pid is not None:
         _clear_lock(key)
         return False
@@ -209,17 +212,9 @@ def is_running(key: str) -> bool:
     if alive and pid is not None:
         info = _read_lock_info(key) or {}
         script = info.get("script")
-        if script:
-            try:
-                cmdline = subprocess.check_output(
-                    ["ps", "-p", str(pid), "-o", "command="],
-                    text=True,
-                ).strip()
-            except Exception:
-                cmdline = ""
-            if script not in cmdline:
-                _clear_lock(key)
-                return False
+        if not pid_matches_script(pid, script):
+            _clear_lock(key)
+            return False
 
     return alive
 

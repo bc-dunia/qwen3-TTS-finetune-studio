@@ -62,6 +62,57 @@ def _start_stdout_pump(proc: Any) -> Queue[str | None]:
     return q
 
 
+def _iter_subprocess_lines(
+    proc: Any, q: "Queue[str | None]"
+) -> Generator[list[str], None, None]:
+    """Yield batches of stdout lines from *proc* at a regular cadence.
+
+    Each yielded list contains the lines accumulated since the previous yield.
+    A yield happens when new lines arrive or ``_LOG_YIELD_INTERVAL_SEC`` elapses.
+    The iterator exits after *proc* terminates and all remaining output is
+    drained (the final batch is yielded before return).
+    """
+    last_yield = 0.0
+    while True:
+        batch: list[str] = []
+        while True:
+            try:
+                item = q.get_nowait()
+            except Empty:
+                break
+            if item is None:
+                break
+            normalized = str(item).rstrip("\n")
+            if not normalized.strip():
+                continue
+            batch.append(normalized)
+
+        now = time.time()
+        if batch or (now - last_yield) >= _LOG_YIELD_INTERVAL_SEC:
+            last_yield = now
+            yield batch
+
+        if proc.poll() is not None:
+            # Drain remaining buffered lines, if any.
+            final: list[str] = []
+            while True:
+                try:
+                    item = q.get_nowait()
+                except Empty:
+                    break
+                if item is None:
+                    break
+                normalized = str(item).rstrip("\n")
+                if not normalized.strip():
+                    continue
+                final.append(normalized)
+            if final:
+                yield final
+            return
+
+        time.sleep(_LOG_POLL_INTERVAL_SEC)
+
+
 def _line_count(path: Path) -> int:
     with path.open("r", encoding="utf-8") as f:
         return sum(1 for _ in f)
@@ -89,9 +140,8 @@ def _resolve_prepare_device(device: str) -> str:
     return "cpu"
 
 
-def _resolve_training_mixed_precision(mixed_precision: str) -> str:
+def _resolve_training_mixed_precision(mixed_precision: str, device: str) -> str:
     v = (mixed_precision or "").strip().lower()
-    device = _resolve_prepare_device("auto")
     if v and v != "auto":
         # Accelerate fp16 AMP can fail on MPS/CPU with "Attempting to unscale FP16 gradients".
         # Keep CUDA behavior, but force a safe fallback elsewhere.
@@ -103,11 +153,10 @@ def _resolve_training_mixed_precision(mixed_precision: str) -> str:
     return "no"
 
 
-def _resolve_training_torch_dtype(torch_dtype: str) -> str:
+def _resolve_training_torch_dtype(torch_dtype: str, device: str) -> str:
     v = (torch_dtype or "").strip().lower()
     if v and v != "auto":
         return torch_dtype
-    device = _resolve_prepare_device("auto")
     if device.startswith("cuda"):
         return "bfloat16"
     if device == "mps":
@@ -202,54 +251,19 @@ def run_prepare_data(
     }
 
     try:
-        last_yield = 0.0
-        while True:
-            got_line = False
-            while True:
-                try:
-                    item = out_q.get_nowait()
-                except Empty:
-                    break
-                if item is None:
-                    break
-                normalized = str(item).rstrip("\n")
-                if not normalized.strip():
-                    continue
-                got_line = True
-                logs.append(normalized)
+        for batch in _iter_subprocess_lines(proc, out_q):
+            for line in batch:
+                logs.append(line)
                 with prepare_log_path.open("a", encoding="utf-8") as f:
-                    f.write(normalized + "\n")
-
-            now = time.time()
-            if got_line or (now - last_yield) >= _LOG_YIELD_INTERVAL_SEC:
-                last_yield = now
-                yield {
-                    "status": "Preparing audio codes...",
-                    "logs": "\n".join(logs[-800:]),
-                    "output_jsonl": str(output_path),
-                    "prepare_log_path": str(prepare_log_path),
-                    "done": False,
-                    "success": False,
-                }
-
-            if proc.poll() is not None:
-                # Drain remaining buffered lines, if any.
-                while True:
-                    try:
-                        item = out_q.get_nowait()
-                    except Empty:
-                        break
-                    if item is None:
-                        break
-                    normalized = str(item).rstrip("\n")
-                    if not normalized.strip():
-                        continue
-                    logs.append(normalized)
-                    with prepare_log_path.open("a", encoding="utf-8") as f:
-                        f.write(normalized + "\n")
-                break
-
-            time.sleep(_LOG_POLL_INTERVAL_SEC)
+                    f.write(line + "\n")
+            yield {
+                "status": "Preparing audio codes...",
+                "logs": "\n".join(logs[-800:]),
+                "output_jsonl": str(output_path),
+                "prepare_log_path": str(prepare_log_path),
+                "done": False,
+                "success": False,
+            }
 
         return_code = proc.wait()
         elapsed = time.time() - started_at
@@ -324,8 +338,9 @@ def run_training(
     train_log_path = output_dir / "train.log"
     train_log_path.write_text("", encoding="utf-8")
 
-    resolved_mixed_precision = _resolve_training_mixed_precision(mixed_precision)
-    resolved_torch_dtype = _resolve_training_torch_dtype(torch_dtype)
+    resolved_device = _resolve_prepare_device("auto")
+    resolved_mixed_precision = _resolve_training_mixed_precision(mixed_precision, resolved_device)
+    resolved_torch_dtype = _resolve_training_torch_dtype(torch_dtype, resolved_device)
 
     config_path = output_dir / "run_config.json"
     run_config = {
@@ -488,20 +503,8 @@ def run_training(
     }
 
     try:
-        last_yield = 0.0
-        while True:
-            got_line = False
-            while True:
-                try:
-                    item = out_q.get_nowait()
-                except Empty:
-                    break
-                if item is None:
-                    break
-                line = str(item).rstrip("\n")
-                if not line.strip():
-                    continue
-                got_line = True
+        for batch in _iter_subprocess_lines(proc, out_q):
+            for line in batch:
                 logs.append(line)
                 with train_log_path.open("a", encoding="utf-8") as f:
                     f.write(line + "\n")
@@ -527,42 +530,19 @@ def run_training(
                         },
                     )
 
-            now = time.time()
-            if got_line or (now - last_yield) >= _LOG_YIELD_INTERVAL_SEC:
-                last_yield = now
-                detail = f"{progress} | epoch {current_epoch}/{num_epochs} | step {current_step}/{steps_per_epoch}"
-                if current_loss is not None:
-                    detail += f" | loss {current_loss}"
+            detail = f"{progress} | epoch {current_epoch}/{num_epochs} | step {current_step}/{steps_per_epoch}"
+            if current_loss is not None:
+                detail += f" | loss {current_loss}"
 
-                yield {
-                    "status": "Training in progress...",
-                    "progress": detail,
-                    "logs": "\n".join(logs[-1200:]),
-                    "run_dir": str(output_dir),
-                    "train_log_path": str(train_log_path.resolve()),
-                    "done": False,
-                    "success": False,
-                }
-
-            if proc.poll() is not None:
-                # Drain remaining buffered lines, if any.
-                while True:
-                    try:
-                        item = out_q.get_nowait()
-                    except Empty:
-                        break
-                    if item is None:
-                        break
-                    line = str(item).rstrip("\n")
-                    if not line.strip():
-                        continue
-                    logs.append(line)
-                    with train_log_path.open("a", encoding="utf-8") as f:
-                        f.write(line + "\n")
-                break
-
-            time.sleep(_LOG_POLL_INTERVAL_SEC)
-
+            yield {
+                "status": "Training in progress...",
+                "progress": detail,
+                "logs": "\n".join(logs[-1200:]),
+                "run_dir": str(output_dir),
+                "train_log_path": str(train_log_path.resolve()),
+                "done": False,
+                "success": False,
+            }
         return_code = proc.wait()
         elapsed = time.time() - started_at
         success = return_code == 0

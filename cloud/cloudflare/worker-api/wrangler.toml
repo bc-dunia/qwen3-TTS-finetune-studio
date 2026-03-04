@@ -1,0 +1,54 @@
+# Qwen3-TTS Studio — Cloudflare Worker Configuration
+#
+# Setup commands:
+#   npx wrangler login
+#   npx wrangler r2 bucket create qwen-tts-studio
+#   npx wrangler d1 create qwen-tts-db
+#   npx wrangler d1 execute qwen-tts-db --file=schema.sql
+#   npx wrangler kv namespace create TTS_CACHE
+#   npx wrangler secret put API_KEY
+#   npx wrangler secret put RUNPOD_API_KEY
+#   npx wrangler secret put R2_ACCESS_KEY_ID
+#   npx wrangler secret put R2_SECRET_ACCESS_KEY
+#   npx wrangler deploy
+
+name = "qwen-tts-api"
+main = "src/index.ts"
+compatibility_date = "2026-03-01"
+compatibility_flags = ["nodejs_compat"]
+
+# ── R2 Object Storage ────────────────────────────────────────────────
+# Stores checkpoints, datasets, audio files
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "qwen-tts-studio"
+
+# ── D1 Database ──────────────────────────────────────────────────────
+# Metadata for voices, training jobs, generations
+[[d1_databases]]
+binding = "DB"
+database_name = "qwen-tts-db"
+database_id = "4404eac6-c4e0-41f6-bd94-74b93bbb778d"
+
+# ── KV Namespace ─────────────────────────────────────────────────────
+# Cache for presigned URLs, rate limiting, session data
+[[kv_namespaces]]
+binding = "KV"
+id = "5215a0e24f6c46ff8c8fdcbdb439263e"
+
+# ── Environment Variables ────────────────────────────────────────────
+[vars]
+RUNPOD_ENDPOINT_ID = "6cp5ohsawnqk6f"           # RunPod serverless endpoint ID (for inference)
+RUNPOD_TRAINING_TEMPLATE_ID = "vnaafxatc5"  # RunPod pod template ID (for training)
+R2_ENDPOINT_URL = "https://3672c083409da5ca133c50e0d06fd0e0.r2.cloudflarestorage.com"
+CORS_ORIGIN = "*"                 # Allowed CORS origin (set to your frontend domain in prod)
+
+# ── Secrets (set via wrangler secret put) ────────────────────────────
+# API_KEY              - API authentication key for clients
+# RUNPOD_API_KEY       - RunPod API key for pod/serverless management
+# R2_ACCESS_KEY_ID     - R2 S3-compatible access key (for presigned URLs)
+# R2_SECRET_ACCESS_KEY - R2 S3-compatible secret key (for presigned URLs)
+
+# ── Development ──────────────────────────────────────────────────────
+[dev]
+port = 8787
