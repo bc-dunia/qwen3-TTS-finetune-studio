@@ -1085,20 +1085,84 @@ def find_checkpoints(output_dir: Path) -> list[tuple[int, Path]]:
 def upload_checkpoints(
     *, r2: R2Storage, cfg: JobConfig, output_dir: Path, status: StatusWriter
 ) -> list[dict[str, Any]]:
+    """Upload all checkpoints to R2 using full recursive upload.
+
+    Uses upload_checkpoint_full() (NOT delta) because the inference Docker
+    image is 'lite' — no base models baked in. The inference handler uses
+    checkpoint_type='full' and calls from_pretrained() directly on the
+    downloaded directory, so it needs ALL files including speech_tokenizer/.
+    """
     status.write({"status": "uploading", "message": "Uploading checkpoints to R2..."})
     checkpoints = find_checkpoints(output_dir)
     if not checkpoints:
         raise RuntimeError(f"No checkpoint-epoch-* directories found in {output_dir}")
     uploaded: list[dict[str, Any]] = []
     for epoch, ckpt_dir in checkpoints:
-        prefix = r2.upload_checkpoint_delta(
+        prefix = r2.upload_checkpoint_full(
             checkpoint_dir=ckpt_dir,
             voice_id=cfg.voice_id,
             run_name=cfg.run_name,
             epoch=epoch,
         )
+        _verify_checkpoint_upload(r2, prefix, ckpt_dir)
         uploaded.append({"epoch": epoch, "r2_prefix": prefix})
+        LOGGER.info("Checkpoint epoch %d uploaded and verified: %s", epoch, prefix)
     return uploaded
+
+
+def _verify_checkpoint_upload(
+    r2: R2Storage, r2_prefix: str, local_dir: Path
+) -> None:
+    """Verify uploaded checkpoint is complete by comparing local vs R2 file counts."""
+    local_files: dict[str, int] = {}
+    for fpath in local_dir.rglob("*"):
+        if fpath.is_file():
+            rel = str(fpath.relative_to(local_dir))
+            local_files[rel] = fpath.stat().st_size
+
+    r2_objects = r2.list_prefix(f"{r2_prefix}/")
+    r2_files: dict[str, int] = {}
+    for obj in r2_objects:
+        rel = obj["key"][len(r2_prefix) + 1 :]
+        if rel:
+            r2_files[rel] = obj["size"]
+
+    # Check required files exist
+    required = ["model.safetensors", "config.json"]
+    missing_required = [f for f in required if f not in r2_files]
+    if missing_required:
+        raise RuntimeError(
+            f"Checkpoint verification FAILED: required files missing on R2: {missing_required}"
+        )
+
+    # Check all local files were uploaded
+    missing = set(local_files.keys()) - set(r2_files.keys())
+    if missing:
+        raise RuntimeError(
+            f"Checkpoint verification FAILED: {len(missing)} file(s) missing on R2: "
+            + ", ".join(sorted(missing)[:10])
+        )
+
+    # Check sizes match (catches partial uploads)
+    size_mismatches: list[str] = []
+    for rel_path, local_size in local_files.items():
+        r2_size = r2_files.get(rel_path, -1)
+        if r2_size != local_size:
+            size_mismatches.append(
+                f"{rel_path}: local={local_size} r2={r2_size}"
+            )
+    if size_mismatches:
+        raise RuntimeError(
+            f"Checkpoint verification FAILED: {len(size_mismatches)} file(s) size mismatch: "
+            + ", ".join(size_mismatches[:5])
+        )
+
+    LOGGER.info(
+        "Checkpoint verified: %d/%d files match on R2 (%s)",
+        len(r2_files),
+        len(local_files),
+        r2_prefix,
+    )
 
 
 def terminate_pod() -> None:
@@ -1130,6 +1194,7 @@ def main() -> int:
     r2 = R2Storage()
     status = StatusWriter(r2, job_id)
     log_buffer: LogBuffer | None = None
+    upload_verified = False
     try:
         raw_cfg = r2.read_job_config(job_id)
         if raw_cfg is None:
@@ -1224,8 +1289,9 @@ def main() -> int:
         checkpoints = upload_checkpoints(
             r2=r2, cfg=cfg, output_dir=output_dir, status=status
         )
+        upload_verified = True
         status.write({"status": "completed", "checkpoints": checkpoints})
-        LOGGER.info("Job completed")
+        LOGGER.info("Job completed successfully — checkpoint uploaded and verified")
         return 0
     except Exception as exc:
         LOGGER.exception("Job failed: %s", exc)
@@ -1240,8 +1306,17 @@ def main() -> int:
                 log_buffer.close()
             except Exception:
                 LOGGER.exception("Failed to flush log buffer")
-        terminate_pod()
-
+        # SAFETY: Only terminate pod if checkpoint upload was verified.
+        # If upload failed or was never reached, keep the pod alive so
+        # the checkpoint can be manually recovered from ephemeral storage.
+        if upload_verified:
+            terminate_pod()
+        else:
+            LOGGER.warning(
+                "SKIPPING pod termination — checkpoint upload was NOT verified. "
+                "Pod will remain alive for manual recovery. "
+                "Use RunPod dashboard or API to terminate manually after recovery."
+            )
 
 if __name__ == "__main__":
     sys.exit(main())

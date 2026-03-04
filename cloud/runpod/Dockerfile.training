@@ -5,7 +5,7 @@
 #   2. Downloads dataset from R2
 #   3. Runs prepare_data.py (audio code extraction)
 #   4. Runs sft_12hz.py (full SFT training)
-#   5. Uploads checkpoint deltas to R2
+#   5. Uploads full checkpoints to R2 (with verification)
 #   6. Updates job status and self-terminates
 #
 # Build (from project root):
