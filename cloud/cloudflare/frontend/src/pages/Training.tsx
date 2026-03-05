@@ -11,6 +11,21 @@ import {
   formatDate,
 } from '../lib/api'
 
+const ACTIVE_JOB_STATUSES = new Set([
+  'pending',
+  'running',
+  'provisioning',
+  'downloading',
+  'preprocessing',
+  'preparing',
+  'training',
+  'uploading',
+])
+
+function isJobActiveStatus(status: string): boolean {
+  return ACTIVE_JOB_STATUSES.has(status)
+}
+
 export function Training() {
   const [voices, setVoices] = useState<Voice[]>([])
   const [loadingVoices, setLoadingVoices] = useState(true)
@@ -79,9 +94,7 @@ export function Training() {
   }, [])
 
   // Poll active jobs every 5 seconds
-  const hasActiveJobs = jobs.some(
-    (j) => j.status === 'running' || j.status === 'pending',
-  )
+  const hasActiveJobs = jobs.some((j) => isJobActiveStatus(j.status))
 
   useEffect(() => {
     if (!hasActiveJobs) return
@@ -89,7 +102,7 @@ export function Training() {
     const interval = setInterval(async () => {
       const currentJobs = jobsRef.current
       const activeJobIds = currentJobs
-        .filter((j) => j.status === 'running' || j.status === 'pending')
+        .filter((j) => isJobActiveStatus(j.status))
         .map((j) => j.job_id)
 
       if (activeJobIds.length === 0) return
@@ -167,9 +180,7 @@ export function Training() {
     }
   }
 
-  const activeJobs = jobs.filter(
-    (j) => j.status === 'running' || j.status === 'pending',
-  )
+  const activeJobs = jobs.filter((j) => isJobActiveStatus(j.status))
   const completedJobs = jobs.filter(
     (j) => j.status === 'completed' || j.status === 'failed',
   )
@@ -347,7 +358,7 @@ function JobCard({
   job: TrainingJob
   onCancel: (jobId: string) => void
 }) {
-  const isActive = job.status === 'running' || job.status === 'pending'
+  const isActive = isJobActiveStatus(job.status)
   const epoch = typeof job.progress.epoch === 'number' ? job.progress.epoch : 0
   const totalEpochs = typeof job.progress.total_epochs === 'number' ? job.progress.total_epochs : 0
   const loss = typeof job.progress.loss === 'number' ? job.progress.loss : null
@@ -364,6 +375,12 @@ function JobCard({
   const statusStyles: Record<string, { bg: string; text: string }> = {
     pending: { bg: 'bg-warning-dim', text: 'text-warning' },
     running: { bg: 'bg-accent-dim', text: 'text-accent' },
+    provisioning: { bg: 'bg-warning-dim', text: 'text-warning' },
+    downloading: { bg: 'bg-accent-dim', text: 'text-accent' },
+    preprocessing: { bg: 'bg-accent-dim', text: 'text-accent' },
+    preparing: { bg: 'bg-accent-dim', text: 'text-accent' },
+    training: { bg: 'bg-accent-dim', text: 'text-accent' },
+    uploading: { bg: 'bg-accent-dim', text: 'text-accent' },
     completed: { bg: 'bg-accent-dim', text: 'text-accent' },
     failed: { bg: 'bg-error-dim', text: 'text-error' },
     cancelled: { bg: 'bg-raised', text: 'text-muted' },

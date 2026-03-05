@@ -6,6 +6,8 @@
 LOG=/tmp/handler_output.log
 JOB="${JOB_ID:-unknown}"
 
+export HF_HUB_ENABLE_HF_TRANSFER=0
+
 echo "=== ENTRYPOINT START $(date -u) ===" | tee "$LOG"
 echo "Python: $(python3 --version 2>&1)" | tee -a "$LOG"
 echo "JOB_ID: $JOB" | tee -a "$LOG"

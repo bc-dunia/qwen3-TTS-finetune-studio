@@ -47,7 +47,18 @@ export interface TrainingConfig {
 
 export interface TrainingJob {
   job_id: string
-  status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled'
+  status:
+    | 'pending'
+    | 'running'
+    | 'provisioning'
+    | 'downloading'
+    | 'preprocessing'
+    | 'preparing'
+    | 'training'
+    | 'uploading'
+    | 'completed'
+    | 'failed'
+    | 'cancelled'
   progress: TrainingProgress
   voice_id: string
   created_at: number

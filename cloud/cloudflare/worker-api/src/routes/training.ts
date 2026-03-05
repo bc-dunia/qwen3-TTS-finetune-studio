@@ -23,6 +23,17 @@ type TrainingStatusBlob = {
   checkpoints?: Array<{ epoch?: number; r2_prefix?: string }>;
 };
 
+const ACTIVE_JOB_STATUSES = new Set([
+  "pending",
+  "running",
+  "provisioning",
+  "downloading",
+  "preprocessing",
+  "preparing",
+  "training",
+  "uploading",
+]);
+
 const parseRunNameFromCheckpointPrefix = (prefix: string): string | null => {
   const parts = prefix.split("/");
   if (parts.length < 4 || parts[0] !== "checkpoints") {
@@ -102,9 +113,7 @@ app.post("/start", async (c) => {
   }
 
   const activeJobs = await listTrainingJobs(c.env.DB, { voice_id: body.voice_id, limit: 10 });
-  const hasActiveJob = activeJobs.some((j) =>
-    ["pending", "provisioning", "downloading", "preprocessing", "preparing", "training", "uploading"].includes(j.status)
-  );
+  const hasActiveJob = activeJobs.some((j) => ACTIVE_JOB_STATUSES.has(j.status));
   if (hasActiveJob) {
     return c.json(
       { detail: { message: "A training job is already active for this voice. Cancel it first or wait for completion." } },
@@ -258,7 +267,17 @@ app.get("/jobs", async (c) => {
     limit,
   });
 
-  return c.json({ jobs: jobs.map(serializeTrainingJob) });
+  const hydratedJobs = await Promise.all(
+    jobs.map(async (job) => {
+      if (!ACTIVE_JOB_STATUSES.has(job.status)) {
+        return job;
+      }
+      await reconcileJobStatus(c, job);
+      return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
+    })
+  );
+
+  return c.json({ jobs: hydratedJobs.map(serializeTrainingJob) });
 });
 
 app.get("/:job_id/logs", async (c) => {
@@ -324,7 +343,7 @@ app.get("/:job_id", async (c) => {
     return c.json({ detail: { message: "Training job not found" } }, 404);
   }
 
-  if (job.status !== "completed" && job.status !== "failed" && job.status !== "cancelled") {
+  if (ACTIVE_JOB_STATUSES.has(job.status)) {
     await reconcileJobStatus(c, job);
     const updated = await getTrainingJob(c.env.DB, jobId);
     if (updated) {
