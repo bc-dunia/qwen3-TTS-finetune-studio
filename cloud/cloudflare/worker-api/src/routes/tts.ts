@@ -43,13 +43,13 @@ const isLowQualityOutput = (quality: unknown): { low: boolean; reason?: string }
   const duration = Number(q.duration_score ?? NaN);
   const health = Number(q.health_score ?? NaN);
 
-  if (Number.isFinite(overall) && overall < 0.7) {
+  if (Number.isFinite(overall) && overall < 0.82) {
     return { low: true, reason: `Low overall quality score (${overall.toFixed(2)})` };
   }
-  if (Number.isFinite(duration) && duration < 0.2) {
+  if (Number.isFinite(duration) && duration < 0.45) {
     return { low: true, reason: `Duration mismatch detected (duration_score=${duration.toFixed(2)})` };
   }
-  if (Number.isFinite(health) && health < 0.55) {
+  if (Number.isFinite(health) && health < 0.72) {
     return { low: true, reason: `Audio health score too low (${health.toFixed(2)})` };
   }
   return { low: false };

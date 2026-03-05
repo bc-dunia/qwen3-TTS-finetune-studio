@@ -107,7 +107,7 @@ _HAN = re.compile(r"[\u4E00-\u9FFF]")
 _HIRA = re.compile(r"[\u3040-\u309F]")
 _KATA = re.compile(r"[\u30A0-\u30FF\uFF66-\uFF9D]")
 _LATIN_DIGIT = re.compile(r"[A-Za-z0-9]")
-_CJK_PUNCT = set(".,!?;:\u2026\u00b7\uFF0C\u3002\uFF01\uFF1F\uFF1B\uFF1A\u3001\u30FB")
+_CJK_PUNCT = set(".,!?;:\u2026\u00b7\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u3001\u30fb")
 
 
 def _expected_seconds(text: str) -> float:
@@ -132,12 +132,12 @@ def _expected_seconds(text: str) -> float:
     other = max(0, other)
 
     sec = 0.0
-    sec += hangul * 0.25   # Korean: ~4 chars/sec
-    sec += han * 0.30      # Chinese / kanji: ~3.3 chars/sec
-    sec += kana * 0.18     # Japanese kana: ~5.5 chars/sec
-    sec += latin * 0.10    # English / digits: ~10 chars/sec
-    sec += punct * 0.12    # punctuation pauses
-    sec += other * 0.20    # unknown scripts: conservative ~5 chars/sec
+    sec += hangul * 0.25  # Korean: ~4 chars/sec
+    sec += han * 0.30  # Chinese / kanji: ~3.3 chars/sec
+    sec += kana * 0.18  # Japanese kana: ~5.5 chars/sec
+    sec += latin * 0.10  # English / digits: ~10 chars/sec
+    sec += punct * 0.12  # punctuation pauses
+    sec += other * 0.20  # unknown scripts: conservative ~5 chars/sec
     return max(0.2, sec)
 
 
@@ -148,7 +148,7 @@ def _adaptive_max_tokens(text: str) -> int:
         return 48  # ~4 second fallback for empty input
     # Convert to tokens: 12Hz * estimated_duration * 1.5x safety buffer
     tokens = int(est * 12 * 1.5)
-    floor = 48   # minimum ~4 seconds (prevents truncation on short texts)
+    floor = 48  # minimum ~4 seconds (prevents truncation on short texts)
     ceil = 1024  # hard upper limit
     return max(floor, min(ceil, tokens))
 
@@ -539,10 +539,21 @@ def _verify_quality(
         rms = float(np.sqrt(np.mean(np.square(finite_audio))))
         peak = float(np.max(np.abs(finite_audio)))
         silence_ratio = float(np.mean(np.abs(finite_audio) < 0.001))
+        if len(finite_audio) > 1:
+            zcr = float(
+                np.mean(
+                    np.not_equal(
+                        np.signbit(finite_audio[:-1]), np.signbit(finite_audio[1:])
+                    )
+                )
+            )
+        else:
+            zcr = 1.0
     else:
         rms = 0.0
         peak = 0.0
         silence_ratio = 1.0
+        zcr = 1.0
 
     if 0.03 <= rms <= 0.15:
         rms_score = 1.0
@@ -561,7 +572,21 @@ def _verify_quality(
     else:
         silence_score = _clamp((0.95 - silence_ratio) / 0.45, 0.0, 1.0)
 
-    health_score = (rms_score * 0.4) + (peak_score * 0.3) + (silence_score * 0.3)
+    if 0.02 <= zcr <= 0.22:
+        zcr_score = 1.0
+    elif zcr < 0.02:
+        zcr_score = _clamp(zcr / 0.02, 0.0, 1.0)
+    elif zcr <= 0.40:
+        zcr_score = _clamp((0.40 - zcr) / 0.18, 0.0, 1.0)
+    else:
+        zcr_score = 0.0
+
+    health_score = (
+        (rms_score * 0.3)
+        + (peak_score * 0.2)
+        + (silence_score * 0.2)
+        + (zcr_score * 0.3)
+    )
 
     finite_score = 1.0 if len(audio_flat) > 0 and finite_mask.all() else 0.0
     non_empty_score = 1.0 if len(audio_flat) > 0 else 0.0
@@ -572,8 +597,8 @@ def _verify_quality(
 
     overall_score = (
         _clamp(duration_score, 0.0, 1.0) * 0.3
-        + _clamp(health_score, 0.0, 1.0) * 0.4
-        + _clamp(stability_score, 0.0, 1.0) * 0.3
+        + _clamp(health_score, 0.0, 1.0) * 0.5
+        + _clamp(stability_score, 0.0, 1.0) * 0.2
     )
 
     return {
@@ -649,7 +674,7 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         seed_anchor = base_seed if base_seed is not None else int(time.time() * 1000)
         num_candidates = _to_int(inp.get("num_candidates"))
         if num_candidates is None:
-            num_candidates = 1
+            num_candidates = 2 if model_id == "qwen3-tts-0.6b" else 1
         num_candidates = max(1, min(5, num_candidates))
 
         storage = _r2_storage_cls()()
@@ -671,7 +696,7 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
             return {"error": f"Model loading failure: {exc}"}
 
         retries = 0
-        max_rounds = 2
+        max_rounds = 3
         best_candidate: dict[str, Any] | None = None
         candidate_scores: list[float] = []
         last_error: Exception | None = None
@@ -681,10 +706,14 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                 round_params["temperature"] = max(
                     0.1, float(round_params.get("temperature", 1.0)) * 0.8
                 )
+                round_params["top_p"] = max(
+                    0.2, float(round_params.get("top_p", 1.0)) * 0.9
+                )
                 retries = round_idx
                 _log(
                     f"quality_retry round={round_idx + 1} "
-                    f"temperature={round_params['temperature']:.3f}"
+                    f"temperature={round_params['temperature']:.3f} "
+                    f"top_p={round_params['top_p']:.3f}"
                 )
 
             round_best: dict[str, Any] | None = None
@@ -737,7 +766,7 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                 if best_candidate is not None
                 else 0.0
             )
-            if best_score >= 0.3:
+            if best_score >= 0.8:
                 break
 
         if best_candidate is None:

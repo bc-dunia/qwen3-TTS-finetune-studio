@@ -39,6 +39,15 @@ export function VoiceDetail() {
     let cancelled = false
 
     async function load() {
+      const apiKey = (localStorage.getItem('xi-api-key') ?? '').trim()
+      if (!apiKey) {
+        if (!cancelled) {
+          setError('Missing API key. Enter your xi-api-key in the left sidebar.')
+          setLoading(false)
+        }
+        return
+      }
+
       try {
         const data = await fetchVoice(voiceId)
         if (!cancelled) {

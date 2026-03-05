@@ -126,13 +126,13 @@ const validateTrainedCheckpoint = async (
         const duration = Number(quality.duration_score ?? NaN);
         const health = Number(quality.health_score ?? NaN);
 
-        if (Number.isFinite(overall) && overall < 0.75) {
+        if (Number.isFinite(overall) && overall < 0.85) {
           return { ok: false, message: `Validation sample ${i + 1} seed ${seed} failed: overall_score=${overall.toFixed(2)}` };
         }
-        if (Number.isFinite(duration) && duration < 0.35) {
+        if (Number.isFinite(duration) && duration < 0.45) {
           return { ok: false, message: `Validation sample ${i + 1} seed ${seed} failed: duration_score=${duration.toFixed(2)}` };
         }
-        if (Number.isFinite(health) && health < 0.6) {
+        if (Number.isFinite(health) && health < 0.72) {
           return { ok: false, message: `Validation sample ${i + 1} seed ${seed} failed: health_score=${health.toFixed(2)}` };
         }
       }
