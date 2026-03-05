@@ -1,7 +1,7 @@
 # RunPod Training Pod — Qwen3-TTS Fine-Tuning
 #
 # Base image provides: torch, numpy, CUDA libs
-# qwen-tts installed with full deps, then heavy unused ones removed
+# qwen-tts installed with full deps (onnxruntime, sox, etc. are eagerly imported)
 #
 #
 #   docker build -f cloud/runpod/Dockerfile.training -t qwen3-tts-training .
@@ -12,14 +12,13 @@ WORKDIR /app
 
 # System dependencies
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg && \
+    apt-get install -y --no-install-recommends ffmpeg sox libsox-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # Python dependencies
 COPY cloud/runpod/requirements-training.txt /app/requirements.txt
 RUN python3 -m pip install --no-cache-dir -r requirements.txt && \
     python3 -m pip install --no-cache-dir qwen-tts>=0.1.1 && \
-    python3 -m pip uninstall -y gradio gradio-client onnxruntime aiofiles ruff httpcore anyio starlette fastapi uvicorn || true && \
     rm -rf /root/.cache/pip /tmp/*
 
 # Copy official training scripts

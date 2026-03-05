@@ -66,7 +66,7 @@ def main() -> int:
             print(f"WARNING: {submod} import raised {type(e).__name__}: {e}")
 
     # System binaries
-    for binary in ["ffmpeg", "python3"]:
+    for binary in ["ffmpeg", "python3", "sox"]:
         if not shutil.which(binary):
             errors.append(f"Missing binary: {binary}")
 
