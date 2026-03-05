@@ -32,6 +32,11 @@ const ALLOWED_AUDIO_CONTENT_TYPES = new Set([
   "application/octet-stream",
 ]);
 
+const MODEL_BY_SIZE: Record<string, { model_size: "1.7B" | "0.6B"; model_id: "qwen3-tts-1.7b" | "qwen3-tts-0.6b" }> = {
+  "1.7b": { model_size: "1.7B", model_id: "qwen3-tts-1.7b" },
+  "0.6b": { model_size: "0.6B", model_id: "qwen3-tts-0.6b" },
+};
+
 const toSpeakerName = (name: string): string => {
   const normalized = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_");
   return normalized || `speaker_${crypto.randomUUID().slice(0, 8)}`;
@@ -87,9 +92,14 @@ app.post("/add", async (c) => {
   const name = String(formData.get("name") ?? "").trim();
   const description = String(formData.get("description") ?? "").trim();
   const labels = parseLabels(formData.get("labels")?.toString() ?? null);
+  const requestedModelSize = String(formData.get("model_size") ?? "1.7B").trim().toLowerCase();
+  const modelConfig = MODEL_BY_SIZE[requestedModelSize];
 
   if (!name) {
     return c.json({ detail: { message: "name is required" } }, 400);
+  }
+  if (!modelConfig) {
+    return c.json({ detail: { message: "model_size must be either 1.7B or 0.6B" } }, 400);
   }
 
   const fileEntries: UploadFile[] = [];
@@ -113,8 +123,8 @@ app.post("/add", async (c) => {
     name,
     description,
     speaker_name: toSpeakerName(name),
-    model_size: "1.7B",
-    model_id: "qwen3-tts-1.7b",
+    model_size: modelConfig.model_size,
+    model_id: modelConfig.model_id,
     category: "cloned",
     status: "created",
     checkpoint_r2_prefix: null,

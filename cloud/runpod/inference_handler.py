@@ -99,13 +99,58 @@ def _resolve_dtype(device: str) -> Any:
     return torch.float32
 
 
+# ---------------------------------------------------------------------------
+# Multi-language script detection for duration estimation
+# ---------------------------------------------------------------------------
+_HANGUL = re.compile(r"[\uAC00-\uD7A3\u1100-\u11FF\u3130-\u318F]")
+_HAN = re.compile(r"[\u4E00-\u9FFF]")
+_HIRA = re.compile(r"[\u3040-\u309F]")
+_KATA = re.compile(r"[\u30A0-\u30FF\uFF66-\uFF9D]")
+_LATIN_DIGIT = re.compile(r"[A-Za-z0-9]")
+_CJK_PUNCT = set(".,!?;:\u2026\u00b7\uFF0C\u3002\uFF01\uFF1F\uFF1B\uFF1A\u3001\u30FB")
+
+
+def _expected_seconds(text: str) -> float:
+    """Estimate speech duration in seconds using per-script character rates.
+
+    Rates are additive so mixed-language text (e.g. Korean with English loanwords)
+    sums correctly instead of picking a single language.
+    """
+    t = (text or "").strip()
+    if not t:
+        return 0.0
+
+    hangul = len(_HANGUL.findall(t))
+    han = len(_HAN.findall(t))
+    kana = len(_HIRA.findall(t)) + len(_KATA.findall(t))
+    latin = len(_LATIN_DIGIT.findall(t))
+    punct = sum(1 for ch in t if ch in _CJK_PUNCT)
+
+    # Count characters not matched by any known script (Thai, Vietnamese, Arabic, etc.)
+    known_count = hangul + han + kana + latin + punct
+    other = sum(1 for ch in t if not ch.isspace()) - known_count
+    other = max(0, other)
+
+    sec = 0.0
+    sec += hangul * 0.25   # Korean: ~4 chars/sec
+    sec += han * 0.30      # Chinese / kanji: ~3.3 chars/sec
+    sec += kana * 0.18     # Japanese kana: ~5.5 chars/sec
+    sec += latin * 0.10    # English / digits: ~10 chars/sec
+    sec += punct * 0.12    # punctuation pauses
+    sec += other * 0.20    # unknown scripts: conservative ~5 chars/sec
+    return max(0.2, sec)
+
+
 def _adaptive_max_tokens(text: str) -> int:
-    """Match local inference adaptive max_new_tokens to prevent over-generation."""
-    chars = max(1, len((text or "").strip()))
-    scaled = int(chars * 4)
-    floor = 192
-    ceil = 1024
-    return max(floor, min(ceil, scaled))
+    """Estimate max_new_tokens from text length using per-script duration."""
+    est = _expected_seconds(text)
+    if est <= 0.0:
+        return 48  # ~4 second fallback for empty input
+    # Convert to tokens: 12Hz * estimated_duration * 1.5x safety buffer
+    tokens = int(est * 12 * 1.5)
+    floor = 48   # minimum ~4 seconds (prevents truncation on short texts)
+    ceil = 1024  # hard upper limit
+    return max(floor, min(ceil, tokens))
 
 
 def _model_supports_instruct(model: Any) -> bool:
@@ -478,17 +523,15 @@ def _verify_quality(
     safe_sr = max(int(sr), 1)
     duration_sec = float(len(audio_flat) / safe_sr) if len(audio_flat) > 0 else 0.0
 
-    korean_chars = len(re.findall(r"[가-힣]", text or ""))
-    if korean_chars <= 0:
-        korean_chars = len((text or "").replace(" ", ""))
-    expected_duration_sec = max(0.3, korean_chars * 0.15)
+    expected_duration_sec = max(0.3, _expected_seconds(text or ""))
     ratio = duration_sec / max(expected_duration_sec, 1e-6)
-    if 0.8 <= ratio <= 1.2:
+    # Wider acceptable band: TTS naturally varies in pacing
+    if 0.5 <= ratio <= 2.0:
         duration_score = 1.0
-    elif 0.5 <= ratio < 0.8:
-        duration_score = (ratio - 0.5) / 0.3
-    elif 1.2 < ratio <= 2.0:
-        duration_score = (2.0 - ratio) / 0.8
+    elif 0.3 <= ratio < 0.5:
+        duration_score = (ratio - 0.3) / 0.2
+    elif 2.0 < ratio <= 3.5:
+        duration_score = (3.5 - ratio) / 1.5
     else:
         duration_score = 0.0
 

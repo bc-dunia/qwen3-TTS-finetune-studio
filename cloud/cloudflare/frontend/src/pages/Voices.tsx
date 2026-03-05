@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { fetchVoices, createVoice, type Voice } from '../lib/api'
+import { fetchVoices, createVoice, type Voice, type VoiceModelSize } from '../lib/api'
 import { VoiceCard } from '../components/VoiceCard'
 
 export function Voices() {
@@ -125,6 +125,7 @@ function CreateVoiceModal({
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
   const [audioFiles, setAudioFiles] = useState<File[]>([])
+  const [modelSize, setModelSize] = useState<VoiceModelSize>('1.7B')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -138,7 +139,7 @@ function CreateVoiceModal({
     setError('')
 
     try {
-      await createVoice(name.trim(), description.trim(), audioFiles[0])
+      await createVoice(name.trim(), description.trim(), audioFiles[0], modelSize)
       onCreated()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create voice')
@@ -212,6 +213,20 @@ function CreateVoiceModal({
               rows={3}
               className="w-full bg-raised border border-edge rounded-lg px-3 py-2 text-sm text-primary placeholder:text-muted focus:border-accent transition-colors resize-none"
             />
+          </div>
+
+          <div>
+            <label className="text-subtle text-xs font-medium mb-1.5 block">
+              Base Model
+            </label>
+            <select
+              value={modelSize}
+              onChange={(e) => setModelSize(e.target.value as VoiceModelSize)}
+              className="w-full bg-raised border border-edge rounded-lg px-3 py-2 text-sm text-primary focus:border-accent transition-colors"
+            >
+              <option value="1.7B">Qwen3-TTS 1.7B (higher capacity)</option>
+              <option value="0.6B">Qwen3-TTS 0.6B (faster/cheaper)</option>
+            </select>
           </div>
 
           {/* Audio Upload */}

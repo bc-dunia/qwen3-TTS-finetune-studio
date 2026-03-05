@@ -3,7 +3,8 @@ import { useParams, useNavigate } from 'react-router'
 import {
   fetchVoice,
   deleteVoice,
-  generateSpeech,
+  getSpeechGenerationStatus,
+  startSpeechGenerationAsync,
   type Voice,
   type VoiceSettings,
   DEFAULT_VOICE_SETTINGS,
@@ -25,6 +26,7 @@ export function VoiceDetail() {
   // Quick generate
   const [text, setText] = useState('')
   const [generating, setGenerating] = useState(false)
+  const [generateStatus, setGenerateStatus] = useState('')
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null)
   const [genError, setGenError] = useState('')
 
@@ -60,14 +62,36 @@ export function VoiceDetail() {
     if (!voiceId || !text.trim()) return
 
     setGenerating(true)
+    setGenerateStatus('Queued...')
     setGenError('')
     setAudioBlob(null)
 
     try {
-      const blob = await generateSpeech(voiceId, text.trim(), settings)
-      setAudioBlob(blob)
+      const asyncJob = await startSpeechGenerationAsync(voiceId, text.trim(), settings)
+      let completed = false
+      let attempts = 0
+      while (attempts < 180) {
+        attempts += 1
+        const status = await getSpeechGenerationStatus(asyncJob.job_id)
+        if (status.status === 'COMPLETED' && status.audio) {
+          const bytes = Uint8Array.from(atob(status.audio), (c) => c.charCodeAt(0))
+          setAudioBlob(new Blob([bytes], { type: 'audio/wav' }))
+          setGenerateStatus('Completed')
+          completed = true
+          break
+        }
+        if (status.status === 'FAILED') {
+          throw new Error(status.error || 'Generation failed')
+        }
+        setGenerateStatus(status.status)
+        await new Promise((resolve) => setTimeout(resolve, 1000))
+      }
+      if (!completed) {
+        throw new Error('Generation timed out. Please try again.')
+      }
     } catch (err) {
       setGenError(err instanceof Error ? err.message : 'Generation failed')
+      setGenerateStatus('')
     } finally {
       setGenerating(false)
     }
@@ -228,7 +252,7 @@ export function VoiceDetail() {
             className="w-full bg-accent hover:bg-accent-light text-void font-semibold text-sm py-2.5 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed transition-colors mb-4"
             type="button"
           >
-            {generating ? 'Generating...' : 'Generate'}
+            {generating ? (generateStatus ? `Generating (${generateStatus})...` : 'Generating...') : 'Generate'}
           </button>
 
           {genError && (

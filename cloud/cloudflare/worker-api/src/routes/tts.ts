@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { createGeneration, getVoice } from "../lib/d1";
-import { invokeServerless } from "../lib/runpod";
+import { getServerlessStatus, invokeServerless, invokeServerlessAsync } from "../lib/runpod";
 import { authMiddleware } from "../middleware/auth";
 import type { AppContext, Generation, TTSRequest } from "../types";
 
@@ -16,6 +16,15 @@ const OUTPUT_FORMAT_TO_CONTENT_TYPE: Record<string, string> = {
 const getContentTypeForFormat = (outputFormat: string): string =>
   OUTPUT_FORMAT_TO_CONTENT_TYPE[outputFormat] ?? "audio/wav";
 
+const MAX_TORCH_SEED = 0xFFFFFFFF;
+const DEFAULT_INFERENCE_SEED = 123456;
+
+const normalizeSeed = (seed: number | undefined): number => {
+  const raw = Number.isFinite(seed) ? Math.trunc(seed as number) : DEFAULT_INFERENCE_SEED;
+  const bounded = ((raw % MAX_TORCH_SEED) + MAX_TORCH_SEED) % MAX_TORCH_SEED;
+  return bounded === 0 ? 1 : bounded;
+};
+
 const decodeBase64 = (value: string): Uint8Array => {
   const decoded = atob(value);
   const bytes = new Uint8Array(decoded.length);
@@ -24,6 +33,53 @@ const decodeBase64 = (value: string): Uint8Array => {
   }
   return bytes;
 };
+
+const isLowQualityOutput = (quality: unknown): { low: boolean; reason?: string } => {
+  if (!quality || typeof quality !== "object") {
+    return { low: false };
+  }
+  const q = quality as Record<string, unknown>;
+  const overall = Number(q.overall_score ?? NaN);
+  const duration = Number(q.duration_score ?? NaN);
+  const health = Number(q.health_score ?? NaN);
+
+  if (Number.isFinite(overall) && overall < 0.7) {
+    return { low: true, reason: `Low overall quality score (${overall.toFixed(2)})` };
+  }
+  if (Number.isFinite(duration) && duration < 0.2) {
+    return { low: true, reason: `Duration mismatch detected (duration_score=${duration.toFixed(2)})` };
+  }
+  if (Number.isFinite(health) && health < 0.55) {
+    return { low: true, reason: `Audio health score too low (${health.toFixed(2)})` };
+  }
+  return { low: false };
+};
+
+const buildInputPayload = (
+  voiceId: string,
+  modelId: string,
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>,
+  body: TTSRequest,
+  seed: number
+): Record<string, unknown> => ({
+  text: body.text,
+  voice_id: voiceId,
+  speaker_name: voice.speaker_name,
+  model_id: modelId,
+  voice_settings: body.voice_settings ?? voice.settings,
+  seed,
+  language: body.language_code ?? "auto",
+  checkpoint_info: voice.checkpoint_r2_prefix
+    ? {
+        r2_prefix: voice.checkpoint_r2_prefix,
+        type: "full" as const,
+      }
+    : {
+        voice_id: voiceId,
+        run_name: voice.run_name,
+        epoch: voice.epoch,
+      },
+});
 
 const runTtsRequest = async (c: Context<AppContext>): Promise<Response> => {
   const voiceId = c.req.param("voice_id");
@@ -57,26 +113,9 @@ const runTtsRequest = async (c: Context<AppContext>): Promise<Response> => {
   const requestId = crypto.randomUUID();
   const startedAt = Date.now();
   const modelId = body.model_id ?? voice.model_id ?? "qwen3-tts-1.7b";
+  const seed = normalizeSeed(body.seed);
 
-  const inputPayload: Record<string, unknown> = {
-    text: body.text,
-    voice_id: voiceId,
-    speaker_name: voice.speaker_name,
-    model_id: modelId,
-    voice_settings: body.voice_settings ?? voice.settings,
-    seed: body.seed,
-    language: body.language_code ?? "auto",
-    checkpoint_info: voice.checkpoint_r2_prefix
-      ? {
-          r2_prefix: voice.checkpoint_r2_prefix,
-          type: "full" as const,
-        }
-      : {
-          voice_id: voiceId,
-          run_name: voice.run_name,
-          epoch: voice.epoch,
-        },
-  };
+  const inputPayload = buildInputPayload(voiceId, modelId, voice, body, seed);
   let runpodResponse: Record<string, unknown>;
   try {
     runpodResponse = await invokeServerless(c.env, c.env.RUNPOD_ENDPOINT_ID, inputPayload);
@@ -93,10 +132,23 @@ const runTtsRequest = async (c: Context<AppContext>): Promise<Response> => {
     audio?: string;
     sample_rate?: number;
     duration_ms?: number;
+    quality?: Record<string, unknown>;
   };
 
   if (!output.audio) {
     return c.json({ detail: { message: "RunPod response did not include audio output" } }, 502);
+  }
+
+  const qualityCheck = isLowQualityOutput(output.quality);
+  if (qualityCheck.low) {
+    return c.json(
+      {
+        detail: {
+          message: `Generated audio rejected by quality gate: ${qualityCheck.reason ?? "low quality"}`,
+        },
+      },
+      422
+    );
   }
 
   let audioBytes: Uint8Array;
@@ -143,6 +195,79 @@ app.post("/:voice_id", async (c) => runTtsRequest(c));
 
 app.post("/:voice_id/stream", async (c) => {
   return runTtsRequest(c);
+});
+
+app.post("/:voice_id/async", async (c) => {
+  const voiceId = c.req.param("voice_id");
+  const body = (await c.req.json()) as TTSRequest;
+  if (!body.text || !body.text.trim()) {
+    return c.json({ detail: { message: "text is required" } }, 400);
+  }
+  if (body.text.length > 5000) {
+    return c.json({ detail: { message: "text must be 5000 characters or less" } }, 400);
+  }
+
+  const voice = await getVoice(c.env.DB, voiceId);
+  if (!voice || voice.status !== "ready") {
+    return c.json({ detail: { message: "Voice not found or not ready" } }, 404);
+  }
+
+  const modelId = body.model_id ?? voice.model_id ?? "qwen3-tts-1.7b";
+  const seed = normalizeSeed(body.seed);
+  const inputPayload = buildInputPayload(voiceId, modelId, voice, body, seed);
+
+  try {
+    const runpodResponse = await invokeServerlessAsync(c.env, c.env.RUNPOD_ENDPOINT_ID, inputPayload);
+    return c.json({
+      job_id: runpodResponse.id,
+      status: runpodResponse.status ?? "IN_QUEUE",
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown RunPod error";
+    return c.json({ detail: { message } }, 502);
+  }
+});
+
+app.get("/jobs/:job_id", async (c) => {
+  const jobId = c.req.param("job_id");
+  try {
+    const runpodResponse = await getServerlessStatus(c.env, c.env.RUNPOD_ENDPOINT_ID, jobId);
+    const status = String(runpodResponse.status ?? "UNKNOWN");
+    const output = (runpodResponse.output ?? {}) as {
+      audio?: string;
+      duration_ms?: number;
+      sample_rate?: number;
+      error?: string;
+      quality?: Record<string, unknown>;
+    };
+
+    if (status === "FAILED") {
+      return c.json({ status, error: output.error ?? runpodResponse.error ?? "Generation failed" }, 502);
+    }
+
+    if (status !== "COMPLETED") {
+      return c.json({ status });
+    }
+
+    if (!output.audio) {
+      return c.json({ status: "FAILED", error: "RunPod response did not include audio output" }, 502);
+    }
+
+    const qualityCheck = isLowQualityOutput(output.quality);
+    if (qualityCheck.low) {
+      return c.json({ status: "FAILED", error: `Quality gate rejected output: ${qualityCheck.reason ?? "low quality"}` }, 422);
+    }
+
+    return c.json({
+      status,
+      audio: output.audio,
+      sample_rate: output.sample_rate ?? 24000,
+      duration_ms: output.duration_ms ?? null,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown RunPod error";
+    return c.json({ detail: { message } }, 502);
+  }
 });
 
 export default app;

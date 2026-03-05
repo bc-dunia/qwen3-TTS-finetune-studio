@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
+import { Link } from 'react-router'
 import {
   fetchVoices,
   fetchTrainingJobs,
@@ -33,7 +34,7 @@ export function Training() {
   // Form state
   const [selectedVoiceId, setSelectedVoiceId] = useState('')
   const [batchSize, setBatchSize] = useState(2)
-  const [epochs, setEpochs] = useState(5)
+  const [epochs, setEpochs] = useState(10)
   const [learningRate, setLearningRate] = useState(0.00002)
   const [starting, setStarting] = useState(false)
   const [formError, setFormError] = useState('')
@@ -198,6 +199,24 @@ export function Training() {
         <div className="bg-raised border border-edge rounded-xl p-5">
           <h2 className="text-heading font-semibold text-sm mb-5">Start Training</h2>
 
+          <div className="mb-4 rounded-lg border border-edge bg-surface px-3 py-2.5">
+            <p className="text-subtle text-xs">
+              Upload training audio on the Voices page first, then start training here.
+            </p>
+            <Link
+              to="/voices"
+              className="inline-flex items-center gap-1 mt-2 text-accent text-xs font-medium hover:text-accent-light"
+            >
+              Go to Voices upload
+            </Link>
+          </div>
+
+          {voices.length === 0 && !loadingVoices && (
+            <div className="mb-4 rounded-lg border border-warning/20 bg-warning-dim px-3 py-2 text-warning text-xs">
+              No voices found yet. Create a voice and upload audio first.
+            </div>
+          )}
+
           <form onSubmit={handleStartTraining} className="space-y-4">
             {/* Voice */}
             <div>
@@ -278,7 +297,7 @@ export function Training() {
             {/* Submit */}
             <button
               type="submit"
-              disabled={!selectedVoiceId || starting}
+              disabled={!selectedVoiceId || starting || voices.length === 0}
               className="w-full bg-accent hover:bg-accent-light text-void font-semibold text-sm py-2.5 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
             >
               {starting ? 'Starting...' : 'Start Training'}

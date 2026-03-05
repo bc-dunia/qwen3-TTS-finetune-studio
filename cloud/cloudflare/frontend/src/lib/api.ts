@@ -18,6 +18,8 @@ export interface Voice {
   created_at: string
 }
 
+export type VoiceModelSize = '1.7B' | '0.6B'
+
 export interface VoicesResponse {
   voices: Voice[]
   has_more: boolean
@@ -28,6 +30,19 @@ export interface Model {
   model_id: string
   name: string
   description: string
+}
+
+export interface AsyncSpeechJob {
+  job_id: string
+  status: string
+}
+
+export interface AsyncSpeechStatus {
+  status: string
+  audio?: string
+  sample_rate?: number
+  duration_ms?: number | null
+  error?: string
 }
 
 export interface TrainingProgress {
@@ -94,7 +109,7 @@ export class ApiError extends Error {
 const API_URL = import.meta.env.VITE_API_URL ?? ''
 
 function getApiKey(): string {
-  return localStorage.getItem('xi-api-key') ?? ''
+  return (localStorage.getItem('xi-api-key') ?? '').trim()
 }
 
 function authHeaders(): Record<string, string> {
@@ -120,10 +135,26 @@ async function request<T>(
     let detail = `Request failed: ${response.status}`
     try {
       const body = await response.json() as Record<string, unknown>
-      if (typeof body.detail === 'string') detail = body.detail
+      if (typeof body.detail === 'string') {
+        detail = body.detail
+      } else if (
+        typeof body.detail === 'object' &&
+        body.detail !== null &&
+        typeof (body.detail as { message?: unknown }).message === 'string'
+      ) {
+        detail = (body.detail as { message: string }).message
+      }
     } catch {
       // ignore parse errors
     }
+
+    if (response.status === 401) {
+      const hasKey = getApiKey().length > 0
+      detail = hasKey
+        ? 'Invalid API key. Check the key in the left sidebar.'
+        : 'Missing API key. Enter your xi-api-key in the left sidebar.'
+    }
+
     throw new ApiError(detail, response.status, detail)
   }
 
@@ -144,10 +175,12 @@ export async function createVoice(
   name: string,
   description: string,
   audioFile: File,
+  modelSize: VoiceModelSize = '1.7B',
 ): Promise<{ voice_id: string }> {
   const formData = new FormData()
   formData.append('name', name)
   formData.append('description', description)
+  formData.append('model_size', modelSize)
   formData.append('files', audioFile)
 
   const url = `${API_URL}/v1/voices/add`
@@ -211,6 +244,22 @@ export async function generateSpeech(
   }
 
   return response.blob()
+}
+
+export async function startSpeechGenerationAsync(
+  voiceId: string,
+  text: string,
+  voiceSettings?: Partial<VoiceSettings>,
+): Promise<AsyncSpeechJob> {
+  return request<AsyncSpeechJob>(`/v1/text-to-speech/${voiceId}/async`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, voice_settings: voiceSettings }),
+  })
+}
+
+export async function getSpeechGenerationStatus(jobId: string): Promise<AsyncSpeechStatus> {
+  return request<AsyncSpeechStatus>(`/v1/text-to-speech/jobs/${jobId}`)
 }
 
 // ── Models ─────────────────────────────────────────────────────────────────────

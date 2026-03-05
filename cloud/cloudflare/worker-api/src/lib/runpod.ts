@@ -56,6 +56,50 @@ export const invokeServerless = async (
   return (await response.json()) as Record<string, unknown>;
 };
 
+export const invokeServerlessAsync = async (
+  env: Env,
+  endpointId: string,
+  input: Record<string, unknown>
+): Promise<Record<string, unknown>> => {
+  const url = `${RUNPOD_SERVERLESS_BASE_URL}/${endpointId}/run`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${env.RUNPOD_API_KEY}`,
+    },
+    body: JSON.stringify({ input }),
+  });
+
+  if (!response.ok) {
+    const bodyText = await response.text();
+    throw new Error(`RunPod async invocation failed (${response.status}): ${bodyText}`);
+  }
+
+  return (await response.json()) as Record<string, unknown>;
+};
+
+export const getServerlessStatus = async (
+  env: Env,
+  endpointId: string,
+  runId: string
+): Promise<Record<string, unknown>> => {
+  const url = `${RUNPOD_SERVERLESS_BASE_URL}/${endpointId}/status/${runId}`;
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${env.RUNPOD_API_KEY}`,
+    },
+  });
+
+  if (!response.ok) {
+    const bodyText = await response.text();
+    throw new Error(`RunPod status request failed (${response.status}): ${bodyText}`);
+  }
+
+  return (await response.json()) as Record<string, unknown>;
+};
+
 export const createPod = async (
   env: Env,
   templateId: string,

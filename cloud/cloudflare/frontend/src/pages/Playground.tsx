@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from 'react'
 import {
   fetchVoices,
-  generateSpeech,
+  getSpeechGenerationStatus,
+  startSpeechGenerationAsync,
   type Voice,
   type VoiceSettings,
   DEFAULT_VOICE_SETTINGS,
@@ -28,6 +29,7 @@ export function Playground() {
   const [settings, setSettings] = useState<VoiceSettings>(DEFAULT_VOICE_SETTINGS)
 
   const [generating, setGenerating] = useState(false)
+  const [generateStatus, setGenerateStatus] = useState('')
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null)
   const [error, setError] = useState('')
 
@@ -75,12 +77,34 @@ export function Playground() {
     if (!selectedVoiceId || !text.trim()) return
 
     setGenerating(true)
+    setGenerateStatus('Queued...')
     setError('')
     setAudioBlob(null)
 
     try {
-      const blob = await generateSpeech(selectedVoiceId, text.trim(), settings)
-      setAudioBlob(blob)
+      const asyncJob = await startSpeechGenerationAsync(selectedVoiceId, text.trim(), settings)
+      let completed = false
+      let attempts = 0
+      while (attempts < 180) {
+        attempts += 1
+        const status = await getSpeechGenerationStatus(asyncJob.job_id)
+        if (status.status === 'COMPLETED' && status.audio) {
+          const bytes = Uint8Array.from(atob(status.audio), (c) => c.charCodeAt(0))
+          setAudioBlob(new Blob([bytes], { type: 'audio/wav' }))
+          setGenerateStatus('Completed')
+          completed = true
+          break
+        }
+        if (status.status === 'FAILED') {
+          throw new Error(status.error || 'Generation failed')
+        }
+        setGenerateStatus(status.status)
+        await new Promise((resolve) => setTimeout(resolve, 1000))
+      }
+
+      if (!completed) {
+        throw new Error('Generation timed out. Please try again.')
+      }
 
       // Add to history
       const voice = voices.find((v) => v.voice_id === selectedVoiceId)
@@ -94,6 +118,7 @@ export function Playground() {
       saveHistory([entry, ...history])
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Generation failed')
+      setGenerateStatus('')
     } finally {
       setGenerating(false)
     }
@@ -172,7 +197,7 @@ export function Playground() {
                 <svg className="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
                   <circle cx="12" cy="12" r="10" strokeDasharray="60" strokeDashoffset="15" strokeLinecap="round" />
                 </svg>
-                Generating...
+                {generateStatus ? `Generating (${generateStatus})...` : 'Generating...'}
               </>
             ) : (
               <>

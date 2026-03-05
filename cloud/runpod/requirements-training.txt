@@ -2,7 +2,9 @@
 # Base image provides: torch, numpy, CUDA libs
 # qwen-tts (installed separately in Dockerfile with full deps)
 
-# HuggingFace (pinned by qwen-tts, listed here as baseline)
+# HuggingFace — pin transformers <5.0.0 to avoid 85-99% silence bug (PR #201)
+transformers>=4.40.0,<5.0.0
+accelerate>=0.30.0
 safetensors>=0.4.0
 huggingface-hub>=0.23.0
 

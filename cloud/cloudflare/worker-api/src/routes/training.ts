@@ -10,7 +10,7 @@ import {
   updateTrainingJob,
   updateVoice,
 } from "../lib/d1";
-import { createPod, terminatePod } from "../lib/runpod";
+import { createPod, invokeServerless, terminatePod } from "../lib/runpod";
 import { authMiddleware } from "../middleware/auth";
 import type { AppContext, TrainingConfig, TrainingJob, TrainingProgress } from "../types";
 
@@ -34,6 +34,14 @@ const ACTIVE_JOB_STATUSES = new Set([
   "uploading",
 ]);
 
+const needsCompletedValidation = (job: TrainingJob): boolean => {
+  if (job.status !== "completed") {
+    return false;
+  }
+  const summary = (job.summary ?? {}) as Record<string, unknown>;
+  return summary.validation_checked !== true;
+};
+
 const parseRunNameFromCheckpointPrefix = (prefix: string): string | null => {
   const parts = prefix.split("/");
   if (parts.length < 4 || parts[0] !== "checkpoints") {
@@ -45,6 +53,98 @@ const parseRunNameFromCheckpointPrefix = (prefix: string): string | null => {
 const serializeTrainingJob = (job: TrainingJob): Omit<TrainingJob, "job_token"> => {
   const { job_token: _jobToken, ...safeJob } = job;
   return safeJob;
+};
+
+const validateTrainedCheckpoint = async (
+  c: Context<AppContext>,
+  job: TrainingJob,
+  checkpointPrefix: string
+): Promise<{ ok: boolean; message: string }> => {
+  const voice = await getVoice(c.env.DB, job.voice_id);
+  if (!voice) {
+    return { ok: false, message: "Voice record missing for validation" };
+  }
+
+  // Multi-language validation texts — select based on job config or default to mixed set
+  const jobConfig = job.config as Record<string, unknown>;
+  const lang = typeof jobConfig.whisper_language === "string" ? jobConfig.whisper_language.toLowerCase() : "";
+
+  const validationTextsByLang: Record<string, string[]> = {
+    ko: [
+      "안녕하세요.",
+      "안녕하세요. 오늘 회의는 오후 두 시에 시작합니다.",
+      "안녕하세요. 오늘 회의는 오후 두 시에 시작하고, 발표 자료는 메일로 공유드리겠습니다.",
+    ],
+    en: [
+      "Hello.",
+      "Hello. The meeting starts at two o'clock this afternoon.",
+      "Hello. The meeting starts at two o'clock this afternoon, and I will share the presentation materials via email.",
+    ],
+    zh: [
+      "你好。",
+      "你好。今天的会议下午两点开始。",
+      "你好。今天的会议下午两点开始，我会通过邮件分享演示文稿。",
+    ],
+    ja: [
+      "こんにちは。",
+      "こんにちは。今日の会議は午後二時に始まります。",
+      "こんにちは。今日の会議は午後二時に始まります。プレゼン資料はメールでお送りします。",
+    ],
+  };
+
+  // Use language-specific texts, or fall back to mixed set (short/medium/long)
+  const validationTexts = validationTextsByLang[lang] ?? [
+    "Hello.",
+    "Hello. The meeting starts at two o'clock this afternoon.",
+    "Hello. The meeting starts at two o'clock this afternoon, and I will share the presentation materials via email.",
+  ];
+
+  try {
+    for (let i = 0; i < validationTexts.length; i += 1) {
+      for (const seed of [123456 + i, 223456 + i]) {
+        const payload: Record<string, unknown> = {
+          text: validationTexts[i],
+          voice_id: voice.voice_id,
+          speaker_name: voice.speaker_name,
+          model_id: voice.model_id ?? "qwen3-tts-1.7b",
+          language: "auto",
+          seed,
+          checkpoint_info: {
+            r2_prefix: checkpointPrefix,
+            type: "full",
+          },
+        };
+
+        const response = await invokeServerless(c.env, c.env.RUNPOD_ENDPOINT_ID, payload);
+        const output = (response.output ?? {}) as { quality?: Record<string, unknown>; audio?: string };
+        if (!output.audio) {
+          return { ok: false, message: `Validation sample ${i + 1} seed ${seed} returned no audio` };
+        }
+
+        const quality = output.quality ?? {};
+        const overall = Number(quality.overall_score ?? NaN);
+        const duration = Number(quality.duration_score ?? NaN);
+        const health = Number(quality.health_score ?? NaN);
+
+        if (Number.isFinite(overall) && overall < 0.75) {
+          return { ok: false, message: `Validation sample ${i + 1} seed ${seed} failed: overall_score=${overall.toFixed(2)}` };
+        }
+        if (Number.isFinite(duration) && duration < 0.35) {
+          return { ok: false, message: `Validation sample ${i + 1} seed ${seed} failed: duration_score=${duration.toFixed(2)}` };
+        }
+        if (Number.isFinite(health) && health < 0.6) {
+          return { ok: false, message: `Validation sample ${i + 1} seed ${seed} failed: health_score=${health.toFixed(2)}` };
+        }
+      }
+    }
+
+    return { ok: true, message: "Validation passed on all samples" };
+  } catch (error) {
+    return {
+      ok: false,
+      message: `Validation invocation failed: ${error instanceof Error ? error.message : "unknown"}`,
+    };
+  }
 };
 
 const reconcileJobStatus = async (
@@ -75,15 +175,47 @@ const reconcileJobStatus = async (
     });
   }
 
-  if (status === "completed" && Array.isArray(parsedStatus.checkpoints) && parsedStatus.checkpoints.length > 0) {
+  if (status === "completed" && !job.summary?.validation_checked && Array.isArray(parsedStatus.checkpoints) && parsedStatus.checkpoints.length > 0) {
     const lastCheckpoint = parsedStatus.checkpoints[parsedStatus.checkpoints.length - 1];
     if (typeof lastCheckpoint.epoch === "number" && typeof lastCheckpoint.r2_prefix === "string") {
-      await updateVoice(c.env.DB, job.voice_id, {
-        status: "ready",
-        checkpoint_r2_prefix: lastCheckpoint.r2_prefix,
-        run_name: parseRunNameFromCheckpointPrefix(lastCheckpoint.r2_prefix),
-        epoch: lastCheckpoint.epoch,
-      });
+      const validation = await validateTrainedCheckpoint(c, job, lastCheckpoint.r2_prefix);
+      if (validation.ok) {
+        await updateVoice(c.env.DB, job.voice_id, {
+          status: "ready",
+          checkpoint_r2_prefix: lastCheckpoint.r2_prefix,
+          run_name: parseRunNameFromCheckpointPrefix(lastCheckpoint.r2_prefix),
+          epoch: lastCheckpoint.epoch,
+        });
+        await updateTrainingJob(c.env.DB, job.job_id, {
+          status: "completed",
+          completed_at: job.completed_at ?? Date.now(),
+          progress,
+          summary: {
+            ...(job.summary ?? {}),
+            validation_checked: true,
+            validation_passed: true,
+            validation_message: validation.message,
+          },
+        });
+      } else {
+        await updateVoice(c.env.DB, job.voice_id, {
+          status: "created",
+        });
+        await updateTrainingJob(c.env.DB, job.job_id, {
+          status: "failed",
+          error_message: validation.message,
+          summary: {
+            ...(job.summary ?? {}),
+            validation_failed: true,
+            validation_checked: true,
+            validation_passed: false,
+            validation_message: validation.message,
+          },
+          completed_at: job.completed_at ?? Date.now(),
+          progress,
+        });
+        return { status: "failed", progress };
+      }
     }
 
     await updateTrainingJob(c.env.DB, job.job_id, {
@@ -188,6 +320,7 @@ app.post("/start", async (c) => {
     seed: Number(cfg.seed ?? 42),
     job_token: jobToken,
     worker_api_url: workerUrl,
+    whisper_language: typeof cfg.whisper_language === "string" ? cfg.whisper_language : undefined,
   };
   await c.env.R2.put(`jobs/${jobId}/config.json`, JSON.stringify(jobConfig), {
     httpMetadata: { contentType: "application/json" },
@@ -271,7 +404,9 @@ app.get("/jobs", async (c) => {
   const hydratedJobs = await Promise.all(
     jobs.map(async (job) => {
       if (!ACTIVE_JOB_STATUSES.has(job.status)) {
-        return job;
+        if (!needsCompletedValidation(job)) {
+          return job;
+        }
       }
       await reconcileJobStatus(c, job);
       return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
@@ -344,7 +479,7 @@ app.get("/:job_id", async (c) => {
     return c.json({ detail: { message: "Training job not found" } }, 404);
   }
 
-  if (ACTIVE_JOB_STATUSES.has(job.status)) {
+  if (ACTIVE_JOB_STATUSES.has(job.status) || needsCompletedValidation(job)) {
     await reconcileJobStatus(c, job);
     const updated = await getTrainingJob(c.env.DB, jobId);
     if (updated) {

@@ -239,10 +239,11 @@ def train():
 
                 input_embeddings = input_text_embedding + input_codec_embedding
 
-                for i in range(1, 16):
-                    codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
-                    codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
-                    input_embeddings = input_embeddings + codec_i_embedding
+                # NOTE: codec layers 1-15 embeddings intentionally excluded.
+                # Including them violates causality — the AR model would learn to
+                # predict timing from future codec tokens that don't exist at
+                # inference time, causing progressively faster speech per epoch.
+                # See: https://github.com/QwenLM/Qwen3-TTS/pull/178
 
                 outputs = model.talker(
                     inputs_embeds=input_embeddings[:, :-1, :],
@@ -301,10 +302,10 @@ def train():
             unwrapped_model = accelerator.unwrap_model(model)
             state_dict = {k: v.detach().to("cpu") for k, v in unwrapped_model.state_dict().items()}
 
-            drop_prefix = "speaker_encoder"
-            keys_to_drop = [k for k in state_dict.keys() if k.startswith(drop_prefix)]
-            for k in keys_to_drop:
-                del state_dict[k]
+            # NOTE: speaker_encoder weights are preserved in checkpoints to
+            # allow training resume. They can be stripped for inference-only
+            # exports if checkpoint size is a concern.
+            # See: https://github.com/QwenLM/Qwen3-TTS/pull/232
 
             weight = state_dict['talker.model.codec_embedding.weight']
             state_dict['talker.model.codec_embedding.weight'][int(args.speaker_id)] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)

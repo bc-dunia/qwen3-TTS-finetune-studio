@@ -71,6 +71,7 @@ class JobConfig:
     seed: int
     worker_api_url: str | None = None
     job_token: str | None = None
+    whisper_language: str | None = None  # None = auto-detect; e.g. "ko", "en", "zh", "ja"
 
 
 class UnrecoverableError(Exception):
@@ -320,7 +321,11 @@ def parse_job_config(raw: dict[str, Any]) -> JobConfig:
         seed=int(raw.get("seed", 42)),
         worker_api_url=(str(raw.get("worker_api_url", "")).strip() or None),
         job_token=(str(raw.get("job_token", "")).strip() or None),
+        whisper_language=(str(raw.get("whisper_language", "")).strip() or None),
     )
+    # Normalize whisper_language: "auto" or empty → None (auto-detect)
+    if cfg.whisper_language and cfg.whisper_language.lower() == "auto":
+        cfg.whisper_language = None
     for field_name, field_value in [
         ("voice_id", cfg.voice_id),
         ("run_name", cfg.run_name),
@@ -694,7 +699,8 @@ def _compute_rms(audio_path: Path) -> float:
 
 
 def preprocess_raw_audio(
-    dataset_dir: Path, output_jsonl: Path, status: StatusWriter
+    dataset_dir: Path, output_jsonl: Path, status: StatusWriter,
+    whisper_language: str | None = None,
 ) -> None:
     import torch
 
@@ -846,7 +852,7 @@ def preprocess_raw_audio(
 
         whisper_segments, _ = model.transcribe(
             str(seg_path),
-            language="ko",
+            language=whisper_language,
             beam_size=5,
         )
         text_parts: list[str] = []
@@ -1281,7 +1287,7 @@ def main() -> int:
                 }
             )
             try:
-                preprocess_raw_audio(DATASET_DIR, train_raw_jsonl, status)
+                preprocess_raw_audio(DATASET_DIR, train_raw_jsonl, status, whisper_language=cfg.whisper_language)
             except (FileNotFoundError, RuntimeError) as exc:
                 raise UnrecoverableError(f"Preprocessing failed: {exc}") from exc
             generated_train_raw = True

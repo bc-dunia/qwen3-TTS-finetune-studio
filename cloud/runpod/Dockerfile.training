@@ -18,7 +18,7 @@ RUN apt-get update && \
 # Python dependencies
 COPY cloud/runpod/requirements-training.txt /app/requirements.txt
 RUN python3 -m pip install --no-cache-dir -r requirements.txt && \
-    python3 -m pip install --no-cache-dir qwen-tts>=0.1.1 && \
+    python3 -m pip install --no-cache-dir qwen-tts==0.1.1 && \
     rm -rf /root/.cache/pip /tmp/*
 
 # Copy official training scripts
