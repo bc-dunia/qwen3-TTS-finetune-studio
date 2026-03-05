@@ -1,22 +1,13 @@
-# Training handler — ABSOLUTE MINIMUM dependencies
+# Training handler dependencies
 # Base image provides: torch, numpy, CUDA libs
-#
-# REMOVED to shrink image:
-# - runpod SDK (not imported by training_handler.py — saves fastapi/uvicorn/starlette ~200MB)
-# - faster-whisper/CTranslate2 (dataset already preprocessed)
-# - qwen-tts extras (gradio, onnxruntime, sox)
+# qwen-tts (installed separately in Dockerfile with full deps)
 
-# HuggingFace (required by training scripts)
-transformers>=4.40.0
-accelerate>=0.30.0
+# HuggingFace (pinned by qwen-tts, listed here as baseline)
 safetensors>=0.4.0
 huggingface-hub>=0.23.0
-einops
 
-# Audio (dataset.py mel_spectrogram)
+# Audio (soundfile used by training handler directly)
 soundfile>=0.12.0
-librosa
-torchaudio
 
 # R2 / S3 client
 boto3>=1.34.0

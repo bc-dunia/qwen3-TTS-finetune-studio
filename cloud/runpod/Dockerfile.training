@@ -1,15 +1,9 @@
-# RunPod Training Pod — Qwen3-TTS Fine-Tuning (SLIM)
+# RunPod Training Pod — Qwen3-TTS Fine-Tuning
 #
-# Optimized for fast image pull on RunPod community cloud.
-# Target compressed size: ~7-8GB (vs 14.5GB before).
+# Base image provides: torch, numpy, CUDA libs
+# qwen-tts installed with full deps, then heavy unused ones removed
 #
-# Key optimizations:
-# - qwen-tts installed --no-deps (skips gradio, torchaudio, onnxruntime, sox)
-# - No faster-whisper/CTranslate2 (dataset already has train_raw.jsonl)
-# - No librosa (audio already 24kHz)
-# - Tokenizer downloaded at runtime (not baked into image)
 #
-# Build (from project root):
 #   docker build -f cloud/runpod/Dockerfile.training -t qwen3-tts-training .
 
 FROM runpod/pytorch:1.0.3-cu1281-torch271-ubuntu2204
@@ -21,10 +15,12 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
-# Python dependencies — minimal set
+# Python dependencies
 COPY cloud/runpod/requirements-training.txt /app/requirements.txt
 RUN python3 -m pip install --no-cache-dir -r requirements.txt && \
-    python3 -m pip install --no-cache-dir --no-deps qwen-tts>=0.1.1
+    python3 -m pip install --no-cache-dir qwen-tts>=0.1.1 && \
+    python3 -m pip uninstall -y gradio gradio-client onnxruntime aiofiles ruff httpcore anyio starlette fastapi uvicorn || true && \
+    rm -rf /root/.cache/pip /tmp/*
 
 # Copy official training scripts
 COPY third_party/Qwen3-TTS/finetuning/ /app/finetuning/
