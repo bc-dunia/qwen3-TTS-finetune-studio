@@ -4,8 +4,7 @@
 # REMOVED to shrink image:
 # - runpod SDK (not imported by training_handler.py — saves fastapi/uvicorn/starlette ~200MB)
 # - faster-whisper/CTranslate2 (dataset already preprocessed)
-# - librosa (audio already 24kHz)
-# - qwen-tts extras (gradio, torchaudio, onnxruntime, sox)
+# - qwen-tts extras (gradio, onnxruntime, sox)
 
 # HuggingFace (required by training scripts)
 transformers>=4.40.0
@@ -16,6 +15,8 @@ einops
 
 # Audio (dataset.py mel_spectrogram)
 soundfile>=0.12.0
+librosa
+torchaudio
 
 # R2 / S3 client
 boto3>=1.34.0

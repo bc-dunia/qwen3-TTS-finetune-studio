@@ -1208,12 +1208,18 @@ def terminate_pod() -> None:
 def main() -> int:
     setup_logging()
     LOGGER.info("RunPod training handler started")
-    job_id = required_env(JOB_ID_ENV)
-    r2 = R2Storage()
-    status = StatusWriter(r2, job_id)
     log_buffer: LogBuffer | None = None
     upload_verified = False
     training_started = False
+    # --- Early init: R2 + status must be inside try/except so crashes are observable ---
+    try:
+        job_id = required_env(JOB_ID_ENV)
+        r2 = R2Storage()
+        status = StatusWriter(r2, job_id)
+        status.write({"status": "starting", "message": "Handler initializing..."})
+    except Exception as exc:
+        LOGGER.exception("Fatal: handler failed before status could be established: %s", exc)
+        return 1
     try:
         raw_cfg = r2.read_job_config(job_id)
         if raw_cfg is None:

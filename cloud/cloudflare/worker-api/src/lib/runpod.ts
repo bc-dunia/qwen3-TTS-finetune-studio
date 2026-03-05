@@ -76,7 +76,7 @@ export const createPod = async (
     env: envVars,
     cloudType: "ALL",
     gpuCount: 1,
-    containerDiskInGb: 50,
+    containerDiskInGb: 100,
     volumeInGb: 0,
   };
   if (gpuTypeId) {

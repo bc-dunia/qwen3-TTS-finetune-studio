@@ -25,13 +25,13 @@ def main() -> int:
         "boto3",
         "botocore",
         "einops",
+        "librosa",
+        "torchaudio",
     ]
 
-    # Optional: installed but may have missing transitive deps (--no-deps)
+    # Optional: nice-to-have but not strictly required for training
     optional_modules = [
-        "qwen_tts",  # installed --no-deps, top-level import needs librosa
         "runpod",
-        "librosa",
         "faster_whisper",
     ]
 
@@ -47,17 +47,24 @@ def main() -> int:
         except ImportError:
             print(f"INFO: Optional module not installed: {module}")
 
-    # Verify qwen_tts submodules used by training scripts work
-    qwen_submodules = [
-        "qwen_tts.core.models.configuration_qwen3_tts",
-        "qwen_tts.core.models.modeling_qwen3_tts",
+    # Verify qwen_tts and the specific submodules used by training scripts
+    # These MUST succeed — training will crash immediately without them.
+    qwen_required = [
+        ("qwen_tts", "top-level package"),
+        ("qwen_tts.core.models.configuration_qwen3_tts", "TTSConfig for dataset.py"),
+        ("qwen_tts.core.models.modeling_qwen3_tts", "mel_spectrogram for dataset.py"),
     ]
-    for submod in qwen_submodules:
+    for submod, reason in qwen_required:
         try:
             __import__(submod)
         except ImportError as e:
+            errors.append(
+                f"Missing qwen_tts module: {submod} ({e}) — needed for: {reason}"
+            )
+        except Exception as e:
             # May fail at build time due to missing CUDA — warn only
-            print(f"WARNING: {submod} import failed: {e}")
+            print(f"WARNING: {submod} import raised {type(e).__name__}: {e}")
+
     # System binaries
     for binary in ["ffmpeg", "python3"]:
         if not shutil.which(binary):
