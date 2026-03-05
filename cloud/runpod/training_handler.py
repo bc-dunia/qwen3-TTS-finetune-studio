@@ -42,9 +42,9 @@ WORKER_API_URL_ENV = "WORKER_API_URL"
 DATASET_DIR = Path("/tmp/dataset")
 OUTPUT_ROOT = Path("/tmp/output")
 APP_FINETUNE_DIR = Path("/app/finetuning")
-REPO_FINETUNE_DIR = (
-    Path(__file__).resolve().parents[2] / "third_party" / "Qwen3-TTS" / "finetuning"
-)
+_THIS_FILE = Path(__file__).resolve()
+_REPO_ROOT = _THIS_FILE.parents[2] if len(_THIS_FILE.parents) > 2 else _THIS_FILE.parent
+REPO_FINETUNE_DIR = _REPO_ROOT / "third_party" / "Qwen3-TTS" / "finetuning"
 
 
 @dataclass
@@ -697,6 +697,7 @@ def preprocess_raw_audio(
     dataset_dir: Path, output_jsonl: Path, status: StatusWriter
 ) -> None:
     import torch
+
     try:
         from faster_whisper import WhisperModel
     except ImportError:
@@ -1218,7 +1219,9 @@ def main() -> int:
         status = StatusWriter(r2, job_id)
         status.write({"status": "starting", "message": "Handler initializing..."})
     except Exception as exc:
-        LOGGER.exception("Fatal: handler failed before status could be established: %s", exc)
+        LOGGER.exception(
+            "Fatal: handler failed before status could be established: %s", exc
+        )
         return 1
     try:
         raw_cfg = r2.read_job_config(job_id)
