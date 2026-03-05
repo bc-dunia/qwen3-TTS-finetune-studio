@@ -178,7 +178,7 @@ app.post("/start", async (c) => {
     speaker_id: Number(cfg.speaker_id ?? 3000),
     mixed_precision: String(cfg.mixed_precision ?? "bf16"),
     torch_dtype: String(cfg.torch_dtype ?? "bfloat16"),
-    attn_implementation: String(cfg.attn_implementation ?? "flash_attention_2"),
+      attn_implementation: String(cfg.attn_implementation ?? "sdpa"),
     weight_decay: Number(cfg.weight_decay ?? 0.01),
     max_grad_norm: Number(cfg.max_grad_norm ?? 1.0),
     subtalker_loss_weight: Number(cfg.subtalker_loss_weight ?? 0.3),
@@ -223,6 +223,7 @@ app.post("/start", async (c) => {
       { key: "R2_SECRET_ACCESS_KEY", value: c.env.R2_SECRET_ACCESS_KEY },
       { key: "R2_BUCKET", value: "qwen-tts-studio" },
       { key: "RUNPOD_API_KEY", value: c.env.RUNPOD_API_KEY },
+      { key: "HF_HUB_ENABLE_HF_TRANSFER", value: "0" },
     ]);
   } catch (podError) {
     // Pod creation failed (e.g., GPU supply constraint) — mark job as failed
