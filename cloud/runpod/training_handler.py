@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from typing import TYPE_CHECKING
@@ -225,7 +225,7 @@ class StatusWriter:
 
     def write(self, payload: dict[str, Any]) -> None:
         data = dict(payload)
-        data["updated_at"] = datetime.now(UTC).isoformat()
+        data["updated_at"] = datetime.now(timezone.utc).isoformat()
         self.r2.write_job_status(self.job_id, data)
         LOGGER.info("Status update: %s", json.dumps(data, ensure_ascii=False))
 
