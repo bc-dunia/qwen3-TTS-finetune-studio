@@ -27,6 +27,8 @@ COPY third_party/Qwen3-TTS/finetuning/ /app/finetuning/
 # Copy handler code
 COPY cloud/runpod/r2_storage.py /app/r2_storage.py
 COPY cloud/runpod/training_handler.py /app/training_handler.py
+COPY cloud/runpod/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 # Smoke test — validate core imports
 COPY cloud/runpod/smoke_test.py /app/smoke_test.py
@@ -35,4 +37,4 @@ RUN python3 smoke_test.py
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 
-CMD ["python3", "-u", "training_handler.py"]
+CMD ["/app/entrypoint.sh"]
