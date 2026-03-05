@@ -670,11 +670,22 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
             return {"error": f"Unsupported model_id: {model_id}"}
 
         params, speed_hint = _decode_params(inp)
+        if model_id == "qwen3-tts-0.6b":
+            if inp.get("temperature") is None:
+                params["temperature"] = min(float(params.get("temperature", 0.7)), 0.45)
+            if inp.get("top_p") is None:
+                params["top_p"] = min(float(params.get("top_p", 0.5)), 0.35)
+            if inp.get("top_k") is None:
+                params["top_k"] = min(int(params.get("top_k", 50)), 40)
+            if inp.get("repetition_penalty") is None:
+                params["repetition_penalty"] = max(
+                    float(params.get("repetition_penalty", 1.2)), 1.25
+                )
         base_seed = _to_int(inp.get("seed"))
         seed_anchor = base_seed if base_seed is not None else int(time.time() * 1000)
         num_candidates = _to_int(inp.get("num_candidates"))
         if num_candidates is None:
-            num_candidates = 2 if model_id == "qwen3-tts-0.6b" else 1
+            num_candidates = 3 if model_id == "qwen3-tts-0.6b" else 1
         num_candidates = max(1, min(5, num_candidates))
 
         storage = _r2_storage_cls()()
@@ -766,7 +777,7 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                 if best_candidate is not None
                 else 0.0
             )
-            if best_score >= 0.8:
+            if best_score >= 0.9:
                 break
 
         if best_candidate is None:
@@ -778,6 +789,15 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         sr = best_candidate["sr"]
         gen_ms = best_candidate["gen_ms"]
         quality = best_candidate["quality"]
+        min_accept_score = 0.9 if model_id == "qwen3-tts-0.6b" else 0.82
+        if float(quality["overall_score"]) < min_accept_score:
+            return {
+                "error": (
+                    f"Generated audio below quality threshold: "
+                    f"overall_score={float(quality['overall_score']):.3f} "
+                    f"required={min_accept_score:.3f}"
+                )
+            }
 
         torch = _torch()
         duration_ms = int((len(audio) / max(sr, 1)) * 1000)

@@ -25,6 +25,16 @@ export function Voices() {
     loadVoices()
   }, [])
 
+  useEffect(() => {
+    const onApiKeyChanged = () => {
+      loadVoices()
+    }
+    window.addEventListener('xi-api-key-changed', onApiKeyChanged)
+    return () => {
+      window.removeEventListener('xi-api-key-changed', onApiKeyChanged)
+    }
+  }, [])
+
   return (
     <div className="space-y-6">
       {/* Header */}

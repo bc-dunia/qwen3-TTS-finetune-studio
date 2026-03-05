@@ -12,6 +12,16 @@ import {
 } from '../lib/api'
 import { AudioPlayer } from '../components/AudioPlayer'
 
+function normalizeVoiceSettings(value: Partial<VoiceSettings> | null | undefined): VoiceSettings {
+  const src = value ?? {}
+  return {
+    stability: typeof src.stability === 'number' ? src.stability : DEFAULT_VOICE_SETTINGS.stability,
+    similarity_boost: typeof src.similarity_boost === 'number' ? src.similarity_boost : DEFAULT_VOICE_SETTINGS.similarity_boost,
+    style: typeof src.style === 'number' ? src.style : DEFAULT_VOICE_SETTINGS.style,
+    speed: typeof src.speed === 'number' ? src.speed : DEFAULT_VOICE_SETTINGS.speed,
+  }
+}
+
 export function VoiceDetail() {
   const { voiceId = '' } = useParams()
   const navigate = useNavigate()
@@ -52,7 +62,7 @@ export function VoiceDetail() {
         const data = await fetchVoice(voiceId)
         if (!cancelled) {
           setVoice(data)
-          setSettings(data.settings ?? DEFAULT_VOICE_SETTINGS)
+          setSettings(normalizeVoiceSettings(data.settings))
         }
       } catch (err) {
         if (!cancelled) {
@@ -64,7 +74,14 @@ export function VoiceDetail() {
     }
 
     load()
-    return () => { cancelled = true }
+    const onApiKeyChanged = () => {
+      load()
+    }
+    window.addEventListener('xi-api-key-changed', onApiKeyChanged)
+    return () => {
+      cancelled = true
+      window.removeEventListener('xi-api-key-changed', onApiKeyChanged)
+    }
   }, [voiceId])
 
   async function handleGenerate() {

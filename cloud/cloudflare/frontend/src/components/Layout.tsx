@@ -28,6 +28,7 @@ export function Layout() {
   function saveApiKey(key: string) {
     setApiKey(key)
     localStorage.setItem('xi-api-key', key)
+    window.dispatchEvent(new Event('xi-api-key-changed'))
   }
 
   return (
