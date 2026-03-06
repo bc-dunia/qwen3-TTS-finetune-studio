@@ -33,9 +33,9 @@ export function Training() {
 
   // Form state
   const [selectedVoiceId, setSelectedVoiceId] = useState('')
-  const [batchSize, setBatchSize] = useState(2)
-  const [epochs, setEpochs] = useState(10)
-  const [learningRate, setLearningRate] = useState(0.00002)
+  const [batchSize, setBatchSize] = useState(4)
+  const [epochs, setEpochs] = useState(8)
+  const [learningRate, setLearningRate] = useState(0.00001)
   const [starting, setStarting] = useState(false)
   const [formError, setFormError] = useState('')
 
@@ -201,7 +201,7 @@ export function Training() {
 
           <div className="mb-4 rounded-lg border border-edge bg-surface px-3 py-2.5">
             <p className="text-subtle text-xs">
-              Upload training audio on the Voices page first, then start training here.
+              Upload a real training set on the Voices page first. The defaults here are conservative and tuned for voice similarity over aggressive overfitting.
             </p>
             <Link
               to="/voices"

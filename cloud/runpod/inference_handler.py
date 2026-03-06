@@ -1,6 +1,7 @@
 from __future__ import annotations
 import base64
 import gc
+import hashlib
 import importlib
 import importlib.util
 import io
@@ -8,6 +9,7 @@ import os
 import re
 import shutil
 import threading
+import tempfile
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
@@ -28,7 +30,13 @@ CACHE_IDENTITY: dict[str, str] = {}
 _MODEL_LOCK = threading.Lock()
 _MERGE_LOCKS: dict[str, threading.Lock] = {}
 _MERGE_LOCKS_LOCK = threading.Lock()
+_ASR_MODEL: Any | None = None
+_ASR_LOCK = threading.Lock()
+_EVAL_MODEL: Any | None = None
+_EVAL_MODEL_LOCK = threading.Lock()
 _SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9._-]{1,128}$")
+_NORMALIZED_TEXT_RE = re.compile(r"[^0-9a-zA-Z가-힣]+")
+REFERENCE_CACHE_ROOT = Path("/tmp/reference_audio_cache")
 
 
 def _log(msg: str) -> None:
@@ -153,6 +161,240 @@ def _adaptive_max_tokens(text: str) -> int:
     return max(floor, min(ceil, tokens))
 
 
+def _normalize_text(text: str) -> str:
+    return _NORMALIZED_TEXT_RE.sub("", (text or "").strip().lower())
+
+
+def _levenshtein_ratio(a: str, b: str) -> float:
+    if a == b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    n = len(b)
+    prev = list(range(n + 1))
+    for i, ca in enumerate(a, start=1):
+        curr = [i] + [0] * n
+        for j, cb in enumerate(b, start=1):
+            cost = 0 if ca == cb else 1
+            curr[j] = min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
+        prev = curr
+    return 1.0 - (prev[n] / max(len(a), len(b), 1))
+
+
+def _asr_similarity(target: str, pred: str) -> float:
+    return float(_levenshtein_ratio(_normalize_text(target), _normalize_text(pred)))
+
+
+def _load_asr_model() -> Any:
+    global _ASR_MODEL
+    with _ASR_LOCK:
+        if _ASR_MODEL is not None:
+            return _ASR_MODEL
+        WhisperModel = importlib.import_module("faster_whisper").WhisperModel
+        device = "cuda" if _torch().cuda.is_available() else "cpu"
+        compute_type = "float16" if device == "cuda" else "int8"
+        _ASR_MODEL = WhisperModel("base", device=device, compute_type=compute_type)
+        return _ASR_MODEL
+
+
+def _load_eval_model() -> Any:
+    global _EVAL_MODEL
+    with _EVAL_MODEL_LOCK:
+        if _EVAL_MODEL is not None:
+            return _EVAL_MODEL
+        Qwen3TTSModel = importlib.import_module("qwen_tts").Qwen3TTSModel
+        device = _resolve_device()
+        dtype = _resolve_dtype(device)
+        attn = "sdpa" if device.startswith("cuda") else None
+        opts = {"device_map": device, "attn_implementation": attn}
+        if dtype is not None:
+            opts["torch_dtype"] = dtype
+        opts = {k: v for k, v in opts.items() if v is not None}
+        model = Qwen3TTSModel.from_pretrained(BASE_MODEL_PATHS["qwen3-tts-0.6b"], **opts)
+        try:
+            model.model.eval()
+        except Exception:
+            pass
+        _EVAL_MODEL = model
+        return _EVAL_MODEL
+
+
+def _transcribe_for_review(
+    audio: np.ndarray,
+    sr: int,
+    language: str | None,
+) -> tuple[str, float | None]:
+    sf = importlib.import_module("soundfile")
+    audio_1d = np.asarray(audio, dtype=np.float32).reshape(-1)
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        sf.write(str(tmp_path), audio_1d, sr)
+        model = _load_asr_model()
+        lang = (language or "").strip()
+        lang = None if not lang or lang.lower() == "auto" else lang
+        segments, info = model.transcribe(
+            str(tmp_path),
+            language=lang,
+            beam_size=3,
+            vad_filter=True,
+            condition_on_previous_text=False,
+        )
+        text = "".join(str(seg.text or "") for seg in segments).strip()
+        try:
+            prob = float(getattr(info, "language_probability", 0.0))
+        except Exception:
+            prob = None
+        return text, prob
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _unit(vec: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(vec))
+    if norm <= 1e-12:
+        return vec.copy()
+    return vec / norm
+
+
+def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+    na = float(np.linalg.norm(a))
+    nb = float(np.linalg.norm(b))
+    if na <= 1e-12 or nb <= 1e-12:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb + 1e-12))
+
+
+def _resample_audio(audio: np.ndarray, sr: int, target_sr: int = 24000) -> np.ndarray:
+    arr = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if int(sr) == int(target_sr):
+        return arr
+    librosa = importlib.import_module("librosa")
+    return np.asarray(
+        librosa.resample(arr, orig_sr=int(sr), target_sr=int(target_sr)),
+        dtype=np.float32,
+    )
+
+
+def _speaker_embedding(audio: np.ndarray, sr: int) -> np.ndarray:
+    arr = _resample_audio(audio, sr, 24000)
+    model = _load_eval_model()
+    emb = model.model.extract_speaker_embedding(arr.astype(np.float32), 24000)
+    if hasattr(emb, "detach"):
+        emb = emb.detach()
+    if hasattr(emb, "cpu"):
+        emb = emb.cpu()
+    if hasattr(emb, "numpy"):
+        emb = emb.numpy()
+    return _unit(np.asarray(emb, dtype=np.float32).reshape(-1))
+
+
+def _pitch_stats(audio: np.ndarray, sr: int) -> tuple[float, float]:
+    librosa = importlib.import_module("librosa")
+    arr = _resample_audio(audio, sr, 24000)
+    try:
+        f0, _, _ = librosa.pyin(
+            arr.astype(np.float32),
+            fmin=float(librosa.note_to_hz("C2")),
+            fmax=float(librosa.note_to_hz("C6")),
+            sr=24000,
+            frame_length=1024,
+            hop_length=256,
+        )
+        voiced = f0[np.isfinite(f0)]
+        if len(voiced) == 0:
+            return 0.0, 0.0
+        return float(np.median(voiced)), float(np.std(voiced))
+    except Exception:
+        return 0.0, 0.0
+
+
+def _ratio_score(a: float, b: float, *, tolerance: float = 1.0) -> float:
+    x = max(float(a), 1e-6)
+    y = max(float(b), 1e-6)
+    diff = abs(np.log(x / y))
+    return float(np.exp(-diff * tolerance))
+
+
+def _cached_reference_audio(storage: Any, r2_key: str) -> Path:
+    key = hashlib.sha1(r2_key.encode("utf-8")).hexdigest()
+    local = REFERENCE_CACHE_ROOT / f"{key}{Path(r2_key).suffix or '.wav'}"
+    if local.exists():
+        return local
+    local.parent.mkdir(parents=True, exist_ok=True)
+    storage.download_file(r2_key, local)
+    return local
+
+
+def _reference_similarity_metrics(
+    *,
+    storage: Any | None,
+    audio: np.ndarray,
+    sr: int,
+    text: str,
+    review_cfg: dict[str, Any],
+) -> dict[str, float | str]:
+    if storage is None:
+        return {}
+
+    reference_key = str(review_cfg.get("reference_audio_key", "") or "").strip()
+    if not reference_key:
+        return {}
+
+    try:
+        librosa = importlib.import_module("librosa")
+        ref_path = _cached_reference_audio(storage, reference_key)
+        ref_audio, ref_sr = librosa.load(str(ref_path), sr=None, mono=True)
+        ref_audio_24 = _resample_audio(np.asarray(ref_audio, dtype=np.float32), int(ref_sr or 24000), 24000)
+        gen_audio_24 = _resample_audio(audio, sr, 24000)
+
+        result: dict[str, float | str] = {}
+
+        if bool(review_cfg.get("enable_speaker", True)):
+            ref_emb = _speaker_embedding(ref_audio_24, 24000)
+            gen_emb = _speaker_embedding(gen_audio_24, 24000)
+            speaker_cos = _cosine(gen_emb, ref_emb)
+            result["speaker_cosine"] = float(speaker_cos)
+            result["speaker_score"] = float(_clamp((speaker_cos - 0.85) / 0.15, 0.0, 1.0))
+
+        if bool(review_cfg.get("enable_style", True)):
+            ref_pitch_median, ref_pitch_std = _pitch_stats(ref_audio_24, 24000)
+            gen_pitch_median, gen_pitch_std = _pitch_stats(gen_audio_24, 24000)
+            result["reference_pitch_median"] = float(ref_pitch_median)
+            result["reference_pitch_std"] = float(ref_pitch_std)
+            result["generated_pitch_median"] = float(gen_pitch_median)
+            result["generated_pitch_std"] = float(gen_pitch_std)
+            if ref_pitch_median > 0.0 and gen_pitch_median > 0.0:
+                tone_score = (
+                    (_ratio_score(gen_pitch_median, ref_pitch_median, tolerance=1.3) * 0.7)
+                    + (_ratio_score(max(gen_pitch_std, 1.0), max(ref_pitch_std, 1.0), tolerance=1.1) * 0.3)
+                )
+                result["tone_score"] = float(_clamp(tone_score, 0.0, 1.0))
+
+        reference_text = str(review_cfg.get("reference_text", "") or "").strip()
+        if bool(review_cfg.get("enable_speed", True)) and reference_text:
+            ref_duration_sec = float(len(ref_audio_24) / 24000.0)
+            gen_duration_sec = float(len(gen_audio_24) / 24000.0)
+            ref_chars = len(_normalize_text(reference_text))
+            gen_chars = len(_normalize_text(text))
+            if ref_chars > 0 and gen_chars > 0 and ref_duration_sec > 0 and gen_duration_sec > 0:
+                ref_cps = ref_chars / ref_duration_sec
+                gen_cps = gen_chars / gen_duration_sec
+                result["reference_chars_per_sec"] = float(ref_cps)
+                result["generated_chars_per_sec"] = float(gen_cps)
+                result["speed_score"] = float(
+                    _clamp(_ratio_score(gen_cps, ref_cps, tolerance=1.6), 0.0, 1.0)
+                )
+
+        return result
+    except Exception as exc:
+        _log(f"reference_review_failed key={reference_key} error={exc}")
+        return {}
+
+
 def _model_supports_instruct(model: Any) -> bool:
     """0.6B models do not support instruct in custom_voice mode."""
     try:
@@ -165,15 +407,23 @@ def _model_supports_instruct(model: Any) -> bool:
 
 def _decode_params(job_input: dict[str, Any]) -> tuple[dict[str, Any], float | None]:
     vs = job_input.get("voice_settings") or {}
-    stability = _clamp(_to_float(vs.get("stability")) or 0.5, 0.0, 1.0)
-    similarity = _clamp(_to_float(vs.get("similarity_boost")) or 0.75, 0.0, 1.0)
-    style = _clamp(_to_float(vs.get("style")) or 0.0, 0.0, 1.0)
+    stability = _clamp(_to_float(vs.get("stability")) or 0.85, 0.0, 1.0)
+    similarity = _clamp(_to_float(vs.get("similarity_boost")) or 0.85, 0.0, 1.0)
+    style = _clamp(_to_float(vs.get("style")) or 0.05, 0.0, 1.0)
     speed = _to_float(vs.get("speed"))
+    variability = 1.0 - stability
     p: dict[str, Any] = {
-        "temperature": 1.0 - (stability * 0.6),
-        "top_k": 50,
-        "top_p": 0.5 + (style * 0.45),
-        "repetition_penalty": 1.0 + (similarity * 0.5),
+        "temperature": _clamp(0.38 + (variability * 0.22) + (style * 0.08), 0.32, 0.75),
+        "top_k": int(round(_clamp(18 + (variability * 18) + (style * 10), 12, 50))),
+        "top_p": _clamp(0.86 + (style * 0.08) + (variability * 0.03), 0.82, 0.96),
+        "repetition_penalty": _clamp(1.01 + (similarity * 0.06), 1.0, 1.10),
+        "subtalker_temperature": _clamp(
+            0.50 + (style * 0.18) + (variability * 0.10), 0.45, 0.85
+        ),
+        "subtalker_top_k": int(round(_clamp(18 + (style * 12) + (variability * 8), 12, 40))),
+        "subtalker_top_p": _clamp(0.86 + (style * 0.08), 0.82, 0.96),
+        "do_sample": True,
+        "subtalker_dosample": True,
         "max_new_tokens": _adaptive_max_tokens(job_input.get("text", "")),
     }
     t = _to_float(job_input.get("temperature"))
@@ -181,6 +431,9 @@ def _decode_params(job_input: dict[str, Any]) -> tuple[dict[str, Any], float | N
     pp = _to_float(job_input.get("top_p"))
     rp = _to_float(job_input.get("repetition_penalty"))
     mx = _to_int(job_input.get("max_new_tokens"))
+    st = _to_float(job_input.get("subtalker_temperature"))
+    sk = _to_int(job_input.get("subtalker_top_k"))
+    sp = _to_float(job_input.get("subtalker_top_p"))
     if t is not None:
         p["temperature"] = t
     if k is not None:
@@ -191,6 +444,12 @@ def _decode_params(job_input: dict[str, Any]) -> tuple[dict[str, Any], float | N
         p["repetition_penalty"] = rp
     if mx is not None:
         p["max_new_tokens"] = mx
+    if st is not None:
+        p["subtalker_temperature"] = st
+    if sk is not None:
+        p["subtalker_top_k"] = sk
+    if sp is not None:
+        p["subtalker_top_p"] = sp
     return p, speed
 
 
@@ -467,6 +726,11 @@ def _generate_audio(
         "top_k": params["top_k"],
         "top_p": params["top_p"],
         "repetition_penalty": params["repetition_penalty"],
+        "subtalker_temperature": params.get("subtalker_temperature"),
+        "subtalker_top_k": params.get("subtalker_top_k"),
+        "subtalker_top_p": params.get("subtalker_top_p"),
+        "do_sample": params.get("do_sample", True),
+        "subtalker_dosample": params.get("subtalker_dosample", True),
         "max_new_tokens": params["max_new_tokens"],
     }
     try:
@@ -484,6 +748,11 @@ def _generate_audio(
             "top_k",
             "top_p",
             "repetition_penalty",
+            "subtalker_temperature",
+            "subtalker_top_k",
+            "subtalker_top_p",
+            "do_sample",
+            "subtalker_dosample",
             "max_new_tokens",
         ]
         fallback = {k: gen_kwargs[k] for k in fallback_keys if k in gen_kwargs}
@@ -514,9 +783,17 @@ def _generate_audio(
 
 
 def _verify_quality(
-    audio: np.ndarray, sr: int, text: str, params: dict[str, Any]
-) -> dict[str, float]:
+    audio: np.ndarray,
+    sr: int,
+    text: str,
+    params: dict[str, Any],
+    *,
+    language: str | None = None,
+    review: dict[str, Any] | None = None,
+    storage: Any | None = None,
+) -> dict[str, Any]:
     del params
+    review_cfg = review or {}
     audio_flat = np.asarray(audio, dtype=np.float32).reshape(-1)
     finite_mask = np.isfinite(audio_flat)
     finite_audio = audio_flat[finite_mask]
@@ -595,18 +872,64 @@ def _verify_quality(
         finite_score * 0.5 + non_empty_score * 0.2 + min_duration_score * 0.3
     )
 
-    overall_score = (
-        _clamp(duration_score, 0.0, 1.0) * 0.3
-        + _clamp(health_score, 0.0, 1.0) * 0.5
-        + _clamp(stability_score, 0.0, 1.0) * 0.2
+    asr_text = ""
+    asr_similarity = -1.0
+    asr_score = 0.0
+    if bool(review_cfg.get("enable_asr")) and text.strip():
+        try:
+            asr_text, _ = _transcribe_for_review(audio, sr, language)
+            asr_similarity = _asr_similarity(text, asr_text)
+            asr_score = float(_clamp(asr_similarity, 0.0, 1.0))
+        except Exception as exc:
+            _log(f"asr_review_failed error={exc}")
+
+    reference_metrics = _reference_similarity_metrics(
+        storage=storage,
+        audio=audio,
+        sr=sr,
+        text=text,
+        review_cfg=review_cfg,
     )
 
-    return {
+    if bool(review_cfg.get("enable_asr")) or reference_metrics:
+        weighted_parts: list[tuple[float, float]] = [
+            (_clamp(duration_score, 0.0, 1.0), 0.22),
+            (_clamp(health_score, 0.0, 1.0), 0.33),
+            (_clamp(stability_score, 0.0, 1.0), 0.15),
+        ]
+        if bool(review_cfg.get("enable_asr")):
+            weighted_parts.append((_clamp(asr_score, 0.0, 1.0), 0.15))
+        speaker_score = reference_metrics.get("speaker_score")
+        tone_score = reference_metrics.get("tone_score")
+        speed_score = reference_metrics.get("speed_score")
+        if isinstance(speaker_score, (int, float)):
+            weighted_parts.append((_clamp(float(speaker_score), 0.0, 1.0), 0.10))
+        if isinstance(tone_score, (int, float)):
+            weighted_parts.append((_clamp(float(tone_score), 0.0, 1.0), 0.03))
+        if isinstance(speed_score, (int, float)):
+            weighted_parts.append((_clamp(float(speed_score), 0.0, 1.0), 0.02))
+        total_weight = sum(weight for _, weight in weighted_parts) or 1.0
+        overall_score = sum(score * weight for score, weight in weighted_parts) / total_weight
+    else:
+        overall_score = (
+            _clamp(duration_score, 0.0, 1.0) * 0.3
+            + _clamp(health_score, 0.0, 1.0) * 0.5
+            + _clamp(stability_score, 0.0, 1.0) * 0.2
+        )
+
+    result = {
         "overall_score": float(_clamp(overall_score, 0.0, 1.0)),
         "duration_score": float(_clamp(duration_score, 0.0, 1.0)),
         "health_score": float(_clamp(health_score, 0.0, 1.0)),
         "stability_score": float(_clamp(stability_score, 0.0, 1.0)),
     }
+    if bool(review_cfg.get("enable_asr")):
+        result["asr_score"] = float(_clamp(asr_score, 0.0, 1.0))
+        result["asr_similarity"] = float(max(asr_similarity, 0.0))
+        result["asr_text"] = asr_text
+    for key, value in reference_metrics.items():
+        result[key] = value
+    return result
 
 
 def _encode_wav(audio: np.ndarray, sr: int) -> str:
@@ -674,19 +997,24 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
             if inp.get("temperature") is None:
                 params["temperature"] = min(float(params.get("temperature", 0.7)), 0.45)
             if inp.get("top_p") is None:
-                params["top_p"] = min(float(params.get("top_p", 0.5)), 0.35)
+                params["top_p"] = min(float(params.get("top_p", 0.88)), 0.88)
             if inp.get("top_k") is None:
-                params["top_k"] = min(int(params.get("top_k", 50)), 40)
+                params["top_k"] = min(int(params.get("top_k", 24)), 30)
             if inp.get("repetition_penalty") is None:
                 params["repetition_penalty"] = max(
-                    float(params.get("repetition_penalty", 1.2)), 1.25
+                    float(params.get("repetition_penalty", 1.05)), 1.04
+                )
+            if inp.get("subtalker_temperature") is None:
+                params["subtalker_temperature"] = min(
+                    float(params.get("subtalker_temperature", 0.55)), 0.7
                 )
         base_seed = _to_int(inp.get("seed"))
         seed_anchor = base_seed if base_seed is not None else int(time.time() * 1000)
         num_candidates = _to_int(inp.get("num_candidates"))
         if num_candidates is None:
-            num_candidates = 3 if model_id == "qwen3-tts-0.6b" else 1
+            num_candidates = 3 if model_id == "qwen3-tts-0.6b" else 2
         num_candidates = max(1, min(5, num_candidates))
+        review_cfg = inp.get("quality_review") or {}
 
         storage = _r2_storage_cls()()
         try:
@@ -718,8 +1046,13 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                     0.1, float(round_params.get("temperature", 1.0)) * 0.8
                 )
                 round_params["top_p"] = max(
-                    0.2, float(round_params.get("top_p", 1.0)) * 0.9
+                    0.2, float(round_params.get("top_p", 1.0)) * 0.94
                 )
+                if "subtalker_temperature" in round_params:
+                    round_params["subtalker_temperature"] = max(
+                        0.35,
+                        float(round_params.get("subtalker_temperature", 0.6)) * 0.9,
+                    )
                 retries = round_idx
                 _log(
                     f"quality_retry round={round_idx + 1} "
@@ -748,7 +1081,15 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                     )
                     continue
 
-                quality = _verify_quality(audio, sr, text, round_params)
+                quality = _verify_quality(
+                    audio,
+                    sr,
+                    text,
+                    round_params,
+                    language=inp.get("language", "auto"),
+                    review=review_cfg if isinstance(review_cfg, dict) else None,
+                    storage=storage,
+                )
                 candidate_score = float(quality["overall_score"])
                 candidate_scores.append(candidate_score)
                 candidate = {
@@ -825,6 +1166,25 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                 "retries": retries,
             },
         }
+        if "asr_score" in quality:
+            out["quality"]["asr_score"] = float(quality["asr_score"])
+            out["quality"]["asr_similarity"] = float(quality.get("asr_similarity", 0.0))
+            out["quality"]["asr_text"] = str(quality.get("asr_text", ""))
+        for key in [
+            "speaker_cosine",
+            "speaker_score",
+            "tone_score",
+            "speed_score",
+            "reference_pitch_median",
+            "reference_pitch_std",
+            "generated_pitch_median",
+            "generated_pitch_std",
+            "reference_chars_per_sec",
+            "generated_chars_per_sec",
+        ]:
+            if key in quality:
+                raw_value = quality[key]
+                out["quality"][key] = float(raw_value) if isinstance(raw_value, (int, float)) else raw_value
         if speed_hint is not None:
             out["speed_hint"] = speed_hint
             out["speed_hint_note"] = (

@@ -18,11 +18,56 @@ const getContentTypeForFormat = (outputFormat: string): string =>
 
 const MAX_TORCH_SEED = 0xFFFFFFFF;
 const DEFAULT_INFERENCE_SEED = 123456;
+const LANGUAGE_ALIASES: Record<string, string> = {
+  auto: "auto",
+  zh: "chinese",
+  "zh-cn": "chinese",
+  "zh-tw": "chinese",
+  chinese: "chinese",
+  en: "english",
+  "en-us": "english",
+  "en-gb": "english",
+  english: "english",
+  fr: "french",
+  "fr-fr": "french",
+  french: "french",
+  de: "german",
+  "de-de": "german",
+  german: "german",
+  it: "italian",
+  "it-it": "italian",
+  italian: "italian",
+  ja: "japanese",
+  "ja-jp": "japanese",
+  japanese: "japanese",
+  ko: "korean",
+  "ko-kr": "korean",
+  korean: "korean",
+  pt: "portuguese",
+  "pt-br": "portuguese",
+  "pt-pt": "portuguese",
+  portuguese: "portuguese",
+  ru: "russian",
+  "ru-ru": "russian",
+  russian: "russian",
+  es: "spanish",
+  "es-es": "spanish",
+  "es-mx": "spanish",
+  spanish: "spanish",
+};
 
 const normalizeSeed = (seed: number | undefined): number => {
   const raw = Number.isFinite(seed) ? Math.trunc(seed as number) : DEFAULT_INFERENCE_SEED;
   const bounded = ((raw % MAX_TORCH_SEED) + MAX_TORCH_SEED) % MAX_TORCH_SEED;
   return bounded === 0 ? 1 : bounded;
+};
+
+const normalizeLanguageCode = (languageCode: string | undefined): string => {
+  if (!languageCode || !languageCode.trim()) {
+    return "auto";
+  }
+  const normalized = languageCode.trim().toLowerCase().replace(/_/g, "-");
+  return LANGUAGE_ALIASES[normalized] ?? normalized;
 };
 
 const decodeBase64 = (value: string): Uint8Array => {
@@ -43,16 +88,26 @@ const isLowQualityOutput = (quality: unknown): { low: boolean; reason?: string }
   const duration = Number(q.duration_score ?? NaN);
   const health = Number(q.health_score ?? NaN);
 
-  if (Number.isFinite(overall) && overall < 0.82) {
+  if (Number.isFinite(overall) && overall < 0.75) {
     return { low: true, reason: `Low overall quality score (${overall.toFixed(2)})` };
   }
-  if (Number.isFinite(duration) && duration < 0.45) {
+  if (Number.isFinite(duration) && duration < 0.35) {
     return { low: true, reason: `Duration mismatch detected (duration_score=${duration.toFixed(2)})` };
   }
-  if (Number.isFinite(health) && health < 0.72) {
+  if (Number.isFinite(health) && health < 0.6) {
     return { low: true, reason: `Audio health score too low (${health.toFixed(2)})` };
   }
   return { low: false };
+};
+
+const isQualityThresholdError = (message: string): boolean => {
+  const m = message.toLowerCase();
+  return (
+    m.includes("quality threshold") ||
+    m.includes("quality gate") ||
+    m.includes("below quality") ||
+    m.includes("overall_score")
+  );
 };
 
 const buildInputPayload = (
@@ -68,7 +123,7 @@ const buildInputPayload = (
   model_id: modelId,
   voice_settings: body.voice_settings ?? voice.settings,
   seed,
-  language: body.language_code ?? "auto",
+  language: normalizeLanguageCode(body.language_code),
   checkpoint_info: voice.checkpoint_r2_prefix
     ? {
         r2_prefix: voice.checkpoint_r2_prefix,
@@ -125,7 +180,8 @@ const runTtsRequest = async (c: Context<AppContext>): Promise<Response> => {
   }
 
   if (typeof runpodResponse.error === "string" && runpodResponse.error) {
-    return c.json({ detail: { message: runpodResponse.error } }, 502);
+    const statusCode = isQualityThresholdError(runpodResponse.error) ? 422 : 502;
+    return c.json({ detail: { message: runpodResponse.error } }, statusCode);
   }
 
   const output = (runpodResponse.output ?? {}) as {
@@ -242,7 +298,9 @@ app.get("/jobs/:job_id", async (c) => {
     };
 
     if (status === "FAILED") {
-      return c.json({ status, error: output.error ?? runpodResponse.error ?? "Generation failed" }, 502);
+      const message = String(output.error ?? runpodResponse.error ?? "Generation failed");
+      const statusCode = isQualityThresholdError(message) ? 422 : 502;
+      return c.json({ status, error: message }, statusCode);
     }
 
     if (status !== "COMPLETED") {

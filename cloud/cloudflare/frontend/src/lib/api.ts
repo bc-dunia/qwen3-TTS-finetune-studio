@@ -174,14 +174,20 @@ export async function fetchVoice(voiceId: string): Promise<Voice> {
 export async function createVoice(
   name: string,
   description: string,
-  audioFile: File,
-  modelSize: VoiceModelSize = '1.7B',
+  audioFiles: File[],
+  modelSize: VoiceModelSize = '0.6B',
 ): Promise<{ voice_id: string }> {
+  if (audioFiles.length === 0) {
+    throw new ApiError('At least one training audio file is required', 400)
+  }
+
   const formData = new FormData()
   formData.append('name', name)
   formData.append('description', description)
   formData.append('model_size', modelSize)
-  formData.append('files', audioFile)
+  for (const audioFile of audioFiles) {
+    formData.append('files', audioFile)
+  }
 
   const url = `${API_URL}/v1/voices/add`
   const response = await fetch(url, {
@@ -339,8 +345,8 @@ export function formatDuration(seconds: number): string {
 }
 
 export const DEFAULT_VOICE_SETTINGS: VoiceSettings = {
-  stability: 0.5,
-  similarity_boost: 0.75,
-  style: 0.0,
+  stability: 0.85,
+  similarity_boost: 0.85,
+  style: 0.05,
   speed: 1.0,
 }

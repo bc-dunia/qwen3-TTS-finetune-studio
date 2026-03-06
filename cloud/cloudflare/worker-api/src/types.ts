@@ -4,6 +4,9 @@ export interface Env {
   RUNPOD_API_KEY: string;
   RUNPOD_ENDPOINT_ID: string;
   RUNPOD_TRAINING_TEMPLATE_ID: string;
+  RUNPOD_TRAINING_IMAGE_NAME?: string;
+  RUNPOD_TRAINING_DOCKER_ARGS?: string;
+  RUNPOD_TRAINING_VOLUME_MOUNT_PATH?: string;
   API_KEY: string;
   R2_ACCESS_KEY_ID: string;
   R2_SECRET_ACCESS_KEY: string;
@@ -140,6 +143,7 @@ export interface CreateDatasetRequest {
   dataset_name: string;
   items: DatasetItem[];
   ref_audio_r2_key: string;
+  ref_text?: string;
 }
 
 export interface DatasetInfo {

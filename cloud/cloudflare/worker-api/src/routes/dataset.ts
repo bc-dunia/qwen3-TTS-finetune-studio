@@ -117,16 +117,34 @@ app.post("/:voice_id", async (c) => {
     httpMetadata: { contentType: "application/jsonl" },
   });
 
+  const refText = typeof body.ref_text === "string" ? body.ref_text.trim() : "";
+  if (refText) {
+    await c.env.R2.put(
+      `${datasetPrefix}/reference_profile.json`,
+      JSON.stringify(
+        {
+          reference_audio_key: `${datasetPrefix}/ref_audio.wav`,
+          reference_text: refText,
+        },
+        null,
+        2,
+      ),
+      {
+        httpMetadata: { contentType: "application/json" },
+      },
+    );
+  }
+
   // Update voice with ref_audio_r2_key
   await updateVoice(c.env.DB, voiceId, {
-    ref_audio_r2_key: body.ref_audio_r2_key,
+    ref_audio_r2_key: `${datasetPrefix}/ref_audio.wav`,
   });
 
   return c.json({
     dataset_name: body.dataset_name,
     dataset_r2_prefix: datasetPrefix,
     items_count: body.items.length,
-    ref_audio_r2_key: body.ref_audio_r2_key,
+    ref_audio_r2_key: `${datasetPrefix}/ref_audio.wav`,
   });
 });
 

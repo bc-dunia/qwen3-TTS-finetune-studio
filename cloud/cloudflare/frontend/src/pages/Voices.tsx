@@ -135,7 +135,7 @@ function CreateVoiceModal({
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
   const [audioFiles, setAudioFiles] = useState<File[]>([])
-  const [modelSize, setModelSize] = useState<VoiceModelSize>('1.7B')
+  const [modelSize, setModelSize] = useState<VoiceModelSize>('0.6B')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -149,7 +149,7 @@ function CreateVoiceModal({
     setError('')
 
     try {
-      await createVoice(name.trim(), description.trim(), audioFiles[0], modelSize)
+      await createVoice(name.trim(), description.trim(), audioFiles, modelSize)
       onCreated()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create voice')
@@ -234,16 +234,20 @@ function CreateVoiceModal({
               onChange={(e) => setModelSize(e.target.value as VoiceModelSize)}
               className="w-full bg-raised border border-edge rounded-lg px-3 py-2 text-sm text-primary focus:border-accent transition-colors"
             >
-              <option value="1.7B">Qwen3-TTS 1.7B (higher capacity)</option>
-              <option value="0.6B">Qwen3-TTS 0.6B (faster/cheaper)</option>
+              <option value="0.6B">Qwen3-TTS 0.6B (recommended for cloud training/serving)</option>
+              <option value="1.7B">Qwen3-TTS 1.7B (higher capacity, slower/more expensive)</option>
             </select>
           </div>
 
           {/* Audio Upload */}
           <div>
             <label className="text-subtle text-xs font-medium mb-1.5 block">
-              Reference Audio <span className="text-error">*</span>
+              Training Audio Files <span className="text-error">*</span>
             </label>
+            <div className="mb-2 rounded-lg border border-edge bg-raised px-3 py-2 text-[11px] leading-relaxed text-subtle">
+              Upload multiple clips from the same speaker.
+              Best results: 24kHz mono WAV, 3-15s per clip, clean speech only, at least 10 minutes total.
+            </div>
             <div
               className={`
                 border-2 border-dashed rounded-lg p-6 text-center cursor-pointer transition-colors
@@ -297,7 +301,7 @@ function CreateVoiceModal({
                     <line x1="12" y1="3" x2="12" y2="15" />
                   </svg>
                   <div className="text-subtle text-sm">Drop audio files or click to browse</div>
-                  <div className="text-muted text-xs mt-1">WAV format recommended — multiple files supported</div>
+                  <div className="text-muted text-xs mt-1">WAV only. Upload the full training set, not just one reference clip.</div>
                 </div>
               )}
             </div>

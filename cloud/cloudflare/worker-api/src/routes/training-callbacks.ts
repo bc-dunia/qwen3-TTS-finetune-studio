@@ -128,11 +128,13 @@ app.post("/:job_id/report", async (c) => {
   if (body.status === "completed" && Array.isArray(body.checkpoints) && body.checkpoints.length > 0) {
     const lastCheckpoint = body.checkpoints[body.checkpoints.length - 1];
     if (typeof lastCheckpoint.epoch === "number" && typeof lastCheckpoint.r2_prefix === "string") {
-      await updateVoice(c.env.DB, auth.job.voice_id, {
-        status: "ready",
-        checkpoint_r2_prefix: lastCheckpoint.r2_prefix,
-        run_name: parseRunNameFromCheckpointPrefix(lastCheckpoint.r2_prefix),
-        epoch: lastCheckpoint.epoch,
+      await updateTrainingJob(c.env.DB, auth.job.job_id, {
+        summary: {
+          ...summary,
+          callback_last_checkpoint_epoch: lastCheckpoint.epoch,
+          callback_last_checkpoint_prefix: lastCheckpoint.r2_prefix,
+          callback_reported_completed_at: now,
+        },
       });
     }
   }

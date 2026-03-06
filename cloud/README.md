@@ -317,7 +317,12 @@ cloud/
 
 ### Audio quality issues
 - Ensure training data is 24kHz mono WAV
-- Try different voice_settings (lower stability = more expressive)
+- Upload the full training set, not just one reference clip
+- Prefer **Qwen3-TTS 0.6B** for cloud fine-tuning and serving unless you have a strong reason to use 1.7B
+- Use 3-15 second clean clips from one speaker, ideally 10+ minutes total
+- Keep one stable reference clip and reference transcript when building curated datasets
+- The cloud pipeline now validates checkpoints using ASR similarity plus reference-based speaker/tone/speed similarity when reference metadata is available
+- Use conservative voice settings first; raise style only after the similarity baseline is stable
 - Use the Quality tab in the local Gradio UI for pre-training checks
 
 ### TypeScript errors in Worker

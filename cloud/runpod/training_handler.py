@@ -35,6 +35,7 @@ TRAINING_PROGRESS_RE = re.compile(
 )
 CHECKPOINT_DIR_RE = re.compile(r"checkpoint-epoch-(\d+)$")
 SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9._-]{1,128}$")
+NORMALIZED_TEXT_RE = re.compile(r"[^0-9a-zA-Z가-힣]+")
 
 JOB_ID_ENV = "JOB_ID"
 JOB_TOKEN_ENV = "JOB_TOKEN"
@@ -45,6 +46,18 @@ APP_FINETUNE_DIR = Path("/app/finetuning")
 _THIS_FILE = Path(__file__).resolve()
 _REPO_ROOT = _THIS_FILE.parents[2] if len(_THIS_FILE.parents) > 2 else _THIS_FILE.parent
 REPO_FINETUNE_DIR = _REPO_ROOT / "third_party" / "Qwen3-TTS" / "finetuning"
+
+TARGET_SAMPLE_RATE = 24000
+MIN_SEGMENT_SEC = 3.0
+MAX_SEGMENT_SEC = 15.0
+IDEAL_REF_MIN_SEC = 4.0
+IDEAL_REF_MAX_SEC = 8.0
+MIN_ACCEPTED_SEGMENTS = 25
+MIN_ACCEPTED_AUDIO_MIN = 6.0
+MIN_TRANSCRIPT_CHARS = 6
+MIN_CONFIDENCE = 0.55
+MAX_DUPLICATES_PER_TEXT = 2
+MAX_UPLOADED_CHECKPOINTS = 4
 
 
 @dataclass
@@ -648,10 +661,10 @@ def _build_speech_segments(audio_path: Path) -> list[tuple[float, float]]:
     for seg_start, seg_end in speech_intervals:
         start = max(0.0, seg_start)
         end = min(duration, seg_end)
-        while end - start > 30.0:
-            split_intervals.append((start, start + 30.0))
-            start += 30.0
-        if end - start >= 1.0:
+        while end - start > MAX_SEGMENT_SEC:
+            split_intervals.append((start, start + MAX_SEGMENT_SEC))
+            start += MAX_SEGMENT_SEC
+        if end - start >= MIN_SEGMENT_SEC:
             split_intervals.append((start, end))
 
     merged: list[tuple[float, float]] = []
@@ -669,20 +682,57 @@ def _build_speech_segments(audio_path: Path) -> list[tuple[float, float]]:
             candidate_end = n_end
             if gap > 0.6:
                 break
-            if candidate_end - start > 30.0:
+            if candidate_end - start > MAX_SEGMENT_SEC:
                 break
             end = candidate_end
             idx += 1
-            if end - start >= 3.0:
+            if end - start >= MIN_SEGMENT_SEC:
                 break
 
-        if end - start >= 1.0:
+        if end - start >= MIN_SEGMENT_SEC:
             merged.append((start, end))
         idx += 1
 
     return [
-        (start, end - start) for start, end in merged if 1.0 <= (end - start) <= 30.0
+        (start, end - start)
+        for start, end in merged
+        if MIN_SEGMENT_SEC <= (end - start) <= MAX_SEGMENT_SEC
     ]
+
+
+def _normalize_text(text: str) -> str:
+    return NORMALIZED_TEXT_RE.sub("", (text or "").strip().lower())
+
+
+def _compute_signal_metrics(audio_path: Path) -> dict[str, float]:
+    import numpy as np
+    import soundfile as sf
+
+    samples, sr = sf.read(str(audio_path), dtype="float32", always_2d=False)
+    audio = np.asarray(samples, dtype=np.float32)
+    if audio.size == 0:
+        return {
+            "rms": 0.0,
+            "peak": 0.0,
+            "silence_ratio": 1.0,
+            "clipping_ratio": 0.0,
+            "duration_sec": 0.0,
+        }
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+
+    rms = float(np.sqrt(np.mean(np.square(audio)) + 1e-12))
+    peak = float(np.max(np.abs(audio)))
+    silence_ratio = float(np.mean(np.abs(audio) < 1e-4))
+    clipping_ratio = float(np.mean(np.abs(audio) >= 0.999))
+    duration_sec = float(len(audio) / max(int(sr), 1))
+    return {
+        "rms": rms,
+        "peak": peak,
+        "silence_ratio": silence_ratio,
+        "clipping_ratio": clipping_ratio,
+        "duration_sec": duration_sec,
+    }
 
 
 def _compute_rms(audio_path: Path) -> float:
@@ -701,7 +751,7 @@ def _compute_rms(audio_path: Path) -> float:
 def preprocess_raw_audio(
     dataset_dir: Path, output_jsonl: Path, status: StatusWriter,
     whisper_language: str | None = None,
-) -> None:
+) -> dict[str, Any]:
     import torch
 
     try:
@@ -740,24 +790,23 @@ def preprocess_raw_audio(
         }
     )
     for idx, src in enumerate(source_audio, start=1):
-        if src.suffix.lower() == ".wav":
-            wav_inputs.append(src)
-        else:
-            converted_path = converted_dir / f"{src.stem}_{idx:04d}.wav"
-            cmd = [
-                "ffmpeg",
-                "-hide_banner",
-                "-y",
-                "-i",
-                str(src),
-                "-ac",
-                "1",
-                "-ar",
-                "24000",
-                str(converted_path),
-            ]
-            _run_ffmpeg_capture(cmd)
-            wav_inputs.append(converted_path)
+        converted_path = converted_dir / f"src_{idx:04d}.wav"
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-y",
+            "-i",
+            str(src),
+            "-ac",
+            "1",
+            "-ar",
+            str(TARGET_SAMPLE_RATE),
+            "-c:a",
+            "pcm_s16le",
+            str(converted_path),
+        ]
+        _run_ffmpeg_capture(cmd)
+        wav_inputs.append(converted_path)
 
         status.write(
             {
@@ -827,8 +876,12 @@ def preprocess_raw_audio(
     )
     model = WhisperModel("large-v3", device=device, compute_type=compute_type)
 
-    accepted_rows: list[dict[str, Any]] = []
+    raw_rows: list[dict[str, Any]] = []
     ref_candidates: list[tuple[float, Path]] = []
+    skipped_short = 0
+    skipped_low_rms = 0
+    skipped_low_conf = 0
+    skipped_short_text = 0
     status.write(
         {
             "status": "preprocessing",
@@ -839,8 +892,20 @@ def preprocess_raw_audio(
 
     for idx, seg_path in enumerate(all_segments, start=1):
         duration = _probe_duration_seconds(seg_path)
-        rms = _compute_rms(seg_path)
-        if duration < 1.0 or duration > 30.0 or rms < 0.005:
+        metrics = _compute_signal_metrics(seg_path)
+        rms = metrics.get("rms", 0.0)
+        if duration < MIN_SEGMENT_SEC or duration > MAX_SEGMENT_SEC:
+            skipped_short += 1
+            status.write(
+                {
+                    "status": "preprocessing",
+                    "message": "Transcribing and filtering segments...",
+                    "progress": {"step": idx, "total": len(all_segments)},
+                }
+            )
+            continue
+        if rms < 0.005:
+            skipped_low_rms += 1
             status.write(
                 {
                     "status": "preprocessing",
@@ -854,6 +919,8 @@ def preprocess_raw_audio(
             str(seg_path),
             language=whisper_language,
             beam_size=5,
+            vad_filter=True,
+            condition_on_previous_text=False,
         )
         text_parts: list[str] = []
         confidence_values: list[float] = []
@@ -872,7 +939,8 @@ def preprocess_raw_audio(
             else 0.0
         )
 
-        if not text or confidence < 0.3:
+        if not text or confidence < MIN_CONFIDENCE:
+            skipped_low_conf += 1
             status.write(
                 {
                     "status": "preprocessing",
@@ -882,17 +950,38 @@ def preprocess_raw_audio(
             )
             continue
 
-        accepted_rows.append(
+        if len(_normalize_text(text)) < MIN_TRANSCRIPT_CHARS:
+            skipped_short_text += 1
+            status.write(
+                {
+                    "status": "preprocessing",
+                    "message": "Transcribing and filtering segments...",
+                    "progress": {"step": idx, "total": len(all_segments)},
+                }
+            )
+            continue
+
+        ref_duration_bonus = 1.0 - min(1.0, abs(duration - 6.0) / 4.0)
+        ref_score = (
+            (confidence * 0.55)
+            + (ref_duration_bonus * 0.2)
+            + (min(1.0, rms / 0.04) * 0.15)
+            + ((1.0 - min(1.0, metrics.get("silence_ratio", 1.0))) * 0.1)
+        )
+
+        raw_rows.append(
             {
                 "audio": str(seg_path),
                 "text": text,
                 "_duration": duration,
                 "_confidence": confidence,
+                "_metrics": metrics,
+                "_norm_text": _normalize_text(text),
+                "_ref_score": ref_score,
             }
         )
 
-        if 3.0 <= duration <= 8.0:
-            ref_score = confidence + min(1.0, duration / 8.0)
+        if IDEAL_REF_MIN_SEC <= duration <= IDEAL_REF_MAX_SEC:
             ref_candidates.append((ref_score, seg_path))
 
         status.write(
@@ -903,9 +992,39 @@ def preprocess_raw_audio(
             }
         )
 
-    if not accepted_rows:
+    if not raw_rows:
         raise RuntimeError(
             "No usable segments left after transcription and quality filtering"
+        )
+
+    raw_rows.sort(
+        key=lambda row: (
+            -float(row.get("_confidence", 0.0)),
+            -float(row.get("_duration", 0.0)),
+            str(row.get("audio", "")),
+        )
+    )
+
+    accepted_rows: list[dict[str, Any]] = []
+    text_counts: dict[str, int] = {}
+    duplicate_dropped = 0
+    for row in raw_rows:
+        norm = str(row.get("_norm_text", "")).strip()
+        count = text_counts.get(norm, 0)
+        if norm and count >= MAX_DUPLICATES_PER_TEXT:
+            duplicate_dropped += 1
+            continue
+        if norm:
+            text_counts[norm] = count + 1
+        accepted_rows.append(row)
+
+    total_duration_min = sum(float(row.get("_duration", 0.0)) for row in accepted_rows) / 60.0
+    if len(accepted_rows) < MIN_ACCEPTED_SEGMENTS or total_duration_min < MIN_ACCEPTED_AUDIO_MIN:
+        raise RuntimeError(
+            "Dataset quality gate failed after preprocessing: "
+            f"accepted_segments={len(accepted_rows)} (required >= {MIN_ACCEPTED_SEGMENTS}), "
+            f"accepted_minutes={total_duration_min:.2f} (required >= {MIN_ACCEPTED_AUDIO_MIN:.2f}). "
+            "Upload more clean speech from the same speaker before training."
         )
 
     if ref_candidates:
@@ -914,6 +1033,14 @@ def preprocess_raw_audio(
     else:
         accepted_rows.sort(key=lambda row: row["_confidence"], reverse=True)
         ref_audio_source = Path(str(accepted_rows[0]["audio"]))
+    reference_text = next(
+        (
+            str(row.get("text", "")).strip()
+            for row in accepted_rows
+            if str(row.get("audio", "")).strip() == str(ref_audio_source)
+        ),
+        "",
+    )
 
     ref_audio_path = dataset_dir / "ref_audio.wav"
     shutil.copyfile(ref_audio_source, ref_audio_path)
@@ -933,6 +1060,29 @@ def preprocess_raw_audio(
                 + "\n"
             )
 
+    dataset_report = {
+        "source_audio_files": len(source_audio),
+        "segments_created": len(all_segments),
+        "segments_accepted": len(accepted_rows),
+        "accepted_duration_min": round(total_duration_min, 2),
+        "avg_confidence": round(
+            sum(float(row.get("_confidence", 0.0)) for row in accepted_rows)
+            / max(len(accepted_rows), 1),
+            4,
+        ),
+        "duplicate_dropped": duplicate_dropped,
+        "skipped_short_or_long": skipped_short,
+        "skipped_low_rms": skipped_low_rms,
+        "skipped_low_confidence": skipped_low_conf,
+        "skipped_short_text": skipped_short_text,
+        "reference_audio": str(ref_audio_path),
+        "reference_text": reference_text,
+    }
+    (dataset_dir / "preprocess_report.json").write_text(
+        json.dumps(dataset_report, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
     LOGGER.info(
         "Generated %s with %d samples (%d raw files -> %d segments)",
         output_jsonl,
@@ -940,6 +1090,8 @@ def preprocess_raw_audio(
         len(source_audio),
         len(all_segments),
     )
+    LOGGER.info("Preprocess report: %s", json.dumps(dataset_report, ensure_ascii=False))
+    return dataset_report
 
 
 def run_prepare(
@@ -1125,16 +1277,48 @@ def upload_checkpoints(
     checkpoints = find_checkpoints(output_dir)
     if not checkpoints:
         raise RuntimeError(f"No checkpoint-epoch-* directories found in {output_dir}")
+    selected_checkpoints = checkpoints[-MAX_UPLOADED_CHECKPOINTS:]
+    skipped_epochs = [epoch for epoch, _ in checkpoints[:-MAX_UPLOADED_CHECKPOINTS]]
+    if skipped_epochs:
+        LOGGER.info(
+            "Skipping upload of %d earlier checkpoint(s): %s",
+            len(skipped_epochs),
+            skipped_epochs,
+        )
     uploaded: list[dict[str, Any]] = []
-    for epoch, ckpt_dir in checkpoints:
+    total_to_upload = len(selected_checkpoints)
+    for index, (epoch, ckpt_dir) in enumerate(selected_checkpoints, start=1):
+        progress = {
+            "epoch": epoch,
+            "total_epochs": cfg.num_epochs,
+            "step": index,
+            "total_steps": total_to_upload,
+        }
+        status.write(
+            {
+                "status": "uploading",
+                "message": f"Uploading checkpoint {index}/{total_to_upload} (epoch {epoch}) to R2...",
+                "progress": progress,
+                "checkpoints": uploaded,
+            }
+        )
         prefix = r2.upload_checkpoint_full(
             checkpoint_dir=ckpt_dir,
             voice_id=cfg.voice_id,
             run_name=cfg.run_name,
             epoch=epoch,
         )
+        status.heartbeat(progress=progress, message=f"Verifying checkpoint epoch {epoch}")
         _verify_checkpoint_upload(r2, prefix, ckpt_dir)
         uploaded.append({"epoch": epoch, "r2_prefix": prefix})
+        status.write(
+            {
+                "status": "uploading",
+                "message": f"Uploaded checkpoint {index}/{total_to_upload} (epoch {epoch})",
+                "progress": progress,
+                "checkpoints": uploaded,
+            }
+        )
         LOGGER.info("Checkpoint epoch %d uploaded and verified: %s", epoch, prefix)
     return uploaded
 
@@ -1279,6 +1463,7 @@ def main() -> int:
 
         train_raw_jsonl = DATASET_DIR / "train_raw.jsonl"
         generated_train_raw = False
+        preprocess_report: dict[str, Any] | None = None
         if not train_raw_jsonl.exists():
             status.write(
                 {
@@ -1287,10 +1472,29 @@ def main() -> int:
                 }
             )
             try:
-                preprocess_raw_audio(DATASET_DIR, train_raw_jsonl, status, whisper_language=cfg.whisper_language)
+                preprocess_report = preprocess_raw_audio(
+                    DATASET_DIR,
+                    train_raw_jsonl,
+                    status,
+                    whisper_language=cfg.whisper_language,
+                )
             except (FileNotFoundError, RuntimeError) as exc:
                 raise UnrecoverableError(f"Preprocessing failed: {exc}") from exc
             generated_train_raw = True
+            try:
+                ref_audio_local = DATASET_DIR / "ref_audio.wav"
+                if ref_audio_local.exists():
+                    r2.upload_file(
+                        ref_audio_local,
+                        f"{cfg.dataset_r2_prefix}/ref_audio.wav",
+                        content_type="audio/wav",
+                    )
+                if preprocess_report is not None:
+                    ref_meta = dict(preprocess_report)
+                    ref_meta["reference_audio_key"] = f"{cfg.dataset_r2_prefix}/ref_audio.wav"
+                    r2.upload_json(ref_meta, f"{cfg.dataset_r2_prefix}/reference_profile.json")
+            except Exception as exc:
+                LOGGER.warning("Failed to upload generated reference profile: %s", exc)
 
         # Rewrite JSONL paths to match downloaded file locations
         if not generated_train_raw:
