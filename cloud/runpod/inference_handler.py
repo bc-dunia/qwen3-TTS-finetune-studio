@@ -25,7 +25,7 @@ DEFAULT_MODEL_ID = "qwen3-tts-1.7b"
 CHECKPOINT_ROOT = Path("/tmp/checkpoints")
 MAX_CACHED_MODELS = 2
 R2_TIMEOUT_SEC = 600  # 10 min for large full checkpoints (~4GB)
-MODEL_CACHE: OrderedDict[str, tuple[Any, Any | None]] = OrderedDict()
+MODEL_CACHE: OrderedDict[str, tuple[Any, Any | None, Path]] = OrderedDict()
 CACHE_IDENTITY: dict[str, str] = {}
 _MODEL_LOCK = threading.Lock()
 _MERGE_LOCKS: dict[str, threading.Lock] = {}
@@ -538,7 +538,52 @@ def _merge_checkpoint(base_dir: Path, delta_dir: Path, merged_dir: Path) -> None
     if merged_dir.exists():
         shutil.rmtree(merged_dir)
     shutil.move(str(tmp), str(merged_dir))
+    if delta_dir.exists():
+        shutil.rmtree(delta_dir, ignore_errors=True)
     _log(f"checkpoint_merge_ms={int((time.time() - start) * 1000)} path={merged_dir}")
+
+
+def _artifact_root_for_checkpoint_dir(checkpoint_dir: Path) -> Path:
+    return checkpoint_dir.parent
+
+
+def _safe_remove_tree(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        resolved = path.resolve()
+    except Exception:
+        resolved = path
+    try:
+        checkpoint_root = CHECKPOINT_ROOT.resolve()
+    except Exception:
+        checkpoint_root = CHECKPOINT_ROOT
+    if resolved == checkpoint_root or checkpoint_root not in resolved.parents:
+        return
+    shutil.rmtree(resolved, ignore_errors=True)
+
+
+def _current_cache_roots(extra_keep: Path | None = None) -> set[Path]:
+    roots: set[Path] = set()
+    with _MODEL_LOCK:
+        for _, _, checkpoint_dir in MODEL_CACHE.values():
+            roots.add(_artifact_root_for_checkpoint_dir(checkpoint_dir))
+    if extra_keep is not None:
+        roots.add(extra_keep)
+    return roots
+
+
+def _prune_stale_checkpoint_dirs(extra_keep: Path | None = None) -> None:
+    if not CHECKPOINT_ROOT.exists():
+        return
+    keep_roots = {root.resolve() for root in _current_cache_roots(extra_keep)}
+    for candidate in CHECKPOINT_ROOT.rglob("checkpoint-epoch-*"):
+        if not candidate.is_dir():
+            continue
+        resolved = candidate.resolve()
+        if resolved in keep_roots:
+            continue
+        shutil.rmtree(resolved, ignore_errors=True)
 
 
 def _ensure_merged_checkpoint(
@@ -579,6 +624,7 @@ def _ensure_merged_checkpoint(
         merge_lock = _MERGE_LOCKS[merge_key]
 
     with merge_lock:
+        _prune_stale_checkpoint_dirs(extra_keep=root)
         if (merged_dir / "model.safetensors").exists():
             return merged_dir
 
@@ -644,12 +690,13 @@ def _evict_lru() -> None:
     torch = _torch()
     if not MODEL_CACHE:
         return
-    voice_id, (model, _) = MODEL_CACHE.popitem(last=False)
+    voice_id, (model, _, checkpoint_dir) = MODEL_CACHE.popitem(last=False)
     CACHE_IDENTITY.pop(voice_id, None)
     del model
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    _safe_remove_tree(_artifact_root_for_checkpoint_dir(checkpoint_dir))
     _log(f"cache_evict voice_id={voice_id}")
 
 
@@ -669,18 +716,24 @@ def _get_model(
     else:
         identity = f"{model_id}:delta:{run_name}:{epoch}"
     stale_model: Any | None = None
+    stale_checkpoint_dir: Path | None = None
     with _MODEL_LOCK:
         if voice_id in MODEL_CACHE and CACHE_IDENTITY.get(voice_id) == identity:
             MODEL_CACHE.move_to_end(voice_id)
             return MODEL_CACHE[voice_id][0]
         if voice_id in MODEL_CACHE:
-            stale_model, _ = MODEL_CACHE.pop(voice_id)
+            stale_model, _, stale_checkpoint_dir = MODEL_CACHE.pop(voice_id)
             CACHE_IDENTITY.pop(voice_id, None)
     if stale_model is not None:
         del stale_model
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+    _safe_remove_tree(
+        _artifact_root_for_checkpoint_dir(stale_checkpoint_dir)
+        if stale_checkpoint_dir is not None
+        else None
+    )
     merged_dir = _ensure_merged_checkpoint(
         storage=storage,
         voice_id=voice_id,
@@ -694,7 +747,7 @@ def _get_model(
     with _MODEL_LOCK:
         while len(MODEL_CACHE) >= MAX_CACHED_MODELS:
             _evict_lru()
-        MODEL_CACHE[voice_id] = (model, tokenizer)
+        MODEL_CACHE[voice_id] = (model, tokenizer, merged_dir)
         CACHE_IDENTITY[voice_id] = identity
         MODEL_CACHE.move_to_end(voice_id)
     return model
@@ -1131,7 +1184,9 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         gen_ms = best_candidate["gen_ms"]
         quality = best_candidate["quality"]
         min_accept_score = 0.9 if model_id == "qwen3-tts-0.6b" else 0.82
-        if float(quality["overall_score"]) < min_accept_score:
+        allow_below_threshold = bool(review_cfg.get("allow_below_threshold"))
+        accepted = float(quality["overall_score"]) >= min_accept_score
+        if not accepted and not allow_below_threshold:
             return {
                 "error": (
                     f"Generated audio below quality threshold: "
@@ -1161,6 +1216,8 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                 "duration_score": float(quality["duration_score"]),
                 "health_score": float(quality["health_score"]),
                 "stability_score": float(quality["stability_score"]),
+                "accepted": accepted,
+                "required_score": float(min_accept_score),
                 "candidates_generated": len(candidate_scores),
                 "candidate_scores": [float(s) for s in candidate_scores],
                 "retries": retries,
@@ -1189,6 +1246,12 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
             out["speed_hint"] = speed_hint
             out["speed_hint_note"] = (
                 "speed is accepted as a hint but has no direct Qwen3-TTS parameter"
+            )
+        if not accepted:
+            out["warning"] = (
+                f"Generated audio below quality threshold: "
+                f"overall_score={float(quality['overall_score']):.3f} "
+                f"required={min_accept_score:.3f}"
             )
         return out
     except Exception as exc:
