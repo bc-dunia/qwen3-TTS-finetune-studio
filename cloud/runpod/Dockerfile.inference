@@ -15,6 +15,10 @@ FROM runpod/pytorch:1.0.3-cu1281-torch271-ubuntu2204
 
 WORKDIR /app
 
+# Base image enables hf_transfer, but the package is not installed. Disable it
+# so baked model downloads use the standard Hugging Face transport.
+ENV HF_HUB_ENABLE_HF_TRANSFER=0
+
 # System dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg && \
