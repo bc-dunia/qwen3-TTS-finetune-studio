@@ -32,6 +32,12 @@ snapshot_download('Qwen/Qwen3-TTS-12Hz-1.7B-Base', local_dir='/models/Qwen3-TTS-
 snapshot_download('Qwen/Qwen3-TTS-12Hz-0.6B-Base', local_dir='/models/Qwen3-TTS-12Hz-0.6B-Base'); \
 snapshot_download('Qwen/Qwen3-TTS-Tokenizer-12Hz', local_dir='/models/Qwen3-TTS-Tokenizer-12Hz')"
 
+# Bake faster-whisper base model into the image so review ASR does not depend
+# on runtime model downloads inside a short-lived worker.
+RUN python3 -c "\
+from faster_whisper.utils import download_model; \
+download_model('base', output_dir='/models/faster-whisper-base')"
+
 # Copy handler code
 COPY cloud/runpod/r2_storage.py /app/r2_storage.py
 COPY cloud/runpod/inference_handler.py /app/inference_handler.py

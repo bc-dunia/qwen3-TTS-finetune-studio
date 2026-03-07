@@ -23,6 +23,13 @@ RUN apt-get update && \
 COPY cloud/runpod/requirements.txt /app/requirements.txt
 RUN python3 -m pip install --no-cache-dir -r requirements.txt
 
+# Bake faster-whisper base model into the image so review ASR does not depend
+# on runtime model downloads inside a short-lived worker.
+RUN mkdir -p /models && \
+    python3 -c "\
+from faster_whisper.utils import download_model; \
+download_model('base', output_dir='/models/faster-whisper-base')"
+
 # Copy handler code
 COPY cloud/runpod/r2_storage.py /app/r2_storage.py
 COPY cloud/runpod/inference_handler.py /app/inference_handler.py

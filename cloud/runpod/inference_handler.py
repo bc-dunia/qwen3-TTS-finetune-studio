@@ -37,6 +37,7 @@ _EVAL_MODEL_LOCK = threading.Lock()
 _SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9._-]{1,128}$")
 _NORMALIZED_TEXT_RE = re.compile(r"[^0-9a-zA-Z가-힣]+")
 REFERENCE_CACHE_ROOT = Path("/tmp/reference_audio_cache")
+LOCAL_ASR_MODEL_DIR = Path("/models/faster-whisper-base")
 _WHISPER_LANGUAGE_ALIASES = {
     "auto": None,
     "english": "en",
@@ -233,6 +234,7 @@ def _load_asr_model_for_device(*, prefer_cpu: bool) -> Any:
         if cache_key in _ASR_MODELS:
             return _ASR_MODELS[cache_key]
         WhisperModel = importlib.import_module("faster_whisper").WhisperModel
+        model_ref = str(LOCAL_ASR_MODEL_DIR) if LOCAL_ASR_MODEL_DIR.exists() else "base"
         if prefer_cpu:
             device = "cpu"
             compute_type = "int8"
@@ -240,14 +242,19 @@ def _load_asr_model_for_device(*, prefer_cpu: bool) -> Any:
             device = "cuda" if _torch().cuda.is_available() else "cpu"
             compute_type = "float16" if device == "cuda" else "int8"
         try:
-            model = WhisperModel("base", device=device, compute_type=compute_type)
+            model = WhisperModel(model_ref, device=device, compute_type=compute_type)
         except Exception as exc:
             if device == "cuda" and not prefer_cpu:
                 _log(f"asr_model_load_failed device=cuda error={exc}; retrying on cpu")
-                model = WhisperModel("base", device="cpu", compute_type="int8")
+                model = WhisperModel(model_ref, device="cpu", compute_type="int8")
                 cache_key = "cpu"
             else:
                 raise
+        _log(
+            f"asr_model_ready device={device if cache_key == 'auto' else 'cpu'} "
+            f"compute_type={compute_type if cache_key == 'auto' else 'int8'} "
+            f"source={model_ref}"
+        )
         _ASR_MODELS[cache_key] = model
         return model
 
