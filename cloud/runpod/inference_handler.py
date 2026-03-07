@@ -37,6 +37,44 @@ _EVAL_MODEL_LOCK = threading.Lock()
 _SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9._-]{1,128}$")
 _NORMALIZED_TEXT_RE = re.compile(r"[^0-9a-zA-Z가-힣]+")
 REFERENCE_CACHE_ROOT = Path("/tmp/reference_audio_cache")
+_WHISPER_LANGUAGE_ALIASES = {
+    "auto": None,
+    "english": "en",
+    "en": "en",
+    "en-us": "en",
+    "en-gb": "en",
+    "korean": "ko",
+    "ko": "ko",
+    "ko-kr": "ko",
+    "japanese": "ja",
+    "ja": "ja",
+    "ja-jp": "ja",
+    "chinese": "zh",
+    "zh": "zh",
+    "zh-cn": "zh",
+    "zh-tw": "zh",
+    "mandarin": "zh",
+    "spanish": "es",
+    "es": "es",
+    "es-es": "es",
+    "es-mx": "es",
+    "french": "fr",
+    "fr": "fr",
+    "fr-fr": "fr",
+    "german": "de",
+    "de": "de",
+    "de-de": "de",
+    "italian": "it",
+    "it": "it",
+    "it-it": "it",
+    "portuguese": "pt",
+    "pt": "pt",
+    "pt-br": "pt",
+    "pt-pt": "pt",
+    "russian": "ru",
+    "ru": "ru",
+    "ru-ru": "ru",
+}
 
 
 def _log(msg: str) -> None:
@@ -203,12 +241,9 @@ def _load_eval_model() -> Any:
         if _EVAL_MODEL is not None:
             return _EVAL_MODEL
         Qwen3TTSModel = importlib.import_module("qwen_tts").Qwen3TTSModel
-        device = _resolve_device()
-        dtype = _resolve_dtype(device)
-        attn = "sdpa" if device.startswith("cuda") else None
-        opts = {"device_map": device, "attn_implementation": attn}
-        if dtype is not None:
-            opts["torch_dtype"] = dtype
+        # Keep reference embedding extraction off the inference GPU so review does not
+        # compete with the live generation model for VRAM.
+        opts = {"device_map": "cpu", "torch_dtype": _torch().float32}
         opts = {k: v for k, v in opts.items() if v is not None}
         model = Qwen3TTSModel.from_pretrained(BASE_MODEL_PATHS["qwen3-tts-0.6b"], **opts)
         try:
@@ -216,7 +251,17 @@ def _load_eval_model() -> Any:
         except Exception:
             pass
         _EVAL_MODEL = model
+        _log("loaded_eval_model device=cpu model=qwen3-tts-0.6b")
         return _EVAL_MODEL
+
+
+def _normalize_whisper_language(language: str | None) -> str | None:
+    lang = (language or "").strip().lower().replace("_", "-")
+    if not lang:
+        return None
+    if lang in _WHISPER_LANGUAGE_ALIASES:
+        return _WHISPER_LANGUAGE_ALIASES[lang]
+    return None if lang == "auto" else lang
 
 
 def _transcribe_for_review(
@@ -231,21 +276,45 @@ def _transcribe_for_review(
     try:
         sf.write(str(tmp_path), audio_1d, sr)
         model = _load_asr_model()
-        lang = (language or "").strip()
-        lang = None if not lang or lang.lower() == "auto" else lang
-        segments, info = model.transcribe(
-            str(tmp_path),
-            language=lang,
-            beam_size=3,
-            vad_filter=True,
-            condition_on_previous_text=False,
-        )
-        text = "".join(str(seg.text or "") for seg in segments).strip()
-        try:
-            prob = float(getattr(info, "language_probability", 0.0))
-        except Exception:
-            prob = None
-        return text, prob
+        lang = _normalize_whisper_language(language)
+
+        attempts = [
+            {"language": lang, "vad_filter": True, "beam_size": 3},
+            {"language": lang, "vad_filter": False, "beam_size": 3},
+        ]
+        if lang is not None:
+            attempts.append({"language": None, "vad_filter": False, "beam_size": 5})
+
+        best_text = ""
+        best_prob: float | None = None
+        best_score = -1
+        for idx, attempt in enumerate(attempts, start=1):
+            segments, info = model.transcribe(
+                str(tmp_path),
+                language=attempt["language"],
+                beam_size=attempt["beam_size"],
+                vad_filter=attempt["vad_filter"],
+                condition_on_previous_text=False,
+            )
+            text = "".join(str(seg.text or "") for seg in segments).strip()
+            normalized_len = len(_normalize_text(text))
+            try:
+                prob = float(getattr(info, "language_probability", 0.0))
+            except Exception:
+                prob = None
+            if normalized_len > best_score:
+                best_text = text
+                best_prob = prob
+                best_score = normalized_len
+            if text:
+                if idx > 1:
+                    _log(
+                        f"asr_review_recovered attempt={idx} "
+                        f"language={attempt['language'] or 'auto'} "
+                        f"vad_filter={attempt['vad_filter']}"
+                    )
+                return text, prob
+        return best_text, best_prob
     finally:
         try:
             tmp_path.unlink(missing_ok=True)
@@ -350,17 +419,24 @@ def _reference_similarity_metrics(
         ref_audio, ref_sr = librosa.load(str(ref_path), sr=None, mono=True)
         ref_audio_24 = _resample_audio(np.asarray(ref_audio, dtype=np.float32), int(ref_sr or 24000), 24000)
         gen_audio_24 = _resample_audio(audio, sr, 24000)
+    except Exception as exc:
+        _log(f"reference_review_failed key={reference_key} error={exc}")
+        return {}
 
-        result: dict[str, float | str] = {}
+    result: dict[str, float | str] = {}
 
-        if bool(review_cfg.get("enable_speaker", True)):
+    if bool(review_cfg.get("enable_speaker", True)):
+        try:
             ref_emb = _speaker_embedding(ref_audio_24, 24000)
             gen_emb = _speaker_embedding(gen_audio_24, 24000)
             speaker_cos = _cosine(gen_emb, ref_emb)
             result["speaker_cosine"] = float(speaker_cos)
             result["speaker_score"] = float(_clamp((speaker_cos - 0.85) / 0.15, 0.0, 1.0))
+        except Exception as exc:
+            _log(f"reference_speaker_review_failed key={reference_key} error={exc}")
 
-        if bool(review_cfg.get("enable_style", True)):
+    if bool(review_cfg.get("enable_style", True)):
+        try:
             ref_pitch_median, ref_pitch_std = _pitch_stats(ref_audio_24, 24000)
             gen_pitch_median, gen_pitch_std = _pitch_stats(gen_audio_24, 24000)
             result["reference_pitch_median"] = float(ref_pitch_median)
@@ -373,9 +449,12 @@ def _reference_similarity_metrics(
                     + (_ratio_score(max(gen_pitch_std, 1.0), max(ref_pitch_std, 1.0), tolerance=1.1) * 0.3)
                 )
                 result["tone_score"] = float(_clamp(tone_score, 0.0, 1.0))
+        except Exception as exc:
+            _log(f"reference_style_review_failed key={reference_key} error={exc}")
 
-        reference_text = str(review_cfg.get("reference_text", "") or "").strip()
-        if bool(review_cfg.get("enable_speed", True)) and reference_text:
+    reference_text = str(review_cfg.get("reference_text", "") or "").strip()
+    if bool(review_cfg.get("enable_speed", True)) and reference_text:
+        try:
             ref_duration_sec = float(len(ref_audio_24) / 24000.0)
             gen_duration_sec = float(len(gen_audio_24) / 24000.0)
             ref_chars = len(_normalize_text(reference_text))
@@ -388,11 +467,10 @@ def _reference_similarity_metrics(
                 result["speed_score"] = float(
                     _clamp(_ratio_score(gen_cps, ref_cps, tolerance=1.6), 0.0, 1.0)
                 )
+        except Exception as exc:
+            _log(f"reference_speed_review_failed key={reference_key} error={exc}")
 
-        return result
-    except Exception as exc:
-        _log(f"reference_review_failed key={reference_key} error={exc}")
-        return {}
+    return result
 
 
 def _model_supports_instruct(model: Any) -> bool:
