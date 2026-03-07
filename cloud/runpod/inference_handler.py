@@ -30,7 +30,7 @@ CACHE_IDENTITY: dict[str, str] = {}
 _MODEL_LOCK = threading.Lock()
 _MERGE_LOCKS: dict[str, threading.Lock] = {}
 _MERGE_LOCKS_LOCK = threading.Lock()
-_ASR_MODEL: Any | None = None
+_ASR_MODELS: dict[str, Any] = {}
 _ASR_LOCK = threading.Lock()
 _EVAL_MODEL: Any | None = None
 _EVAL_MODEL_LOCK = threading.Lock()
@@ -224,15 +224,32 @@ def _asr_similarity(target: str, pred: str) -> float:
 
 
 def _load_asr_model() -> Any:
-    global _ASR_MODEL
+    return _load_asr_model_for_device(prefer_cpu=False)
+
+
+def _load_asr_model_for_device(*, prefer_cpu: bool) -> Any:
     with _ASR_LOCK:
-        if _ASR_MODEL is not None:
-            return _ASR_MODEL
+        cache_key = "cpu" if prefer_cpu else "auto"
+        if cache_key in _ASR_MODELS:
+            return _ASR_MODELS[cache_key]
         WhisperModel = importlib.import_module("faster_whisper").WhisperModel
-        device = "cuda" if _torch().cuda.is_available() else "cpu"
-        compute_type = "float16" if device == "cuda" else "int8"
-        _ASR_MODEL = WhisperModel("base", device=device, compute_type=compute_type)
-        return _ASR_MODEL
+        if prefer_cpu:
+            device = "cpu"
+            compute_type = "int8"
+        else:
+            device = "cuda" if _torch().cuda.is_available() else "cpu"
+            compute_type = "float16" if device == "cuda" else "int8"
+        try:
+            model = WhisperModel("base", device=device, compute_type=compute_type)
+        except Exception as exc:
+            if device == "cuda" and not prefer_cpu:
+                _log(f"asr_model_load_failed device=cuda error={exc}; retrying on cpu")
+                model = WhisperModel("base", device="cpu", compute_type="int8")
+                cache_key = "cpu"
+            else:
+                raise
+        _ASR_MODELS[cache_key] = model
+        return model
 
 
 def _load_eval_model() -> Any:
@@ -275,7 +292,6 @@ def _transcribe_for_review(
         tmp_path = Path(tmp.name)
     try:
         sf.write(str(tmp_path), audio_1d, sr)
-        model = _load_asr_model()
         lang = _normalize_whisper_language(language)
 
         attempts = [
@@ -288,32 +304,55 @@ def _transcribe_for_review(
         best_text = ""
         best_prob: float | None = None
         best_score = -1
-        for idx, attempt in enumerate(attempts, start=1):
-            segments, info = model.transcribe(
-                str(tmp_path),
-                language=attempt["language"],
-                beam_size=attempt["beam_size"],
-                vad_filter=attempt["vad_filter"],
-                condition_on_previous_text=False,
-            )
-            text = "".join(str(seg.text or "") for seg in segments).strip()
-            normalized_len = len(_normalize_text(text))
+        model_attempts = [("auto", False)]
+        if _torch().cuda.is_available():
+            model_attempts.append(("cpu", True))
+
+        for model_name, prefer_cpu in model_attempts:
             try:
-                prob = float(getattr(info, "language_probability", 0.0))
-            except Exception:
-                prob = None
-            if normalized_len > best_score:
-                best_text = text
-                best_prob = prob
-                best_score = normalized_len
-            if text:
-                if idx > 1:
-                    _log(
-                        f"asr_review_recovered attempt={idx} "
-                        f"language={attempt['language'] or 'auto'} "
-                        f"vad_filter={attempt['vad_filter']}"
+                model = _load_asr_model_for_device(prefer_cpu=prefer_cpu)
+            except Exception as exc:
+                _log(f"asr_model_init_failed device={model_name} error={exc}")
+                continue
+
+            for idx, attempt in enumerate(attempts, start=1):
+                try:
+                    segments, info = model.transcribe(
+                        str(tmp_path),
+                        language=attempt["language"],
+                        beam_size=attempt["beam_size"],
+                        vad_filter=attempt["vad_filter"],
+                        condition_on_previous_text=False,
                     )
-                return text, prob
+                except Exception as exc:
+                    _log(
+                        f"asr_review_attempt_failed device={model_name} "
+                        f"attempt={idx} language={attempt['language'] or 'auto'} "
+                        f"vad_filter={attempt['vad_filter']} error={exc}"
+                    )
+                    if prefer_cpu:
+                        break
+                    # If the GPU path fails, immediately retry the whole sequence on CPU.
+                    break
+
+                text = "".join(str(seg.text or "") for seg in segments).strip()
+                normalized_len = len(_normalize_text(text))
+                try:
+                    prob = float(getattr(info, "language_probability", 0.0))
+                except Exception:
+                    prob = None
+                if normalized_len > best_score:
+                    best_text = text
+                    best_prob = prob
+                    best_score = normalized_len
+                if text:
+                    if idx > 1 or prefer_cpu:
+                        _log(
+                            f"asr_review_recovered device={model_name} attempt={idx} "
+                            f"language={attempt['language'] or 'auto'} "
+                            f"vad_filter={attempt['vad_filter']}"
+                        )
+                    return text, prob
         return best_text, best_prob
     finally:
         try:
