@@ -13,11 +13,14 @@ import {
 import {
   createPod,
   createPodDirect,
+  getServerlessStatus,
   getPodStatus,
   getTemplateById,
   invokeServerless,
+  invokeServerlessAsync,
   terminatePod,
 } from "../lib/runpod";
+import { enrichOutputWithReviewAsr } from "../lib/review-asr";
 import { authMiddleware } from "../middleware/auth";
 import type { AppContext, TrainingConfig, TrainingJob, TrainingProgress } from "../types";
 
@@ -51,6 +54,117 @@ type CheckpointValidationResult = {
   totalSamples: number;
 };
 
+type CheckpointCandidate = {
+  epoch: number;
+  r2_prefix: string;
+};
+
+type CheckpointEvaluation = {
+  epoch: number;
+  prefix: string;
+  ok: boolean;
+  score: number;
+  message: string;
+  preset: string;
+  passed_samples: number;
+  total_samples: number;
+};
+
+type AsyncValidationAccumulator = {
+  passed: number;
+  no_audio: number;
+  infra_issues: number;
+  sum_overall: number;
+  sum_duration: number;
+  sum_health: number;
+  sum_asr: number;
+  sum_speaker: number;
+  sum_tone: number;
+  sum_speed: number;
+  speaker_samples: number;
+  tone_samples: number;
+  speed_samples: number;
+  first_failure_message: string | null;
+};
+
+type AsyncValidationChampion = {
+  epoch: number;
+  prefix: string;
+  score: number;
+  message: string;
+  preset_name: string;
+  preset_settings?: ValidationPreset["settings"];
+  passed_samples: number;
+  total_samples: number;
+};
+
+type AsyncValidationFailure = {
+  passed_samples: number;
+  score: number;
+  message: string;
+  preset_name: string;
+  total_samples: number;
+};
+
+type AsyncCheckpointValidationState = {
+  mode: "checkpoint_async";
+  run_id: string;
+  checkpoint_index: number;
+  checkpoint_epoch: number;
+  checkpoint_prefix: string;
+  preset_index: number;
+  text_index: number;
+  seed_index: number;
+  reference_audio_key: string | null;
+  reference_text: string;
+  evaluations: CheckpointEvaluation[];
+  preset_stats: AsyncValidationAccumulator;
+  checkpoint_best_passing: AsyncValidationChampion | null;
+  checkpoint_best_failure: AsyncValidationFailure | null;
+  champion: AsyncValidationChampion | null;
+};
+
+type Async06bValidationState = {
+  mode: "fast_06b_async";
+  run_id: string;
+  checkpoint_index: number;
+  checkpoint_epoch: number;
+  checkpoint_prefix: string;
+  preset_name: string;
+  validation_text: string;
+  seed: number;
+  reference_audio_key: string | null;
+  reference_text: string;
+  evaluations: CheckpointEvaluation[];
+};
+
+type ValidationPlan = {
+  is06b: boolean;
+  presets: ValidationPreset[];
+  validationTexts: string[];
+  validationSeedOffsets: readonly number[];
+  totalSamples: number;
+  minOverall: number;
+  minPassRate: number;
+  minAsrScore: number;
+  maxCheckpointsToEval: number;
+  prioritizeLatestPassingCheckpoint: boolean;
+};
+
+type ValidationSampleOutcome = {
+  passed: boolean;
+  noAudio: boolean;
+  infraIssue: boolean;
+  overall: number | null;
+  duration: number | null;
+  health: number | null;
+  asr: number | null;
+  speaker: number | null;
+  tone: number | null;
+  speed: number | null;
+  failureMessage: string | null;
+};
+
 const ACTIVE_JOB_STATUSES = new Set([
   "pending",
   "running",
@@ -78,17 +192,95 @@ const parseRunNameFromCheckpointPrefix = (prefix: string): string | null => {
   return parts[2] || null;
 };
 
+const isMissingRunpodRequestError = (error: unknown): error is Error => {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  return (
+    error.message.includes("RunPod status request failed (404)") &&
+    error.message.includes("request does not exist")
+  );
+};
+
+const getServerlessStatusOrSyntheticFailure = async (
+  env: AppContext["Bindings"],
+  endpointId: string,
+  runId: string
+): Promise<Record<string, unknown>> => {
+  try {
+    return await getServerlessStatus(env, endpointId, runId);
+  } catch (error) {
+    if (!isMissingRunpodRequestError(error)) {
+      throw error;
+    }
+    return {
+      status: "FAILED",
+      error: error.message,
+    };
+  }
+};
+
+const shouldPreserveCurrentReadyVoice = (
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>
+): boolean =>
+  voice.status === "ready" &&
+  typeof voice.checkpoint_r2_prefix === "string" &&
+  voice.checkpoint_r2_prefix.trim().length > 0;
+
+const shouldKeepReadyVoiceOnValidationFailure = (
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>,
+  summary: Record<string, unknown>
+): boolean => shouldPreserveCurrentReadyVoice(voice);
+
 type PodStatusDetail = NonNullable<Awaited<ReturnType<typeof getPodStatus>>>;
 
-const VALIDATION_SEEDS_OFFSET = [123456, 223456] as const;
+const FULL_VALIDATION_SEEDS_OFFSET = [123456, 223456] as const;
+const FAST_VALIDATION_SEEDS_OFFSET = [123456] as const;
 const MAX_CHECKPOINTS_TO_EVAL = 4;
+const MAX_CHECKPOINTS_TO_EVAL_06B = 4;
 const VALIDATION_RETRY_ATTEMPTS = 3;
 const MIN_PASS_RATE_06B = 5 / 6;
 const MIN_PASS_RATE_17B = 5 / 6;
 const PROVISIONING_STALE_MS = 4 * 60 * 1000;
+
+const getRecommendedTrainingDefaults = (modelSize: string): {
+  batch_size: number;
+  learning_rate: number;
+  num_epochs: number;
+  gradient_accumulation_steps: number;
+  subtalker_loss_weight: number;
+  save_every_n_epochs: number;
+  seed: number;
+  gpu_type_id: string;
+} => {
+  if (modelSize.includes("0.6")) {
+    return {
+      batch_size: 2,
+      learning_rate: 4e-6,
+      num_epochs: 7,
+      gradient_accumulation_steps: 4,
+      subtalker_loss_weight: 0.3,
+      save_every_n_epochs: 1,
+      seed: 77,
+      gpu_type_id: "NVIDIA A100-SXM4-80GB",
+    };
+  }
+
+  return {
+    batch_size: 2,
+    learning_rate: 2e-5,
+    num_epochs: 15,
+    gradient_accumulation_steps: 4,
+    subtalker_loss_weight: 0.3,
+    save_every_n_epochs: 5,
+    seed: 42,
+    gpu_type_id: "NVIDIA A100-SXM4-80GB",
+  };
+};
 const MAX_PROVISIONING_RECOVERY_ATTEMPTS = 2;
 
 const OVERALL_SCORE_ERROR_RE = /overall_score=([0-9.]+)/i;
+const VALIDATION_ASR_ERROR_KEY = "openai_asr_error";
 
 const getWorkerOrigin = (c: Context<AppContext>): string => new URL(c.req.url).origin;
 const GHCR_INDEX_ACCEPT =
@@ -214,6 +406,11 @@ const getConfiguredTrainingVolumeMountPath = (c: Context<AppContext>): string | 
   return volumeMountPath ? volumeMountPath : null;
 };
 
+const getConfiguredTrainingTemplateId = (c: Context<AppContext>): string | null => {
+  const templateId = c.env.RUNPOD_TRAINING_TEMPLATE_ID?.trim();
+  return templateId ? templateId : null;
+};
+
 const createTrainingPodForJob = async (
   c: Context<AppContext>,
   job: TrainingJob
@@ -221,6 +418,23 @@ const createTrainingPodForJob = async (
   pod: { podId: string; desiredStatus: string };
   summary: Record<string, unknown>;
 }> => {
+  const templateId = getConfiguredTrainingTemplateId(c);
+  if (templateId) {
+    const pod = await createPod(
+      c.env,
+      templateId,
+      getTrainingGpuType(job),
+      buildTrainingPodEnv(c, job)
+    );
+    return {
+      pod,
+      summary: {
+        training_launch_mode: "template",
+        training_template_id: templateId,
+      },
+    };
+  }
+
   const imageName = getConfiguredTrainingImageName(c);
   if (imageName) {
     const dockerArgs = getConfiguredTrainingDockerArgs(c);
@@ -245,19 +459,7 @@ const createTrainingPodForJob = async (
     };
   }
 
-  const pod = await createPod(
-    c.env,
-    c.env.RUNPOD_TRAINING_TEMPLATE_ID,
-    getTrainingGpuType(job),
-    buildTrainingPodEnv(c, job)
-  );
-  return {
-    pod,
-    summary: {
-      training_launch_mode: "template",
-      training_template_id: c.env.RUNPOD_TRAINING_TEMPLATE_ID,
-    },
-  };
+  throw new Error("No training template or direct image configured");
 };
 
 const getDirectFallbackDockerArgs = (
@@ -366,9 +568,10 @@ const recoverStalledProvisioningJob = async (
     return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
   }
 
+  const templateId = getConfiguredTrainingTemplateId(c);
   const hasTriedDirectFallback = summary.provisioning_direct_fallback_attempted === true;
   const hasTriedDigestFallback = summary.provisioning_digest_fallback_attempted === true;
-  if (podStatus.imageName) {
+  if (!templateId && podStatus.imageName) {
     let template: Awaited<ReturnType<typeof getTemplateById>> = null;
     try {
       if (podStatus.templateId) {
@@ -463,12 +666,25 @@ const recoverStalledProvisioningJob = async (
     return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
   }
 
+  if (!templateId) {
+    await updateTrainingJob(c.env.DB, job.job_id, {
+      status: "failed",
+      error_message: `${reason}. No training template configured for recovery.`,
+      completed_at: Date.now(),
+      summary: {
+        ...nextSummary,
+        provisioning_recovery_failed: true,
+      },
+    });
+    return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
+  }
+
   await terminatePod(c.env, job.runpod_pod_id).catch(() => false);
 
   try {
     const newPod = await createPod(
       c.env,
-      c.env.RUNPOD_TRAINING_TEMPLATE_ID,
+      templateId,
       getTrainingGpuType(job),
       buildTrainingPodEnv(c, job)
     );
@@ -503,7 +719,7 @@ const parseOverallFromError = (message: string): number | null => {
   return Number.isFinite(v) ? v : null;
 };
 
-const getValidationTexts = (lang: string): string[] => {
+const getValidationTexts = (lang: string, is06b: boolean): string[] => {
   const validationTextsByLang: Record<string, string[]> = {
     ko: [
       "안녕하세요.",
@@ -527,15 +743,28 @@ const getValidationTexts = (lang: string): string[] => {
     ],
   };
 
-  return validationTextsByLang[lang] ?? [
+  const fallback = validationTextsByLang[lang] ?? [
     "Hello.",
     "Hello. The meeting starts at two o'clock this afternoon.",
     "Hello. The meeting starts at two o'clock this afternoon, and I will share the presentation materials via email.",
   ];
+  if (!is06b) {
+    return fallback;
+  }
+  if (fallback.length >= 2) {
+    return [fallback[1]];
+  }
+  return fallback.slice(0, 1);
 };
 
 const getValidationPresets = (modelId: string): ValidationPreset[] => {
   const is06b = modelId.toLowerCase().includes("0.6b");
+  const balancedSettings = {
+    stability: 0.85,
+    similarity_boost: 0.85,
+    style: 0.05,
+    speed: 1.0,
+  };
   const conservativeSettings = {
     stability: 0.9,
     similarity_boost: 0.9,
@@ -545,7 +774,11 @@ const getValidationPresets = (modelId: string): ValidationPreset[] => {
 
   if (!is06b) {
     return [
-      { name: "default", payload: {} },
+      {
+        name: "balanced",
+        payload: { voice_settings: balancedSettings },
+        settings: balancedSettings,
+      },
       {
         name: "high_similarity",
         payload: { voice_settings: conservativeSettings },
@@ -555,18 +788,1381 @@ const getValidationPresets = (modelId: string): ValidationPreset[] => {
   }
 
   return [
-    { name: "default", payload: {} },
     {
-      name: "conservative",
+      name: "balanced",
+      payload: { voice_settings: balancedSettings },
+      settings: balancedSettings,
+    },
+    {
+      name: "high_similarity",
       payload: { voice_settings: conservativeSettings },
       settings: conservativeSettings,
     },
   ];
 };
 
+const getValidationPlan = (
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>,
+  job: TrainingJob
+): ValidationPlan => {
+  const modelId = voice.model_id ?? "qwen3-tts-1.7b";
+  const is06b = modelId.toLowerCase().includes("0.6b");
+  const jobConfig = job.config as Record<string, unknown>;
+  const lang =
+    typeof jobConfig.whisper_language === "string" ? jobConfig.whisper_language.toLowerCase() : "";
+  const validationTexts = getValidationTexts(lang, is06b);
+  const validationSeedOffsets = is06b ? FAST_VALIDATION_SEEDS_OFFSET : FULL_VALIDATION_SEEDS_OFFSET;
+  return {
+    is06b,
+    presets: getValidationPresets(modelId),
+    validationTexts,
+    validationSeedOffsets,
+    totalSamples: validationTexts.length * validationSeedOffsets.length,
+    minOverall: is06b ? 0.9 : 0.85,
+    minPassRate: is06b ? MIN_PASS_RATE_06B : MIN_PASS_RATE_17B,
+    minAsrScore: 0.8,
+    maxCheckpointsToEval: is06b ? MAX_CHECKPOINTS_TO_EVAL_06B : MAX_CHECKPOINTS_TO_EVAL,
+    prioritizeLatestPassingCheckpoint: is06b,
+  };
+};
+
 const serializeTrainingJob = (job: TrainingJob): Omit<TrainingJob, "job_token"> => {
   const { job_token: _jobToken, ...safeJob } = job;
   return safeJob;
+};
+
+const normalizeCheckpointEvaluation = (value: unknown): CheckpointEvaluation | null => {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const v = value as Record<string, unknown>;
+  if (
+    typeof v.epoch !== "number" ||
+    typeof v.prefix !== "string" ||
+    typeof v.ok !== "boolean" ||
+    typeof v.score !== "number" ||
+    typeof v.message !== "string" ||
+    typeof v.preset !== "string" ||
+    typeof v.passed_samples !== "number" ||
+    typeof v.total_samples !== "number"
+  ) {
+    return null;
+  }
+  return {
+    epoch: v.epoch,
+    prefix: v.prefix,
+    ok: v.ok,
+    score: v.score,
+    message: v.message,
+    preset: v.preset,
+    passed_samples: v.passed_samples,
+    total_samples: v.total_samples,
+  };
+};
+
+const normalizePresetSettings = (value: unknown): ValidationPreset["settings"] | undefined => {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const settings = value as Record<string, unknown>;
+  const stability = Number(settings.stability);
+  const similarityBoost = Number(settings.similarity_boost);
+  const style = Number(settings.style);
+  const speed = Number(settings.speed);
+  if (
+    !Number.isFinite(stability) ||
+    !Number.isFinite(similarityBoost) ||
+    !Number.isFinite(style) ||
+    !Number.isFinite(speed)
+  ) {
+    return undefined;
+  }
+  return {
+    stability,
+    similarity_boost: similarityBoost,
+    style,
+    speed,
+  };
+};
+
+const createValidationAccumulator = (): AsyncValidationAccumulator => ({
+  passed: 0,
+  no_audio: 0,
+  infra_issues: 0,
+  sum_overall: 0,
+  sum_duration: 0,
+  sum_health: 0,
+  sum_asr: 0,
+  sum_speaker: 0,
+  sum_tone: 0,
+  sum_speed: 0,
+  speaker_samples: 0,
+  tone_samples: 0,
+  speed_samples: 0,
+  first_failure_message: null,
+});
+
+const normalizeValidationAccumulator = (value: unknown): AsyncValidationAccumulator => {
+  if (!value || typeof value !== "object") {
+    return createValidationAccumulator();
+  }
+  const src = value as Record<string, unknown>;
+  return {
+    passed: Number.isFinite(Number(src.passed)) ? Number(src.passed) : 0,
+    no_audio: Number.isFinite(Number(src.no_audio)) ? Number(src.no_audio) : 0,
+    infra_issues: Number.isFinite(Number(src.infra_issues)) ? Number(src.infra_issues) : 0,
+    sum_overall: Number.isFinite(Number(src.sum_overall)) ? Number(src.sum_overall) : 0,
+    sum_duration: Number.isFinite(Number(src.sum_duration)) ? Number(src.sum_duration) : 0,
+    sum_health: Number.isFinite(Number(src.sum_health)) ? Number(src.sum_health) : 0,
+    sum_asr: Number.isFinite(Number(src.sum_asr)) ? Number(src.sum_asr) : 0,
+    sum_speaker: Number.isFinite(Number(src.sum_speaker)) ? Number(src.sum_speaker) : 0,
+    sum_tone: Number.isFinite(Number(src.sum_tone)) ? Number(src.sum_tone) : 0,
+    sum_speed: Number.isFinite(Number(src.sum_speed)) ? Number(src.sum_speed) : 0,
+    speaker_samples: Number.isFinite(Number(src.speaker_samples)) ? Number(src.speaker_samples) : 0,
+    tone_samples: Number.isFinite(Number(src.tone_samples)) ? Number(src.tone_samples) : 0,
+    speed_samples: Number.isFinite(Number(src.speed_samples)) ? Number(src.speed_samples) : 0,
+    first_failure_message:
+      typeof src.first_failure_message === "string" ? src.first_failure_message : null,
+  };
+};
+
+const normalizeValidationChampion = (value: unknown): AsyncValidationChampion | null => {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const src = value as Record<string, unknown>;
+  if (
+    typeof src.epoch !== "number" ||
+    typeof src.prefix !== "string" ||
+    typeof src.score !== "number" ||
+    typeof src.message !== "string" ||
+    typeof src.preset_name !== "string" ||
+    typeof src.passed_samples !== "number" ||
+    typeof src.total_samples !== "number"
+  ) {
+    return null;
+  }
+  return {
+    epoch: src.epoch,
+    prefix: src.prefix,
+    score: src.score,
+    message: src.message,
+    preset_name: src.preset_name,
+    preset_settings: normalizePresetSettings(src.preset_settings),
+    passed_samples: src.passed_samples,
+    total_samples: src.total_samples,
+  };
+};
+
+const normalizeValidationFailure = (value: unknown): AsyncValidationFailure | null => {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const src = value as Record<string, unknown>;
+  if (
+    typeof src.passed_samples !== "number" ||
+    typeof src.score !== "number" ||
+    typeof src.message !== "string" ||
+    typeof src.preset_name !== "string" ||
+    typeof src.total_samples !== "number"
+  ) {
+    return null;
+  }
+  return {
+    passed_samples: src.passed_samples,
+    score: src.score,
+    message: src.message,
+    preset_name: src.preset_name,
+    total_samples: src.total_samples,
+  };
+};
+
+const loadValidationReference = async (
+  c: Context<AppContext>,
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>,
+  job: TrainingJob
+): Promise<{ referenceAudioKey: string | null; referenceText: string }> => {
+  const datasetPrefix = String(job.dataset_r2_prefix ?? "").replace(/\/+$/, "");
+  let referenceAudioKey = voice.ref_audio_r2_key ?? (datasetPrefix ? `${datasetPrefix}/ref_audio.wav` : null);
+  let referenceText = "";
+
+  if (datasetPrefix) {
+    try {
+      const profileObj = await c.env.R2.get(`${datasetPrefix}/reference_profile.json`);
+      if (profileObj) {
+        const profile = (await profileObj.json()) as Record<string, unknown>;
+        if (typeof profile.reference_audio_key === "string" && profile.reference_audio_key.trim()) {
+          referenceAudioKey = profile.reference_audio_key.trim();
+        }
+        if (typeof profile.reference_text === "string") {
+          referenceText = profile.reference_text.trim();
+        }
+      }
+    } catch {
+      // Best-effort only. Validation can still proceed with ASR-only scoring.
+    }
+  }
+
+  return { referenceAudioKey, referenceText };
+};
+
+const buildValidationPayload = ({
+  voice,
+  checkpointPrefix,
+  preset,
+  validationText,
+  seed,
+  referenceAudioKey,
+  referenceText,
+}: {
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>;
+  checkpointPrefix: string;
+  preset: ValidationPreset;
+  validationText: string;
+  seed: number;
+  referenceAudioKey: string | null;
+  referenceText: string;
+}): Record<string, unknown> => ({
+  text: validationText,
+  voice_id: voice.voice_id,
+  speaker_name: voice.speaker_name,
+  model_id: voice.model_id ?? "qwen3-tts-1.7b",
+  language: "auto",
+  seed,
+  quality_review: {
+    enable_asr: false,
+    enable_speaker: Boolean(referenceAudioKey),
+    enable_style: Boolean(referenceAudioKey),
+    enable_speed: Boolean(referenceAudioKey && referenceText),
+    allow_below_threshold: true,
+    reference_audio_key: referenceAudioKey,
+    reference_text: referenceText,
+  },
+  checkpoint_info: {
+    r2_prefix: checkpointPrefix,
+    type: "full",
+  },
+  ...preset.payload,
+});
+
+const getValidationLanguageHint = (
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>,
+  job: TrainingJob
+): string => {
+  const jobConfig = job.config as Record<string, unknown>;
+  if (typeof jobConfig.whisper_language === "string" && jobConfig.whisper_language.trim()) {
+    return jobConfig.whisper_language.trim();
+  }
+  if (voice.labels && typeof voice.labels.language === "string" && voice.labels.language.trim()) {
+    return voice.labels.language.trim();
+  }
+  return "auto";
+};
+
+const annotateAsrFailure = (
+  output: { quality?: Record<string, unknown>; audio?: string; error?: unknown } | null,
+  error: unknown
+): { quality?: Record<string, unknown>; audio?: string; error?: unknown } | null => {
+  if (!output) {
+    return output;
+  }
+  const detail = error instanceof Error ? error.message : "OpenAI ASR enrichment failed";
+  return {
+    ...output,
+    quality: {
+      ...(output.quality ?? {}),
+      [VALIDATION_ASR_ERROR_KEY]: detail,
+    },
+  };
+};
+
+const getMissingAsrMessage = (
+  quality: Record<string, unknown>,
+  sampleIndex: number,
+  seed: number
+): string => {
+  const detail = typeof quality[VALIDATION_ASR_ERROR_KEY] === "string" ? quality[VALIDATION_ASR_ERROR_KEY] : null;
+  return detail
+    ? `sample ${sampleIndex} seed ${seed} missing asr_score (${detail})`
+    : `sample ${sampleIndex} seed ${seed} missing asr_score`;
+};
+
+const evaluateValidationSample = ({
+  output,
+  fallbackError,
+  sampleIndex,
+  seed,
+  referenceAudioKey,
+  referenceText,
+  minOverall,
+  minAsrScore,
+}: {
+  output: { quality?: Record<string, unknown>; audio?: string; error?: unknown } | null;
+  fallbackError?: string | null;
+  sampleIndex: number;
+  seed: number;
+  referenceAudioKey: string | null;
+  referenceText: string;
+  minOverall: number;
+  minAsrScore: number;
+}): ValidationSampleOutcome => {
+  if (!output?.audio) {
+    const lastErrorDetail =
+      typeof output?.error === "string"
+        ? output.error
+        : fallbackError && fallbackError.trim()
+          ? fallbackError
+          : "status=unknown no-audio";
+    const parsedOverall = parseOverallFromError(lastErrorDetail);
+    const failureMessage =
+      parsedOverall !== null
+        ? `sample ${sampleIndex} seed ${seed} no audio overall_score=${parsedOverall.toFixed(3)}`
+        : `sample ${sampleIndex} seed ${seed} no audio (${lastErrorDetail})`;
+    return {
+      passed: false,
+      noAudio: true,
+      infraIssue: false,
+      overall: null,
+      duration: null,
+      health: null,
+      asr: null,
+      speaker: null,
+      tone: null,
+      speed: null,
+      failureMessage,
+    };
+  }
+
+  const quality = output.quality ?? {};
+  const overall = Number(quality.overall_score ?? NaN);
+  const duration = Number(quality.duration_score ?? NaN);
+  const health = Number(quality.health_score ?? NaN);
+  const asr = Number(quality.asr_score ?? quality.asr_similarity ?? NaN);
+  const speaker = Number(quality.speaker_score ?? NaN);
+  const tone = Number(quality.tone_score ?? NaN);
+  const speed = Number(quality.speed_score ?? NaN);
+
+  const fail = (failureMessage: string, infraIssue = false): ValidationSampleOutcome => ({
+    passed: false,
+    noAudio: false,
+    infraIssue,
+    overall: Number.isFinite(overall) ? overall : null,
+    duration: Number.isFinite(duration) ? duration : null,
+    health: Number.isFinite(health) ? health : null,
+    asr: Number.isFinite(asr) ? asr : null,
+    speaker: Number.isFinite(speaker) ? speaker : null,
+    tone: Number.isFinite(tone) ? tone : null,
+    speed: Number.isFinite(speed) ? speed : null,
+    failureMessage,
+  });
+
+  if (!Number.isFinite(overall) || !Number.isFinite(duration) || !Number.isFinite(health)) {
+    return fail(`sample ${sampleIndex} seed ${seed} invalid quality metrics`, true);
+  }
+  if (!Number.isFinite(asr)) {
+    return fail(getMissingAsrMessage(quality, sampleIndex, seed), true);
+  }
+  if (overall < minOverall) {
+    return fail(`sample ${sampleIndex} seed ${seed} overall_score=${overall.toFixed(3)}`);
+  }
+  if (duration < 0.45) {
+    return fail(`sample ${sampleIndex} seed ${seed} duration_score=${duration.toFixed(3)}`);
+  }
+  if (health < 0.72) {
+    return fail(`sample ${sampleIndex} seed ${seed} health_score=${health.toFixed(3)}`);
+  }
+  if (asr < minAsrScore) {
+    return fail(`sample ${sampleIndex} seed ${seed} asr_score=${asr.toFixed(3)}`);
+  }
+  if (referenceAudioKey && Number.isFinite(speaker) && speaker < 0.75) {
+    return fail(`sample ${sampleIndex} seed ${seed} speaker_score=${speaker.toFixed(3)}`);
+  }
+  if (referenceAudioKey && Number.isFinite(tone) && tone < 0.45) {
+    return fail(`sample ${sampleIndex} seed ${seed} tone_score=${tone.toFixed(3)}`);
+  }
+  if (referenceAudioKey && referenceText && Number.isFinite(speed) && speed < 0.55) {
+    return fail(`sample ${sampleIndex} seed ${seed} speed_score=${speed.toFixed(3)}`);
+  }
+
+  return {
+    passed: true,
+    noAudio: false,
+    infraIssue: false,
+    overall,
+    duration,
+    health,
+    asr,
+    speaker: Number.isFinite(speaker) ? speaker : null,
+    tone: Number.isFinite(tone) ? tone : null,
+    speed: Number.isFinite(speed) ? speed : null,
+    failureMessage: null,
+  };
+};
+
+const applyValidationSampleOutcome = (
+  accumulator: AsyncValidationAccumulator,
+  outcome: ValidationSampleOutcome
+): AsyncValidationAccumulator => {
+  const next: AsyncValidationAccumulator = { ...accumulator };
+  if (outcome.noAudio) {
+    next.no_audio += 1;
+  }
+  if (outcome.infraIssue) {
+    next.infra_issues += 1;
+  }
+  if (!next.first_failure_message && outcome.failureMessage) {
+    next.first_failure_message = outcome.failureMessage;
+  }
+  if (!outcome.passed) {
+    return next;
+  }
+
+  next.passed += 1;
+  next.sum_overall += outcome.overall ?? 0;
+  next.sum_duration += outcome.duration ?? 0;
+  next.sum_health += outcome.health ?? 0;
+  next.sum_asr += outcome.asr ?? 0;
+  if (typeof outcome.speaker === "number") {
+    next.sum_speaker += outcome.speaker;
+    next.speaker_samples += 1;
+  }
+  if (typeof outcome.tone === "number") {
+    next.sum_tone += outcome.tone;
+    next.tone_samples += 1;
+  }
+  if (typeof outcome.speed === "number") {
+    next.sum_speed += outcome.speed;
+    next.speed_samples += 1;
+  }
+  return next;
+};
+
+const finalizeValidationPresetResult = ({
+  accumulator,
+  preset,
+  totalSamples,
+  minPassRate,
+}: {
+  accumulator: AsyncValidationAccumulator;
+  preset: ValidationPreset;
+  totalSamples: number;
+  minPassRate: number;
+}): CheckpointValidationResult => {
+  const passRate = totalSamples > 0 ? accumulator.passed / totalSamples : 0;
+  if (accumulator.passed > 0 && passRate >= minPassRate && accumulator.infra_issues === 0) {
+    const n = Math.max(1, accumulator.passed);
+    const meanOverall = accumulator.sum_overall / n;
+    const meanDuration = accumulator.sum_duration / n;
+    const meanHealth = accumulator.sum_health / n;
+    const meanAsr = accumulator.sum_asr / n;
+    const meanSpeaker =
+      accumulator.speaker_samples > 0 ? accumulator.sum_speaker / accumulator.speaker_samples : NaN;
+    const meanTone = accumulator.tone_samples > 0 ? accumulator.sum_tone / accumulator.tone_samples : NaN;
+    const meanSpeed = accumulator.speed_samples > 0 ? accumulator.sum_speed / accumulator.speed_samples : NaN;
+    const scoreParts: Array<{ value: number; weight: number }> = [
+      { value: meanOverall, weight: 0.38 },
+      { value: meanAsr, weight: 0.22 },
+      { value: meanHealth, weight: 0.14 },
+      { value: meanDuration, weight: 0.08 },
+      { value: passRate, weight: 0.08 },
+    ];
+    if (Number.isFinite(meanSpeaker)) {
+      scoreParts.push({ value: meanSpeaker, weight: 0.20 });
+    }
+    if (Number.isFinite(meanTone)) {
+      scoreParts.push({ value: meanTone, weight: 0.06 });
+    }
+    if (Number.isFinite(meanSpeed)) {
+      scoreParts.push({ value: meanSpeed, weight: 0.06 });
+    }
+    const totalWeight = scoreParts.reduce((acc, part) => acc + part.weight, 0) || 1;
+    const score =
+      scoreParts.reduce((acc, part) => acc + (part.value * part.weight), 0) / totalWeight;
+    const similarityNote =
+      Number.isFinite(meanSpeaker) && Number.isFinite(meanTone)
+        ? `speaker=${meanSpeaker.toFixed(3)} tone=${meanTone.toFixed(3)} `
+        : "";
+    const speedNote = Number.isFinite(meanSpeed) ? `speed=${meanSpeed.toFixed(3)} ` : "";
+    return {
+      ok: true,
+      message:
+        `preset=${preset.name} ` +
+        `score=${score.toFixed(3)} overall=${meanOverall.toFixed(3)} ` +
+        `asr=${meanAsr.toFixed(3)} ` +
+        similarityNote +
+        speedNote +
+        `health=${meanHealth.toFixed(3)} duration=${meanDuration.toFixed(3)} ` +
+        `samples=${accumulator.passed}/${totalSamples} no_audio=${accumulator.no_audio}`,
+      aggregateScore: score,
+      presetName: preset.name,
+      presetSettings: preset.settings,
+      passedSamples: accumulator.passed,
+      totalSamples,
+    };
+  }
+
+  return {
+    ok: false,
+    message:
+      `All presets failed: ` +
+      `preset=${preset.name} ` +
+      (accumulator.first_failure_message ??
+        `samples=${accumulator.passed}/${totalSamples} ` +
+          `pass_rate=${passRate.toFixed(3)} ` +
+          `no_audio=${accumulator.no_audio} infra=${accumulator.infra_issues}`),
+    aggregateScore: 0,
+    presetName: preset.name,
+    passedSamples: accumulator.passed,
+    totalSamples,
+  };
+};
+
+const scoreSingleValidationOutput = ({
+  preset,
+  seed,
+  output,
+  fallbackError,
+  referenceAudioKey,
+  referenceText,
+  is06b,
+}: {
+  preset: ValidationPreset;
+  seed: number;
+  output: { quality?: Record<string, unknown>; audio?: string; error?: unknown } | null;
+  fallbackError?: string | null;
+  referenceAudioKey: string | null;
+  referenceText: string;
+  is06b: boolean;
+}): CheckpointValidationResult => {
+  const minOverall = is06b ? 0.9 : 0.85;
+  const minAsrScore = 0.8;
+  const totalSamples = 1;
+
+  if (!output?.audio) {
+    const lastErrorDetail =
+      typeof output?.error === "string"
+        ? output.error
+        : fallbackError && fallbackError.trim()
+          ? fallbackError
+          : "status=unknown no-audio";
+    const parsedOverall = parseOverallFromError(lastErrorDetail);
+    const failureSummary =
+      parsedOverall !== null
+        ? `sample 1 seed ${seed} no audio overall_score=${parsedOverall.toFixed(3)}`
+        : `sample 1 seed ${seed} no audio (${lastErrorDetail})`;
+    return {
+      ok: false,
+      message: `All presets failed: preset=${preset.name} ${failureSummary}`,
+      aggregateScore: 0,
+      presetName: preset.name,
+      passedSamples: 0,
+      totalSamples,
+    };
+  }
+
+  const quality = output.quality ?? {};
+  const overall = Number(quality.overall_score ?? NaN);
+  const duration = Number(quality.duration_score ?? NaN);
+  const health = Number(quality.health_score ?? NaN);
+  const asr = Number(quality.asr_score ?? quality.asr_similarity ?? NaN);
+  const speaker = Number(quality.speaker_score ?? NaN);
+  const tone = Number(quality.tone_score ?? NaN);
+  const speed = Number(quality.speed_score ?? NaN);
+
+  const fail = (detail: string): CheckpointValidationResult => ({
+    ok: false,
+    message: `All presets failed: preset=${preset.name} ${detail}`,
+    aggregateScore: 0,
+    presetName: preset.name,
+    passedSamples: 0,
+    totalSamples,
+  });
+
+  if (!Number.isFinite(overall) || !Number.isFinite(duration) || !Number.isFinite(health)) {
+    return fail("sample 1 seed " + seed + " invalid quality metrics");
+  }
+  if (!Number.isFinite(asr)) {
+    return fail(getMissingAsrMessage(quality, 1, seed));
+  }
+  if (overall < minOverall) {
+    return fail(`sample 1 seed ${seed} overall_score=${overall.toFixed(3)}`);
+  }
+  if (duration < 0.45) {
+    return fail(`sample 1 seed ${seed} duration_score=${duration.toFixed(3)}`);
+  }
+  if (health < 0.72) {
+    return fail(`sample 1 seed ${seed} health_score=${health.toFixed(3)}`);
+  }
+  if (asr < minAsrScore) {
+    return fail(`sample 1 seed ${seed} asr_score=${asr.toFixed(3)}`);
+  }
+  if (referenceAudioKey && Number.isFinite(speaker) && speaker < 0.75) {
+    return fail(`sample 1 seed ${seed} speaker_score=${speaker.toFixed(3)}`);
+  }
+  if (referenceAudioKey && Number.isFinite(tone) && tone < 0.45) {
+    return fail(`sample 1 seed ${seed} tone_score=${tone.toFixed(3)}`);
+  }
+  if (referenceAudioKey && referenceText && Number.isFinite(speed) && speed < 0.55) {
+    return fail(`sample 1 seed ${seed} speed_score=${speed.toFixed(3)}`);
+  }
+
+  const scoreParts: Array<{ value: number; weight: number }> = [
+    { value: overall, weight: 0.38 },
+    { value: asr, weight: 0.22 },
+    { value: health, weight: 0.14 },
+    { value: duration, weight: 0.08 },
+    { value: 1, weight: 0.08 },
+  ];
+  if (Number.isFinite(speaker)) {
+    scoreParts.push({ value: speaker, weight: 0.20 });
+  }
+  if (Number.isFinite(tone)) {
+    scoreParts.push({ value: tone, weight: 0.06 });
+  }
+  if (Number.isFinite(speed)) {
+    scoreParts.push({ value: speed, weight: 0.06 });
+  }
+  const totalWeight = scoreParts.reduce((acc, part) => acc + part.weight, 0) || 1;
+  const score = scoreParts.reduce((acc, part) => acc + (part.value * part.weight), 0) / totalWeight;
+  const similarityNote = Number.isFinite(speaker) && Number.isFinite(tone)
+    ? `speaker=${speaker.toFixed(3)} tone=${tone.toFixed(3)} `
+    : "";
+  const speedNote = Number.isFinite(speed)
+    ? `speed=${speed.toFixed(3)} `
+    : "";
+  return {
+    ok: true,
+    message:
+      `preset=${preset.name} ` +
+      `score=${score.toFixed(3)} overall=${overall.toFixed(3)} ` +
+      `asr=${asr.toFixed(3)} ` +
+      similarityNote +
+      speedNote +
+      `health=${health.toFixed(3)} duration=${duration.toFixed(3)} ` +
+      "samples=1/1 no_audio=0",
+    aggregateScore: score,
+    presetName: preset.name,
+    presetSettings: preset.settings,
+    passedSamples: 1,
+    totalSamples,
+  };
+};
+
+const advanceAsyncCheckpointValidation = async (
+  c: Context<AppContext>,
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>,
+  job: TrainingJob,
+  progress: TrainingProgress,
+  currentSummary: Record<string, unknown>,
+  candidateCheckpoints: CheckpointCandidate[]
+): Promise<{ status: string; progress: TrainingProgress }> => {
+  const plan = getValidationPlan(voice, job);
+  if (plan.presets.length === 0 || plan.validationTexts.length === 0 || plan.totalSamples === 0) {
+    return {
+      status: "completed",
+      progress,
+    };
+  }
+
+  const persistedState =
+    currentSummary.async_validation && typeof currentSummary.async_validation === "object"
+      ? (currentSummary.async_validation as Record<string, unknown>)
+      : null;
+  const existingEvaluations = Array.isArray(persistedState?.evaluations)
+    ? persistedState.evaluations
+        .map(normalizeCheckpointEvaluation)
+        .filter((value): value is CheckpointEvaluation => value !== null)
+    : [];
+  const persistedReferenceAudioKey =
+    typeof persistedState?.reference_audio_key === "string" || persistedState?.reference_audio_key === null
+      ? (persistedState.reference_audio_key as string | null)
+      : null;
+  const persistedReferenceText =
+    typeof persistedState?.reference_text === "string" ? persistedState.reference_text : "";
+  const initialReference =
+    persistedReferenceAudioKey !== null || persistedReferenceText
+      ? {
+          referenceAudioKey: persistedReferenceAudioKey,
+          referenceText: persistedReferenceText,
+        }
+      : null;
+
+  const ensureReference = async () => initialReference ?? loadValidationReference(c, voice, job);
+
+  const completeSuccessfulValidation = async (
+    champion: AsyncValidationChampion,
+    evaluations: CheckpointEvaluation[]
+  ): Promise<{ status: string; progress: TrainingProgress }> => {
+    await updateVoice(c.env.DB, job.voice_id, {
+      status: "ready",
+      checkpoint_r2_prefix: champion.prefix,
+      run_name: parseRunNameFromCheckpointPrefix(champion.prefix),
+      epoch: champion.epoch,
+      settings: champion.preset_settings,
+    });
+    await updateTrainingJob(c.env.DB, job.job_id, {
+      status: "completed",
+      completed_at: job.completed_at ?? Date.now(),
+      progress,
+      summary: {
+        ...currentSummary,
+        validation_in_progress: false,
+        validation_checked: true,
+        validation_passed: true,
+        validation_message: champion.message,
+        selected_checkpoint_prefix: champion.prefix,
+        selected_checkpoint_epoch: champion.epoch,
+        selected_preset: champion.preset_name,
+        selected_score: champion.score,
+        evaluated_checkpoints: evaluations,
+        async_validation: null,
+      },
+    });
+    return { status: "completed", progress };
+  };
+
+  const completeFailedValidation = async (
+    message: string,
+    evaluations: CheckpointEvaluation[]
+  ): Promise<{ status: string; progress: TrainingProgress }> => {
+    if (!shouldKeepReadyVoiceOnValidationFailure(voice, currentSummary)) {
+      await updateVoice(c.env.DB, job.voice_id, {
+        status: "created",
+        checkpoint_r2_prefix: null,
+        run_name: null,
+        epoch: null,
+      });
+    }
+
+    await updateTrainingJob(c.env.DB, job.job_id, {
+      status: "failed",
+      error_message: message,
+      completed_at: job.completed_at ?? Date.now(),
+      progress,
+      summary: {
+        ...currentSummary,
+        force_revalidation: false,
+        validation_in_progress: false,
+        validation_checked: true,
+        validation_passed: false,
+        validation_failed: true,
+        validation_message: message,
+        evaluated_checkpoints: evaluations,
+        async_validation: null,
+      },
+    });
+    return { status: "failed", progress };
+  };
+
+  const startValidationSample = async ({
+    checkpointIndex,
+    presetIndex,
+    textIndex,
+    seedIndex,
+    evaluations,
+    presetStats,
+    checkpointBestPassing,
+    checkpointBestFailure,
+    champion,
+  }: {
+    checkpointIndex: number;
+    presetIndex: number;
+    textIndex: number;
+    seedIndex: number;
+    evaluations: CheckpointEvaluation[];
+    presetStats: AsyncValidationAccumulator;
+    checkpointBestPassing: AsyncValidationChampion | null;
+    checkpointBestFailure: AsyncValidationFailure | null;
+    champion: AsyncValidationChampion | null;
+  }): Promise<{ status: string; progress: TrainingProgress }> => {
+    const checkpoint = candidateCheckpoints[checkpointIndex];
+    if (!checkpoint) {
+      if (champion) {
+        return completeSuccessfulValidation(champion, evaluations);
+      }
+      return completeFailedValidation("No remaining checkpoints to validate", evaluations);
+    }
+
+    const preset = plan.presets[presetIndex];
+    const validationText = plan.validationTexts[textIndex];
+    const seedOffset = plan.validationSeedOffsets[seedIndex];
+    if (!preset || !validationText || typeof seedOffset !== "number") {
+      return completeFailedValidation("Validation plan is invalid", evaluations);
+    }
+
+    const seed = seedOffset + textIndex;
+    const reference = await ensureReference();
+    const payload = buildValidationPayload({
+      voice,
+      checkpointPrefix: checkpoint.r2_prefix,
+      preset,
+      validationText,
+      seed,
+      referenceAudioKey: reference.referenceAudioKey,
+      referenceText: reference.referenceText,
+    });
+    const runpodResponse = await invokeServerlessAsync(c.env, c.env.RUNPOD_ENDPOINT_ID, payload);
+    const sampleOrdinal = textIndex * plan.validationSeedOffsets.length + seedIndex + 1;
+    const nextState: AsyncCheckpointValidationState = {
+      mode: "checkpoint_async",
+      run_id: String(runpodResponse.id ?? ""),
+      checkpoint_index: checkpointIndex,
+      checkpoint_epoch: checkpoint.epoch,
+      checkpoint_prefix: checkpoint.r2_prefix,
+      preset_index: presetIndex,
+      text_index: textIndex,
+      seed_index: seedIndex,
+      reference_audio_key: reference.referenceAudioKey,
+      reference_text: reference.referenceText,
+      evaluations,
+      preset_stats: presetStats,
+      checkpoint_best_passing: checkpointBestPassing,
+      checkpoint_best_failure: checkpointBestFailure,
+      champion,
+    };
+    await updateTrainingJob(c.env.DB, job.job_id, {
+      status: "completed",
+      completed_at: job.completed_at ?? Date.now(),
+      progress,
+      summary: {
+        ...currentSummary,
+        validation_in_progress: true,
+        validation_message:
+          `Validating checkpoint epoch ${checkpoint.epoch} ` +
+          `preset ${preset.name} sample ${sampleOrdinal}/${plan.totalSamples}`,
+        evaluated_checkpoints: evaluations,
+        async_validation: nextState,
+      },
+    });
+    return { status: "completed", progress };
+  };
+
+  if (!persistedState || String(persistedState.mode ?? "") !== "checkpoint_async") {
+    return startValidationSample({
+      checkpointIndex: 0,
+      presetIndex: 0,
+      textIndex: 0,
+      seedIndex: 0,
+      evaluations: existingEvaluations,
+      presetStats: createValidationAccumulator(),
+      checkpointBestPassing: null,
+      checkpointBestFailure: null,
+      champion: null,
+    });
+  }
+
+  const checkpointIndex =
+    typeof persistedState.checkpoint_index === "number" ? persistedState.checkpoint_index : 0;
+  const checkpoint = candidateCheckpoints[checkpointIndex];
+  if (!checkpoint) {
+    const champion = normalizeValidationChampion(persistedState.champion);
+    if (champion) {
+      return completeSuccessfulValidation(champion, existingEvaluations);
+    }
+    return completeFailedValidation("No remaining checkpoints to validate", existingEvaluations);
+  }
+
+  const presetIndex = typeof persistedState.preset_index === "number" ? persistedState.preset_index : 0;
+  const textIndex = typeof persistedState.text_index === "number" ? persistedState.text_index : 0;
+  const seedIndex = typeof persistedState.seed_index === "number" ? persistedState.seed_index : 0;
+  const preset = plan.presets[presetIndex];
+  const seedOffset = plan.validationSeedOffsets[seedIndex];
+  if (!preset || typeof seedOffset !== "number" || !plan.validationTexts[textIndex]) {
+    return completeFailedValidation("Validation plan is invalid", existingEvaluations);
+  }
+
+  const seed = seedOffset + textIndex;
+  const runId = typeof persistedState.run_id === "string" ? persistedState.run_id : "";
+  if (!runId) {
+    return startValidationSample({
+      checkpointIndex,
+      presetIndex,
+      textIndex,
+      seedIndex,
+      evaluations: existingEvaluations,
+      presetStats: normalizeValidationAccumulator(persistedState.preset_stats),
+      checkpointBestPassing: normalizeValidationChampion(persistedState.checkpoint_best_passing),
+      checkpointBestFailure: normalizeValidationFailure(persistedState.checkpoint_best_failure),
+      champion: normalizeValidationChampion(persistedState.champion),
+    });
+  }
+
+  const runpodResponse = await getServerlessStatusOrSyntheticFailure(
+    c.env,
+    c.env.RUNPOD_ENDPOINT_ID,
+    runId
+  );
+  const runStatus = String(runpodResponse.status ?? "UNKNOWN");
+  const sampleOrdinal = textIndex * plan.validationSeedOffsets.length + seedIndex + 1;
+  if (runStatus !== "COMPLETED" && runStatus !== "FAILED") {
+    await updateTrainingJob(c.env.DB, job.job_id, {
+      status: "completed",
+      completed_at: job.completed_at ?? Date.now(),
+      progress,
+      summary: {
+        ...currentSummary,
+        validation_in_progress: true,
+        validation_message:
+          `Validation still running for checkpoint epoch ${checkpoint.epoch} ` +
+          `preset ${preset.name} sample ${sampleOrdinal}/${plan.totalSamples} ` +
+          `(${runStatus.toLowerCase()})`,
+        evaluated_checkpoints: existingEvaluations,
+        async_validation: {
+          ...persistedState,
+          evaluations: existingEvaluations,
+        },
+      },
+    });
+    return { status: "completed", progress };
+  }
+
+  const output = (runpodResponse.output ?? null) as
+    | { quality?: Record<string, unknown>; audio?: string; error?: unknown }
+    | null;
+  let enrichedOutput = runStatus === "COMPLETED" ? output : null;
+  if (enrichedOutput?.audio) {
+    try {
+      enrichedOutput = await enrichOutputWithReviewAsr({
+        env: c.env,
+        output: enrichedOutput,
+        expectedText: plan.validationTexts[textIndex],
+        languageHint: getValidationLanguageHint(voice, job),
+      });
+    } catch (error) {
+      enrichedOutput = annotateAsrFailure(enrichedOutput, error);
+    }
+  }
+  const fallbackError =
+    typeof enrichedOutput?.error === "string"
+      ? enrichedOutput.error
+      : typeof runpodResponse.error === "string"
+        ? runpodResponse.error
+        : `runpod_status=${runStatus.toLowerCase()}`;
+  const sampleOutcome = evaluateValidationSample({
+    output: runStatus === "COMPLETED" ? enrichedOutput : null,
+    fallbackError,
+    sampleIndex: textIndex + 1,
+    seed,
+    referenceAudioKey:
+      typeof persistedState.reference_audio_key === "string" || persistedState.reference_audio_key === null
+        ? (persistedState.reference_audio_key as string | null)
+        : null,
+    referenceText: typeof persistedState.reference_text === "string" ? persistedState.reference_text : "",
+    minOverall: plan.minOverall,
+    minAsrScore: plan.minAsrScore,
+  });
+  const nextPresetStats = applyValidationSampleOutcome(
+    normalizeValidationAccumulator(persistedState.preset_stats),
+    sampleOutcome
+  );
+  const currentCheckpointBestPassing = normalizeValidationChampion(persistedState.checkpoint_best_passing);
+  const currentCheckpointBestFailure = normalizeValidationFailure(persistedState.checkpoint_best_failure);
+  const currentChampion = normalizeValidationChampion(persistedState.champion);
+
+  const hasNextSeed = seedIndex + 1 < plan.validationSeedOffsets.length;
+  const hasNextText = !hasNextSeed && textIndex + 1 < plan.validationTexts.length;
+  if (hasNextSeed || hasNextText) {
+    return startValidationSample({
+      checkpointIndex,
+      presetIndex,
+      textIndex: hasNextSeed ? textIndex : textIndex + 1,
+      seedIndex: hasNextSeed ? seedIndex + 1 : 0,
+      evaluations: existingEvaluations,
+      presetStats: nextPresetStats,
+      checkpointBestPassing: currentCheckpointBestPassing,
+      checkpointBestFailure: currentCheckpointBestFailure,
+      champion: currentChampion,
+    });
+  }
+
+  const presetResult = finalizeValidationPresetResult({
+    accumulator: nextPresetStats,
+    preset,
+    totalSamples: plan.totalSamples,
+    minPassRate: plan.minPassRate,
+  });
+  const nextCheckpointBestPassing =
+    presetResult.ok &&
+    (!currentCheckpointBestPassing || presetResult.aggregateScore > currentCheckpointBestPassing.score)
+      ? {
+          epoch: checkpoint.epoch,
+          prefix: checkpoint.r2_prefix,
+          score: presetResult.aggregateScore,
+          message: presetResult.message,
+          preset_name: presetResult.presetName,
+          preset_settings: presetResult.presetSettings,
+          passed_samples: presetResult.passedSamples,
+          total_samples: presetResult.totalSamples,
+        }
+      : currentCheckpointBestPassing;
+  const nextCheckpointBestFailure =
+    !presetResult.ok &&
+    (!currentCheckpointBestFailure ||
+      presetResult.passedSamples > currentCheckpointBestFailure.passed_samples ||
+      (presetResult.passedSamples === currentCheckpointBestFailure.passed_samples &&
+        presetResult.aggregateScore > currentCheckpointBestFailure.score))
+      ? {
+          passed_samples: presetResult.passedSamples,
+          score: presetResult.aggregateScore,
+          message: presetResult.message,
+          preset_name: presetResult.presetName,
+          total_samples: presetResult.totalSamples,
+        }
+      : currentCheckpointBestFailure;
+
+  if (presetIndex + 1 < plan.presets.length) {
+    return startValidationSample({
+      checkpointIndex,
+      presetIndex: presetIndex + 1,
+      textIndex: 0,
+      seedIndex: 0,
+      evaluations: existingEvaluations,
+      presetStats: createValidationAccumulator(),
+      checkpointBestPassing: nextCheckpointBestPassing,
+      checkpointBestFailure: nextCheckpointBestFailure,
+      champion: currentChampion,
+    });
+  }
+
+  const checkpointEvaluation: CheckpointEvaluation = nextCheckpointBestPassing
+    ? {
+        epoch: checkpoint.epoch,
+        prefix: checkpoint.r2_prefix,
+        ok: true,
+        score: nextCheckpointBestPassing.score,
+        message: nextCheckpointBestPassing.message,
+        preset: nextCheckpointBestPassing.preset_name,
+        passed_samples: nextCheckpointBestPassing.passed_samples,
+        total_samples: nextCheckpointBestPassing.total_samples,
+      }
+    : {
+        epoch: checkpoint.epoch,
+        prefix: checkpoint.r2_prefix,
+        ok: false,
+        score: nextCheckpointBestFailure?.score ?? 0,
+        message: nextCheckpointBestFailure?.message ?? "Validation failed for all presets",
+        preset: nextCheckpointBestFailure?.preset_name ?? preset.name,
+        passed_samples: nextCheckpointBestFailure?.passed_samples ?? 0,
+        total_samples: nextCheckpointBestFailure?.total_samples ?? plan.totalSamples,
+      };
+  const nextEvaluations = [...existingEvaluations, checkpointEvaluation];
+
+  if (nextCheckpointBestPassing) {
+    const nextChampion =
+      !currentChampion || nextCheckpointBestPassing.score > currentChampion.score
+        ? nextCheckpointBestPassing
+        : currentChampion;
+    if (plan.prioritizeLatestPassingCheckpoint) {
+      return completeSuccessfulValidation(nextCheckpointBestPassing, nextEvaluations);
+    }
+    if (checkpointIndex + 1 < candidateCheckpoints.length) {
+      return startValidationSample({
+        checkpointIndex: checkpointIndex + 1,
+        presetIndex: 0,
+        textIndex: 0,
+        seedIndex: 0,
+        evaluations: nextEvaluations,
+        presetStats: createValidationAccumulator(),
+        checkpointBestPassing: null,
+        checkpointBestFailure: null,
+        champion: nextChampion,
+      });
+    }
+    return completeSuccessfulValidation(nextChampion, nextEvaluations);
+  }
+
+  if (checkpointIndex + 1 < candidateCheckpoints.length) {
+    return startValidationSample({
+      checkpointIndex: checkpointIndex + 1,
+      presetIndex: 0,
+      textIndex: 0,
+      seedIndex: 0,
+      evaluations: nextEvaluations,
+      presetStats: createValidationAccumulator(),
+      checkpointBestPassing: null,
+      checkpointBestFailure: null,
+      champion: currentChampion,
+    });
+  }
+
+  if (currentChampion) {
+    return completeSuccessfulValidation(currentChampion, nextEvaluations);
+  }
+
+  return completeFailedValidation(checkpointEvaluation.message, nextEvaluations);
+};
+
+const advanceAsync06bCheckpointValidation = async (
+  c: Context<AppContext>,
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>,
+  job: TrainingJob,
+  progress: TrainingProgress,
+  currentSummary: Record<string, unknown>,
+  candidateCheckpoints: CheckpointCandidate[]
+): Promise<{ status: string; progress: TrainingProgress }> => {
+  const preset = getValidationPresets(voice.model_id ?? "qwen3-tts-0.6b")[0];
+  const validationText = getValidationTexts(
+    typeof (job.config as Record<string, unknown>).whisper_language === "string"
+      ? String((job.config as Record<string, unknown>).whisper_language).toLowerCase()
+      : "",
+    true
+  )[0];
+  const seed = FAST_VALIDATION_SEEDS_OFFSET[0];
+
+  if (!preset || !validationText) {
+    return {
+      status: "completed",
+      progress,
+    };
+  }
+
+  const persistedState =
+    currentSummary.async_validation && typeof currentSummary.async_validation === "object"
+      ? currentSummary.async_validation as Record<string, unknown>
+      : null;
+  const existingEvaluations = Array.isArray(persistedState?.evaluations)
+    ? persistedState.evaluations
+        .map(normalizeCheckpointEvaluation)
+        .filter((value): value is CheckpointEvaluation => value !== null)
+    : [];
+
+  const referenceAudioKey =
+    typeof persistedState?.reference_audio_key === "string" || persistedState?.reference_audio_key === null
+      ? (persistedState.reference_audio_key as string | null)
+      : null;
+  const referenceText =
+    typeof persistedState?.reference_text === "string"
+      ? persistedState.reference_text
+      : "";
+
+  const startCheckpointValidation = async (
+    checkpointIndex: number,
+    evaluations: CheckpointEvaluation[]
+  ): Promise<{ status: string; progress: TrainingProgress }> => {
+    const checkpoint = candidateCheckpoints[checkpointIndex];
+    if (!checkpoint) {
+      await updateTrainingJob(c.env.DB, job.job_id, {
+        status: "failed",
+        error_message: "No remaining checkpoints to validate",
+        completed_at: job.completed_at ?? Date.now(),
+        progress,
+        summary: {
+          ...currentSummary,
+          validation_in_progress: false,
+          validation_checked: true,
+          validation_passed: false,
+          validation_failed: true,
+          validation_message: "No remaining checkpoints to validate",
+          evaluated_checkpoints: evaluations,
+          async_validation: null,
+        },
+      });
+      return { status: "failed", progress };
+    }
+    const reference = referenceAudioKey !== null || referenceText
+      ? { referenceAudioKey, referenceText }
+      : await loadValidationReference(c, voice, job);
+    const payload = buildValidationPayload({
+      voice,
+      checkpointPrefix: checkpoint.r2_prefix,
+      preset,
+      validationText,
+      seed,
+      referenceAudioKey: reference.referenceAudioKey,
+      referenceText: reference.referenceText,
+    });
+    const runpodResponse = await invokeServerlessAsync(c.env, c.env.RUNPOD_ENDPOINT_ID, payload);
+    const nextState: Async06bValidationState = {
+      mode: "fast_06b_async",
+      run_id: String(runpodResponse.id ?? ""),
+      checkpoint_index: checkpointIndex,
+      checkpoint_epoch: checkpoint.epoch,
+      checkpoint_prefix: checkpoint.r2_prefix,
+      preset_name: preset.name,
+      validation_text: validationText,
+      seed,
+      reference_audio_key: reference.referenceAudioKey,
+      reference_text: reference.referenceText,
+      evaluations,
+    };
+    await updateTrainingJob(c.env.DB, job.job_id, {
+      status: "completed",
+      completed_at: job.completed_at ?? Date.now(),
+      progress,
+      summary: {
+        ...currentSummary,
+        validation_in_progress: true,
+        validation_message: `Validating checkpoint epoch ${checkpoint.epoch} for 0.6B`,
+        async_validation: nextState,
+      },
+    });
+    return { status: "completed", progress };
+  };
+
+  if (!persistedState || String(persistedState.mode ?? "") !== "fast_06b_async" || typeof persistedState.run_id !== "string") {
+    return startCheckpointValidation(existingEvaluations.length, existingEvaluations);
+  }
+
+  const currentIndex = typeof persistedState.checkpoint_index === "number" ? persistedState.checkpoint_index : 0;
+  const currentEpoch = typeof persistedState.checkpoint_epoch === "number" ? persistedState.checkpoint_epoch : candidateCheckpoints[currentIndex]?.epoch;
+  const currentPrefix =
+    typeof persistedState.checkpoint_prefix === "string"
+      ? persistedState.checkpoint_prefix
+      : candidateCheckpoints[currentIndex]?.r2_prefix;
+
+  const runpodResponse = await getServerlessStatusOrSyntheticFailure(
+    c.env,
+    c.env.RUNPOD_ENDPOINT_ID,
+    persistedState.run_id
+  );
+  const runStatus = String(runpodResponse.status ?? "UNKNOWN");
+  if (runStatus !== "COMPLETED" && runStatus !== "FAILED") {
+    await updateTrainingJob(c.env.DB, job.job_id, {
+      status: "completed",
+      completed_at: job.completed_at ?? Date.now(),
+      progress,
+      summary: {
+        ...currentSummary,
+        validation_in_progress: true,
+        validation_message: `Validation still running for checkpoint epoch ${currentEpoch} (${runStatus.toLowerCase()})`,
+        async_validation: {
+          ...persistedState,
+          evaluations: existingEvaluations,
+        },
+      },
+    });
+    return { status: "completed", progress };
+  }
+
+  const output = (runpodResponse.output ?? null) as { quality?: Record<string, unknown>; audio?: string; error?: unknown } | null;
+  let enrichedOutput = runStatus === "COMPLETED" ? output : null;
+  if (enrichedOutput?.audio) {
+    try {
+      enrichedOutput = await enrichOutputWithReviewAsr({
+        env: c.env,
+        output: enrichedOutput,
+        expectedText: validationText,
+        languageHint: getValidationLanguageHint(voice, job),
+      });
+    } catch (error) {
+      enrichedOutput = annotateAsrFailure(enrichedOutput, error);
+    }
+  }
+  const asyncFailureDetail =
+    typeof enrichedOutput?.error === "string"
+      ? enrichedOutput.error
+      : typeof runpodResponse.error === "string"
+        ? runpodResponse.error
+        : `runpod_status=${runStatus.toLowerCase()}`;
+  const result =
+    runStatus === "COMPLETED"
+      ? scoreSingleValidationOutput({
+          preset,
+          seed,
+          output: enrichedOutput,
+          fallbackError: typeof runpodResponse.error === "string" ? runpodResponse.error : null,
+          referenceAudioKey: referenceAudioKey,
+          referenceText,
+          is06b: true,
+        })
+      : {
+          ok: false,
+          message: `All presets failed: preset=${preset.name} ${asyncFailureDetail}`,
+          aggregateScore: 0,
+          presetName: preset.name,
+          passedSamples: 0,
+          totalSamples: 1,
+        };
+
+  const nextEvaluations: CheckpointEvaluation[] = [
+    ...existingEvaluations,
+    {
+      epoch: typeof currentEpoch === "number" ? currentEpoch : candidateCheckpoints[currentIndex].epoch,
+      prefix: typeof currentPrefix === "string" ? currentPrefix : candidateCheckpoints[currentIndex].r2_prefix,
+      ok: result.ok,
+      score: result.aggregateScore,
+      message: result.message,
+      preset: result.presetName,
+      passed_samples: result.passedSamples,
+      total_samples: result.totalSamples,
+    },
+  ];
+
+  if (result.ok) {
+    await updateVoice(c.env.DB, job.voice_id, {
+      status: "ready",
+      checkpoint_r2_prefix: typeof currentPrefix === "string" ? currentPrefix : candidateCheckpoints[currentIndex].r2_prefix,
+      run_name: parseRunNameFromCheckpointPrefix(
+        typeof currentPrefix === "string" ? currentPrefix : candidateCheckpoints[currentIndex].r2_prefix
+      ),
+      epoch: typeof currentEpoch === "number" ? currentEpoch : candidateCheckpoints[currentIndex].epoch,
+      settings: result.presetSettings,
+    });
+    await updateTrainingJob(c.env.DB, job.job_id, {
+      status: "completed",
+      completed_at: job.completed_at ?? Date.now(),
+      progress,
+        summary: {
+          ...currentSummary,
+          force_revalidation: false,
+          validation_in_progress: false,
+          validation_checked: true,
+          validation_passed: true,
+        validation_message: result.message,
+        selected_checkpoint_prefix:
+          typeof currentPrefix === "string" ? currentPrefix : candidateCheckpoints[currentIndex].r2_prefix,
+        selected_checkpoint_epoch:
+          typeof currentEpoch === "number" ? currentEpoch : candidateCheckpoints[currentIndex].epoch,
+        selected_preset: result.presetName,
+        selected_score: result.aggregateScore,
+        evaluated_checkpoints: nextEvaluations,
+        async_validation: null,
+      },
+    });
+    return { status: "completed", progress };
+  }
+
+  const nextIndex = currentIndex + 1;
+  if (nextIndex < candidateCheckpoints.length) {
+    await updateTrainingJob(c.env.DB, job.job_id, {
+      status: "completed",
+      completed_at: job.completed_at ?? Date.now(),
+      progress,
+      summary: {
+        ...currentSummary,
+        evaluated_checkpoints: nextEvaluations,
+      },
+    });
+    return startCheckpointValidation(nextIndex, nextEvaluations);
+  }
+
+  if (!shouldKeepReadyVoiceOnValidationFailure(voice, currentSummary)) {
+    await updateVoice(c.env.DB, job.voice_id, {
+      status: "created",
+      checkpoint_r2_prefix: null,
+      run_name: null,
+      epoch: null,
+    });
+  }
+
+  await updateTrainingJob(c.env.DB, job.job_id, {
+    status: "failed",
+    error_message: result.message,
+    completed_at: job.completed_at ?? Date.now(),
+    progress,
+    summary: {
+      ...currentSummary,
+      force_revalidation: false,
+      validation_in_progress: false,
+      validation_checked: true,
+      validation_passed: false,
+      validation_failed: true,
+      validation_message: result.message,
+      evaluated_checkpoints: nextEvaluations,
+      async_validation: null,
+    },
+  });
+  return { status: "failed", progress };
 };
 
 const validateTrainedCheckpoint = async (
@@ -578,10 +2174,11 @@ const validateTrainedCheckpoint = async (
   const jobConfig = job.config as Record<string, unknown>;
   const lang = typeof jobConfig.whisper_language === "string" ? jobConfig.whisper_language.toLowerCase() : "";
   const datasetPrefix = String(job.dataset_r2_prefix ?? "").replace(/\/+$/, "");
-  const validationTexts = getValidationTexts(lang);
   const presets = getValidationPresets(voice.model_id ?? "qwen3-tts-1.7b");
-  const totalSamples = validationTexts.length * VALIDATION_SEEDS_OFFSET.length;
   const is06b = String(voice.model_id ?? "").toLowerCase().includes("0.6b");
+  const validationTexts = getValidationTexts(lang, is06b);
+  const validationSeedOffsets = is06b ? FAST_VALIDATION_SEEDS_OFFSET : FULL_VALIDATION_SEEDS_OFFSET;
+  const totalSamples = validationTexts.length * validationSeedOffsets.length;
   const minOverall = is06b ? 0.9 : 0.85;
   const minPassRate = is06b ? MIN_PASS_RATE_06B : MIN_PASS_RATE_17B;
   const minAsrScore = 0.8;
@@ -630,7 +2227,7 @@ const validateTrainedCheckpoint = async (
       let firstFailureMessage: string | null = null;
 
       for (let i = 0; i < validationTexts.length; i += 1) {
-        for (const seedOffset of VALIDATION_SEEDS_OFFSET) {
+        for (const seedOffset of validationSeedOffsets) {
           const seed = seedOffset + i;
           const payload: Record<string, unknown> = {
             text: validationTexts[i],
@@ -640,10 +2237,11 @@ const validateTrainedCheckpoint = async (
             language: "auto",
             seed,
             quality_review: {
-              enable_asr: true,
+              enable_asr: false,
               enable_speaker: Boolean(referenceAudioKey),
               enable_style: Boolean(referenceAudioKey),
               enable_speed: Boolean(referenceAudioKey && referenceText),
+              allow_below_threshold: true,
               reference_audio_key: referenceAudioKey,
               reference_text: referenceText,
             },
@@ -689,7 +2287,18 @@ const validateTrainedCheckpoint = async (
             continue;
           }
 
-          const quality = output.quality ?? {};
+          try {
+            output = (await enrichOutputWithReviewAsr({
+              env: c.env,
+              output,
+              expectedText: validationTexts[i],
+              languageHint: getValidationLanguageHint(voice, job),
+            })) ?? output;
+          } catch (error) {
+            output = annotateAsrFailure(output, error);
+          }
+
+          const quality = output?.quality ?? {};
           const overall = Number(quality.overall_score ?? NaN);
           const duration = Number(quality.duration_score ?? NaN);
           const health = Number(quality.health_score ?? NaN);
@@ -708,7 +2317,7 @@ const validateTrainedCheckpoint = async (
           if (!Number.isFinite(asr)) {
             infraIssues += 1;
             if (!firstFailureMessage) {
-              firstFailureMessage = `sample ${i + 1} seed ${seed} missing asr_score`;
+              firstFailureMessage = getMissingAsrMessage(quality, i + 1, seed);
             }
             continue;
           }
@@ -933,13 +2542,47 @@ const reconcileJobStatus = async (
       return { status: "failed", progress };
     }
 
+    const currentSummary = (job.summary ?? {}) as Record<string, unknown>;
+    const forceRevalidation = currentSummary.force_revalidation === true;
+    const persistedReadyCheckpoint =
+      voice.status === "ready" &&
+      typeof voice.checkpoint_r2_prefix === "string" &&
+      parsedStatus.checkpoints.some((cp) => cp?.r2_prefix === voice.checkpoint_r2_prefix)
+        ? voice.checkpoint_r2_prefix
+        : null;
+
+    if (persistedReadyCheckpoint && !forceRevalidation) {
+      await updateTrainingJob(c.env.DB, job.job_id, {
+        status: "completed",
+        completed_at: job.completed_at ?? Date.now(),
+        progress,
+        summary: {
+          ...currentSummary,
+          validation_checked: true,
+          validation_passed: true,
+          validation_message:
+            typeof currentSummary.validation_message === "string" && currentSummary.validation_message.trim()
+              ? currentSummary.validation_message
+              : "Recovered validation result from persisted ready voice checkpoint",
+          selected_checkpoint_prefix: persistedReadyCheckpoint,
+          selected_checkpoint_epoch: voice.epoch,
+          selected_preset:
+            typeof currentSummary.selected_preset === "string" && currentSummary.selected_preset.trim()
+              ? currentSummary.selected_preset
+              : "high_similarity",
+        },
+      });
+      return { status: "completed", progress };
+    }
+
+    const validationPlan = getValidationPlan(voice, job);
     const candidateCheckpoints = parsedStatus.checkpoints
       .filter(
         (cp): cp is { epoch: number; r2_prefix: string } =>
           typeof cp.epoch === "number" && typeof cp.r2_prefix === "string"
       )
       .sort((a, b) => b.epoch - a.epoch)
-      .slice(0, MAX_CHECKPOINTS_TO_EVAL);
+      .slice(0, validationPlan.maxCheckpointsToEval);
 
     if (candidateCheckpoints.length === 0) {
       const message = "Training completed but checkpoint metadata is invalid";
@@ -962,118 +2605,19 @@ const reconcileJobStatus = async (
       return { status: "failed", progress };
     }
 
-    const checkpointEvaluations: Array<{
-      epoch: number;
-      prefix: string;
-      ok: boolean;
-      score: number;
-      message: string;
-      preset: string;
-      passed_samples: number;
-      total_samples: number;
-    }> = [];
-    let champion: {
-      checkpoint: { epoch: number; r2_prefix: string };
-      result: CheckpointValidationResult;
-    } | null = null;
-
-    for (const checkpoint of candidateCheckpoints) {
-      const validation = await validateTrainedCheckpoint(c, voice, job, checkpoint.r2_prefix);
-      checkpointEvaluations.push({
-        epoch: checkpoint.epoch,
-        prefix: checkpoint.r2_prefix,
-        ok: validation.ok,
-        score: validation.aggregateScore,
-        message: validation.message,
-        preset: validation.presetName,
-        passed_samples: validation.passedSamples,
-        total_samples: validation.totalSamples,
-      });
-
-      if (validation.ok && (!champion || validation.aggregateScore > champion.result.aggregateScore)) {
-        champion = { checkpoint, result: validation };
-      }
-    }
-
-    if (champion) {
-      const voiceUpdate: {
-        status: string;
-        checkpoint_r2_prefix: string;
-        run_name: string | null;
-        epoch: number;
-        settings?: {
-          stability: number;
-          similarity_boost: number;
-          style: number;
-          speed: number;
-        };
-      } = {
-        status: "ready",
-        checkpoint_r2_prefix: champion.checkpoint.r2_prefix,
-        run_name: parseRunNameFromCheckpointPrefix(champion.checkpoint.r2_prefix),
-        epoch: champion.checkpoint.epoch,
-      };
-      if (champion.result.presetSettings) {
-        voiceUpdate.settings = champion.result.presetSettings;
-      }
-      await updateVoice(c.env.DB, job.voice_id, voiceUpdate);
-
-      await updateTrainingJob(c.env.DB, job.job_id, {
-        status: "completed",
-        completed_at: job.completed_at ?? Date.now(),
-        progress,
-        summary: {
-          ...(job.summary ?? {}),
-          validation_checked: true,
-          validation_passed: true,
-          validation_message: champion.result.message,
-          selected_checkpoint_prefix: champion.checkpoint.r2_prefix,
-          selected_checkpoint_epoch: champion.checkpoint.epoch,
-          selected_preset: champion.result.presetName,
-          selected_score: champion.result.aggregateScore,
-          evaluated_checkpoints: checkpointEvaluations,
-        },
-      });
-    } else {
-      const bestFailure = checkpointEvaluations
-        .sort((a, b) => b.passed_samples - a.passed_samples || b.score - a.score)
-        .at(0);
-      const failureMessage =
-        bestFailure?.message ??
-        "Validation failed for all candidate checkpoints";
-
-      await updateVoice(c.env.DB, job.voice_id, {
-        status: "created",
-        checkpoint_r2_prefix: null,
-        run_name: null,
-        epoch: null,
-      });
-      await updateTrainingJob(c.env.DB, job.job_id, {
-        status: "failed",
-        error_message: failureMessage,
-        summary: {
-          ...(job.summary ?? {}),
-          validation_failed: true,
-          validation_checked: true,
-          validation_passed: false,
-          validation_message: failureMessage,
-          evaluated_checkpoints: checkpointEvaluations,
-        },
-        completed_at: job.completed_at ?? Date.now(),
-        progress,
-      });
-      return { status: "failed", progress };
-    }
+    return advanceAsyncCheckpointValidation(c, voice, job, progress, currentSummary, candidateCheckpoints);
   }
 
   return { status, progress };
 };
 
 const RECONCILE_TIMEOUT_MS = 25000;
+const COMPLETED_VALIDATION_TIMEOUT_MS = 180000;
 
 const reconcileJobStatusWithTimeout = async (
   c: Context<AppContext>,
-  job: TrainingJob
+  job: TrainingJob,
+  timeoutMs = RECONCILE_TIMEOUT_MS
 ): Promise<boolean> => {
   let timedOut = false;
   await Promise.race([
@@ -1082,7 +2626,7 @@ const reconcileJobStatusWithTimeout = async (
       setTimeout(() => {
         timedOut = true;
         resolve();
-      }, RECONCILE_TIMEOUT_MS)
+      }, timeoutMs)
     ),
   ]);
   return !timedOut;
@@ -1121,9 +2665,31 @@ app.post("/start", async (c) => {
   const datasetPrefix = body.dataset_name ? `datasets/${body.voice_id}/${body.dataset_name}` : `datasets/${body.voice_id}`;
   const config = body.config ?? {};
   const cfg = config as Record<string, unknown>;
+  const modelSize = typeof config.model_size === "string" && config.model_size
+    ? config.model_size
+    : (voice.model_size || "1.7B");
+  const recommendedDefaults = getRecommendedTrainingDefaults(modelSize);
+  const effectiveConfig: TrainingConfig = {
+    ...config,
+    model_size: modelSize,
+    batch_size: Number(config.batch_size ?? recommendedDefaults.batch_size),
+    learning_rate: Number(config.learning_rate ?? recommendedDefaults.learning_rate),
+    num_epochs: Number(config.num_epochs ?? cfg.epochs ?? recommendedDefaults.num_epochs),
+    gradient_accumulation_steps: Number(cfg.gradient_accumulation_steps ?? recommendedDefaults.gradient_accumulation_steps),
+    subtalker_loss_weight: Number(cfg.subtalker_loss_weight ?? recommendedDefaults.subtalker_loss_weight),
+    save_every_n_epochs: Number(cfg.save_every_n_epochs ?? recommendedDefaults.save_every_n_epochs),
+    seed: Number(cfg.seed ?? recommendedDefaults.seed),
+    gpu_type_id:
+      typeof cfg.gpu_type_id === "string" && cfg.gpu_type_id
+        ? cfg.gpu_type_id
+        : recommendedDefaults.gpu_type_id,
+  };
+  if (typeof cfg.whisper_language === "string" && cfg.whisper_language.trim()) {
+    effectiveConfig.whisper_language = cfg.whisper_language.trim();
+  }
 
-  const numEpochs = Number(config.num_epochs ?? cfg.epochs ?? 8);
-  const batchSize = Number(config.batch_size ?? 4);
+  const numEpochs = Number(effectiveConfig.num_epochs ?? recommendedDefaults.num_epochs);
+  const batchSize = Number(effectiveConfig.batch_size ?? recommendedDefaults.batch_size);
   const maxSteps = Number(cfg.max_steps ?? 0);
 
   if (numEpochs < 1 || numEpochs > 30) {
@@ -1142,7 +2708,7 @@ app.post("/start", async (c) => {
     runpod_pod_id: null,
     job_token: jobToken,
     status: "pending",
-    config,
+    config: effectiveConfig,
     progress: {},
     summary: {},
     metrics: {},
@@ -1161,26 +2727,26 @@ app.post("/start", async (c) => {
     voice_id: body.voice_id,
     dataset_r2_prefix: datasetPrefix,
     speaker_name: voice.speaker_name,
-    model_size: typeof config.model_size === "string" ? config.model_size : (voice.model_size || "1.7B"),
-    batch_size: Number(config.batch_size ?? 4),
-    learning_rate: Number(config.learning_rate ?? 1e-5),
-    num_epochs: Number(config.num_epochs ?? cfg.epochs ?? 8),
+    model_size: modelSize,
+    batch_size: Number(effectiveConfig.batch_size ?? recommendedDefaults.batch_size),
+    learning_rate: Number(effectiveConfig.learning_rate ?? recommendedDefaults.learning_rate),
+    num_epochs: Number(effectiveConfig.num_epochs ?? recommendedDefaults.num_epochs),
     run_name: runName,
-    gradient_accumulation_steps: Number(cfg.gradient_accumulation_steps ?? 4),
+    gradient_accumulation_steps: Number(effectiveConfig.gradient_accumulation_steps ?? recommendedDefaults.gradient_accumulation_steps),
     speaker_id: Number(cfg.speaker_id ?? 3000),
     mixed_precision: String(cfg.mixed_precision ?? "bf16"),
     torch_dtype: String(cfg.torch_dtype ?? "bfloat16"),
-      attn_implementation: String(cfg.attn_implementation ?? "sdpa"),
+    attn_implementation: String(cfg.attn_implementation ?? "sdpa"),
     weight_decay: Number(cfg.weight_decay ?? 0.01),
     max_grad_norm: Number(cfg.max_grad_norm ?? 1.0),
-    subtalker_loss_weight: Number(cfg.subtalker_loss_weight ?? 0.3),
+    subtalker_loss_weight: Number(effectiveConfig.subtalker_loss_weight ?? recommendedDefaults.subtalker_loss_weight),
     log_every_n_steps: Number(cfg.log_every_n_steps ?? 10),
-    save_every_n_epochs: Number(cfg.save_every_n_epochs ?? 1),
+    save_every_n_epochs: Number(effectiveConfig.save_every_n_epochs ?? recommendedDefaults.save_every_n_epochs),
     max_steps: Number(cfg.max_steps ?? 0),
-    seed: Number(cfg.seed ?? 42),
+    seed: Number(effectiveConfig.seed ?? recommendedDefaults.seed),
     job_token: jobToken,
     worker_api_url: workerUrl,
-    whisper_language: typeof cfg.whisper_language === "string" ? cfg.whisper_language : undefined,
+    whisper_language: typeof effectiveConfig.whisper_language === "string" ? effectiveConfig.whisper_language : undefined,
   };
   await c.env.R2.put(`jobs/${jobId}/config.json`, JSON.stringify(jobConfig), {
     httpMetadata: { contentType: "application/json" },
@@ -1254,13 +2820,18 @@ app.get("/jobs", async (c) => {
 
   const hydratedJobs = await Promise.all(
     jobs.map(async (job) => {
-      if (!ACTIVE_JOB_STATUSES.has(job.status)) {
-        if (!needsCompletedValidation(job)) {
-          return job;
+      try {
+        if (!ACTIVE_JOB_STATUSES.has(job.status)) {
+          if (!needsCompletedValidation(job)) {
+            return job;
+          }
         }
+        await reconcileJobStatusWithTimeout(c, job);
+        return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
+      } catch (error) {
+        console.warn(`Failed to hydrate training job ${job.job_id}:`, error);
+        return job;
       }
-      await reconcileJobStatusWithTimeout(c, job);
-      return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
     })
   );
 
@@ -1332,7 +2903,10 @@ app.get("/:job_id", async (c) => {
   }
 
   if (ACTIVE_JOB_STATUSES.has(job.status) || needsCompletedValidation(job)) {
-    const reconciled = await reconcileJobStatusWithTimeout(c, job);
+    const timeoutMs = needsCompletedValidation(job)
+      ? COMPLETED_VALIDATION_TIMEOUT_MS
+      : RECONCILE_TIMEOUT_MS;
+    const reconciled = await reconcileJobStatusWithTimeout(c, job, timeoutMs);
     if (!reconciled) {
       const execCtx = (c as unknown as { executionCtx?: ExecutionContext }).executionCtx;
       execCtx?.waitUntil(
@@ -1441,6 +3015,70 @@ app.post("/:job_id/reconcile", async (c) => {
     status: "accepted",
     validation_started: true,
     job_id: jobId,
+  });
+});
+
+app.post("/:job_id/revalidate", async (c) => {
+  const jobId = c.req.param("job_id");
+  const job = await getTrainingJob(c.env.DB, jobId);
+
+  if (!job) {
+    return c.json({ detail: { message: "Training job not found" } }, 404);
+  }
+  if (ACTIVE_JOB_STATUSES.has(job.status)) {
+    return c.json({ detail: { message: "Cannot revalidate an active training job" } }, 409);
+  }
+
+  const summary = (job.summary ?? {}) as Record<string, unknown>;
+  const {
+    validation_checked: _validationChecked,
+    validation_passed: _validationPassed,
+    validation_failed: _validationFailed,
+    validation_in_progress: _validationInProgress,
+    validation_message: _validationMessage,
+    evaluated_checkpoints: _evaluatedCheckpoints,
+    async_validation: _asyncValidation,
+    selected_checkpoint_prefix: _selectedCheckpointPrefix,
+    selected_checkpoint_epoch: _selectedCheckpointEpoch,
+    selected_preset: _selectedPreset,
+    selected_score: _selectedScore,
+    ...restSummary
+  } = summary;
+
+  await updateTrainingJob(c.env.DB, jobId, {
+    status: "completed",
+    error_message: null,
+    summary: {
+      ...restSummary,
+      force_revalidation: true,
+      validation_checked: false,
+      validation_passed: false,
+      validation_failed: false,
+      validation_in_progress: false,
+      evaluated_checkpoints: [],
+      async_validation: null,
+    },
+  });
+
+  const refreshedJob = await getTrainingJob(c.env.DB, jobId);
+  if (!refreshedJob) {
+    return c.json({ detail: { message: "Training job not found after reset" } }, 404);
+  }
+
+  const reconciled = await reconcileJobStatusWithTimeout(c, refreshedJob, COMPLETED_VALIDATION_TIMEOUT_MS);
+  if (!reconciled) {
+    const execCtx = (c as unknown as { executionCtx?: ExecutionContext }).executionCtx;
+    execCtx?.waitUntil(
+      reconcileJobStatus(c, refreshedJob)
+        .then(() => undefined)
+        .catch(() => undefined)
+    );
+  }
+
+  const updatedJob = await getTrainingJob(c.env.DB, jobId);
+  return c.json({
+    status: reconciled ? "started" : "accepted",
+    job: serializeTrainingJob(updatedJob ?? refreshedJob),
   });
 });
 

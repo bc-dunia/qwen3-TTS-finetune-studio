@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { createGeneration, getVoice } from "../lib/d1";
+import { enrichOutputWithReviewAsr } from "../lib/review-asr";
 import { getServerlessStatus, invokeServerless, invokeServerlessAsync } from "../lib/runpod";
 import { authMiddleware } from "../middleware/auth";
 import type { AppContext, Generation, TTSRequest } from "../types";
@@ -18,6 +19,7 @@ const getContentTypeForFormat = (outputFormat: string): string =>
 
 const MAX_TORCH_SEED = 0xFFFFFFFF;
 const DEFAULT_INFERENCE_SEED = 123456;
+const OVERALL_SCORE_ERROR_RE = /overall_score=([0-9.]+)/i;
 const LANGUAGE_ALIASES: Record<string, string> = {
   auto: "auto",
   zh: "chinese",
@@ -70,6 +72,40 @@ const normalizeLanguageCode = (languageCode: string | undefined): string => {
   return LANGUAGE_ALIASES[normalized] ?? normalized;
 };
 
+const parseOverallScoreFromError = (message: string): number | null => {
+  const match = OVERALL_SCORE_ERROR_RE.exec(message);
+  if (!match || !match[1]) {
+    return null;
+  }
+  const value = Number(match[1]);
+  return Number.isFinite(value) ? value : null;
+};
+
+const getDatasetPrefixFromReferenceKey = (refAudioKey: string | null): string | null => {
+  if (!refAudioKey) {
+    return null;
+  }
+  const index = refAudioKey.lastIndexOf("/");
+  if (index <= 0) {
+    return null;
+  }
+  return refAudioKey.slice(0, index);
+};
+
+const getDefaultReviewText = (languageCode: string): string => {
+  switch (normalizeLanguageCode(languageCode)) {
+    case "korean":
+      return "안녕하세요. 현재 배포된 음성 품질과 화자 유사도를 점검하는 검증 샘플입니다.";
+    case "japanese":
+      return "こんにちは。現在デプロイされている音声品質と話者類似度を確認する検証サンプルです。";
+    case "chinese":
+      return "你好。这是一段用于检查当前部署音色质量和说话人相似度的验证样例。";
+    case "english":
+    default:
+      return "Hello. This is a verification sample for checking deployed voice quality and speaker similarity.";
+  }
+};
+
 const decodeBase64 = (value: string): Uint8Array => {
   const decoded = atob(value);
   const bytes = new Uint8Array(decoded.length);
@@ -77,6 +113,34 @@ const decodeBase64 = (value: string): Uint8Array => {
     bytes[index] = decoded.charCodeAt(index);
   }
   return bytes;
+};
+
+const loadQualityReviewReference = async (
+  c: Context<AppContext>,
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>
+): Promise<{ referenceAudioKey: string | null; referenceText: string }> => {
+  const datasetPrefix = getDatasetPrefixFromReferenceKey(voice.ref_audio_r2_key);
+  let referenceAudioKey = voice.ref_audio_r2_key;
+  let referenceText = "";
+
+  if (datasetPrefix) {
+    try {
+      const profileObj = await c.env.R2.get(`${datasetPrefix}/reference_profile.json`);
+      if (profileObj) {
+        const profile = (await profileObj.json()) as Record<string, unknown>;
+        if (typeof profile.reference_audio_key === "string" && profile.reference_audio_key.trim()) {
+          referenceAudioKey = profile.reference_audio_key.trim();
+        }
+        if (typeof profile.reference_text === "string") {
+          referenceText = profile.reference_text.trim();
+        }
+      }
+    } catch {
+      // Best-effort only.
+    }
+  }
+
+  return { referenceAudioKey, referenceText };
 };
 
 const isLowQualityOutput = (quality: unknown): { low: boolean; reason?: string } => {
@@ -251,6 +315,111 @@ app.post("/:voice_id", async (c) => runTtsRequest(c));
 
 app.post("/:voice_id/stream", async (c) => {
   return runTtsRequest(c);
+});
+
+app.post("/:voice_id/review", async (c) => {
+  const voiceId = c.req.param("voice_id");
+  const body = (await c.req.json()) as TTSRequest;
+  const voice = await getVoice(c.env.DB, voiceId);
+  if (!voice || voice.status !== "ready") {
+    return c.json({ detail: { message: "Voice not found or not ready" } }, 404);
+  }
+
+  const modelId = body.model_id ?? voice.model_id ?? "qwen3-tts-1.7b";
+  const seed = normalizeSeed(body.seed);
+  const reviewReference = await loadQualityReviewReference(c, voice);
+  const text =
+    typeof body.text === "string" && body.text.trim()
+      ? body.text.trim()
+      : reviewReference.referenceText || getDefaultReviewText(body.language_code ?? voice.labels?.language ?? "ko");
+
+  const inputPayload = {
+    ...buildInputPayload(voiceId, modelId, voice, { ...body, text }, seed),
+    quality_review: {
+      enable_asr: false,
+      enable_speaker: Boolean(reviewReference.referenceAudioKey),
+      enable_style: Boolean(reviewReference.referenceAudioKey),
+      enable_speed: Boolean(reviewReference.referenceAudioKey && reviewReference.referenceText),
+      allow_below_threshold: true,
+      reference_audio_key: reviewReference.referenceAudioKey,
+      reference_text: reviewReference.referenceText,
+    },
+  };
+
+  let runpodResponse: Record<string, unknown>;
+  try {
+    runpodResponse = await invokeServerless(c.env, c.env.RUNPOD_ENDPOINT_ID, inputPayload);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown RunPod error";
+    return c.json({ detail: { message } }, 502);
+  }
+
+  const topLevelError =
+    typeof runpodResponse.error === "string" && runpodResponse.error.trim()
+      ? runpodResponse.error.trim()
+      : null;
+  const output = (runpodResponse.output ?? {}) as {
+    audio?: string;
+    sample_rate?: number;
+    duration_ms?: number;
+    error?: string;
+    warning?: string;
+    quality?: Record<string, unknown>;
+  };
+  const outputError =
+    typeof output.error === "string" && output.error.trim() ? output.error.trim() : null;
+  const errorMessage = outputError ?? topLevelError;
+  if (errorMessage) {
+    return c.json({
+      ok: false,
+      voice_id: voiceId,
+      model_id: modelId,
+      text,
+      voice_settings: body.voice_settings ?? voice.settings,
+      error: errorMessage,
+      quality: {
+        overall_score: parseOverallScoreFromError(errorMessage),
+      },
+    });
+  }
+
+  if (!output.audio) {
+    return c.json({
+      ok: false,
+      voice_id: voiceId,
+      model_id: modelId,
+      text,
+      voice_settings: body.voice_settings ?? voice.settings,
+      error: "RunPod response did not include audio output",
+      quality: null,
+    });
+  }
+
+  let enrichedOutput = output;
+  let asrWarning: string | null = null;
+  try {
+    enrichedOutput = (await enrichOutputWithReviewAsr({
+      env: c.env,
+      output,
+      expectedText: text,
+      languageHint: body.language_code ?? voice.labels?.language ?? "auto",
+    })) ?? output;
+  } catch (error) {
+    asrWarning = error instanceof Error ? error.message : "Review ASR enrichment failed";
+  }
+
+  return c.json({
+    ok: true,
+    voice_id: voiceId,
+    model_id: modelId,
+    text,
+    voice_settings: body.voice_settings ?? voice.settings,
+    sample_rate: enrichedOutput.sample_rate ?? output.sample_rate ?? 24000,
+    duration_ms: enrichedOutput.duration_ms ?? output.duration_ms ?? null,
+    quality: enrichedOutput.quality ?? null,
+    audio: enrichedOutput.audio ?? output.audio,
+    warning: [output.warning, asrWarning].filter((value): value is string => Boolean(value)).join(" | ") || null,
+  });
 });
 
 app.post("/:voice_id/async", async (c) => {

@@ -1,6 +1,9 @@
 export interface Env {
   R2: R2Bucket;
   DB: D1Database;
+  AI?: {
+    run(model: string, input: Record<string, unknown>): Promise<unknown>;
+  };
   RUNPOD_API_KEY: string;
   RUNPOD_ENDPOINT_ID: string;
   RUNPOD_TRAINING_TEMPLATE_ID: string;
@@ -12,6 +15,9 @@ export interface Env {
   R2_SECRET_ACCESS_KEY: string;
   R2_ENDPOINT_URL: string;
   CORS_ORIGIN: string;
+  ALLOW_ANONYMOUS_ACCESS?: string;
+  OPENAI_API_KEY?: string;
+  OPENAI_TRANSCRIBE_MODEL?: string;
 }
 
 export interface VoiceSettings {
