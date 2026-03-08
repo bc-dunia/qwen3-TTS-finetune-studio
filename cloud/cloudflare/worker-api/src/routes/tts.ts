@@ -174,31 +174,67 @@ const isQualityThresholdError = (message: string): boolean => {
   );
 };
 
+const resolveCheckpointInfo = (
+  voiceId: string,
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>,
+  body: TTSRequest
+):
+  | { r2_prefix: string; type: "full" }
+  | { voice_id: string; run_name: string | null; epoch: number | null } => {
+  const overridePrefix =
+    typeof body.checkpoint_prefix === "string" && body.checkpoint_prefix.trim()
+      ? body.checkpoint_prefix.trim()
+      : "";
+
+  if (overridePrefix) {
+    return {
+      r2_prefix: overridePrefix,
+      type: "full",
+    };
+  }
+
+  if (voice.checkpoint_r2_prefix) {
+    return {
+      r2_prefix: voice.checkpoint_r2_prefix,
+      type: "full",
+    };
+  }
+
+  return {
+    voice_id: voiceId,
+    run_name: voice.run_name,
+    epoch:
+      typeof body.checkpoint_epoch === "number" && Number.isFinite(body.checkpoint_epoch)
+        ? body.checkpoint_epoch
+        : voice.epoch,
+  };
+};
+
 const buildInputPayload = (
   voiceId: string,
   modelId: string,
   voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>,
   body: TTSRequest,
   seed: number
-): Record<string, unknown> => ({
-  text: body.text,
-  voice_id: voiceId,
-  speaker_name: voice.speaker_name,
-  model_id: modelId,
-  voice_settings: body.voice_settings ?? voice.settings,
-  seed,
-  language: normalizeLanguageCode(body.language_code),
-  checkpoint_info: voice.checkpoint_r2_prefix
-    ? {
-        r2_prefix: voice.checkpoint_r2_prefix,
-        type: "full" as const,
-      }
-    : {
-        voice_id: voiceId,
-        run_name: voice.run_name,
-        epoch: voice.epoch,
-      },
-});
+): Record<string, unknown> => {
+  const stylePrompt = typeof body.style_prompt === "string" ? body.style_prompt.trim() : "";
+  const instruct = typeof body.instruct === "string" ? body.instruct.trim() : "";
+  const combinedInstruct = [stylePrompt ? `Style prompt: ${stylePrompt}` : "", instruct ? `Instruction: ${instruct}` : ""]
+    .filter(Boolean)
+    .join("\n");
+
+  return {
+    text: body.text,
+    voice_id: voiceId,
+    speaker_name: voice.speaker_name,
+    model_id: modelId,
+    voice_settings: body.voice_settings ?? voice.settings,
+    ...(combinedInstruct ? { instruct: combinedInstruct } : {}),
+    seed,
+    language: normalizeLanguageCode(body.language_code),
+    checkpoint_info: resolveCheckpointInfo(voiceId, voice, body),
+  };
+};
 
 const runTtsRequest = async (c: Context<AppContext>): Promise<Response> => {
   const voiceId = c.req.param("voice_id");

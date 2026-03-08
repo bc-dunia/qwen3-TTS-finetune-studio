@@ -1,8 +1,10 @@
 import { useState, useEffect, useCallback } from 'react'
+import { useSearchParams } from 'react-router'
 import {
   fetchVoices,
   getSpeechGenerationStatus,
   startSpeechGenerationAsync,
+  type SpeechGenerationOptions,
   type Voice,
   type VoiceSettings,
   DEFAULT_VOICE_SETTINGS,
@@ -21,12 +23,15 @@ const HISTORY_KEY = 'tts-generation-history'
 const MAX_HISTORY = 20
 
 export function Playground() {
+  const [searchParams, setSearchParams] = useSearchParams()
   const [voices, setVoices] = useState<Voice[]>([])
   const [loadingVoices, setLoadingVoices] = useState(true)
 
   const [selectedVoiceId, setSelectedVoiceId] = useState('')
   const [text, setText] = useState('')
   const [settings, setSettings] = useState<VoiceSettings>(DEFAULT_VOICE_SETTINGS)
+  const [stylePrompt, setStylePrompt] = useState('')
+  const [instruct, setInstruct] = useState('')
 
   const [generating, setGenerating] = useState(false)
   const [generateStatus, setGenerateStatus] = useState('')
@@ -41,6 +46,7 @@ export function Playground() {
       return []
     }
   })
+  const requestedVoiceId = searchParams.get('voice') ?? ''
 
   // Load voices
   useEffect(() => {
@@ -52,8 +58,15 @@ export function Playground() {
         if (cancelled) return
         const readyVoices = data.voices.filter((v) => v.status === 'ready')
         setVoices(readyVoices)
-        if (readyVoices.length > 0 && !selectedVoiceId) {
-          setSelectedVoiceId(readyVoices[0].voice_id)
+        if (readyVoices.length > 0) {
+          const requestedVoice = requestedVoiceId
+            ? readyVoices.find((voice) => voice.voice_id === requestedVoiceId)
+            : null
+          if (requestedVoice) {
+            setSelectedVoiceId(requestedVoice.voice_id)
+          } else if (!selectedVoiceId || !readyVoices.some((voice) => voice.voice_id === selectedVoiceId)) {
+            setSelectedVoiceId(readyVoices[0].voice_id)
+          }
         }
       } catch {
         // silently fail — user can still type
@@ -64,7 +77,7 @@ export function Playground() {
 
     load()
     return () => { cancelled = true }
-  }, [selectedVoiceId])
+  }, [requestedVoiceId, selectedVoiceId])
 
   // Save history to localStorage
   const saveHistory = useCallback((entries: HistoryEntry[]) => {
@@ -82,7 +95,11 @@ export function Playground() {
     setAudioBlob(null)
 
     try {
-      const asyncJob = await startSpeechGenerationAsync(selectedVoiceId, text.trim(), settings)
+      const promptOptions: SpeechGenerationOptions = {
+        stylePrompt: stylePrompt.trim() || undefined,
+        instruct: instruct.trim() || undefined,
+      }
+      const asyncJob = await startSpeechGenerationAsync(selectedVoiceId, text.trim(), settings, promptOptions)
       let completed = false
       let attempts = 0
       while (attempts < 180) {
@@ -134,6 +151,22 @@ export function Playground() {
   }
 
   const selectedVoice = voices.find((v) => v.voice_id === selectedVoiceId)
+  const supportsPromptControls = Boolean(selectedVoice?.model_size?.includes('1.7'))
+
+  useEffect(() => {
+    if (!selectedVoice) return
+    if (requestedVoiceId !== selectedVoice.voice_id) {
+      const next = new URLSearchParams()
+      next.set('voice', selectedVoice.voice_id)
+      setSearchParams(next, { replace: true })
+    }
+    setSettings({
+      stability: selectedVoice.settings.stability ?? DEFAULT_VOICE_SETTINGS.stability,
+      similarity_boost: selectedVoice.settings.similarity_boost ?? DEFAULT_VOICE_SETTINGS.similarity_boost,
+      style: selectedVoice.settings.style ?? DEFAULT_VOICE_SETTINGS.style,
+      speed: selectedVoice.settings.speed ?? DEFAULT_VOICE_SETTINGS.speed,
+    })
+  }, [requestedVoiceId, selectedVoice, setSearchParams])
 
   return (
     <div className="space-y-6">
@@ -163,7 +196,7 @@ export function Playground() {
               >
                 {voices.map((v) => (
                   <option key={v.voice_id} value={v.voice_id}>
-                    {v.name} — {v.model_size || 'base'}
+                    {v.name} — {v.model_size || 'base'}{typeof v.epoch === 'number' ? ` · epoch ${v.epoch}` : ''}
                   </option>
                 ))}
               </select>
@@ -323,12 +356,64 @@ export function Playground() {
               />
             </div>
 
+            <div className="mt-5 pt-5 border-t border-edge space-y-3">
+              <div>
+                <h3 className="text-heading text-xs font-semibold">Prompt Controls</h3>
+                <p className="text-muted text-[10px] mt-1 leading-relaxed">
+                  Style Prompt and Instruct are applied on `1.7B` voices. `0.6B` custom voices ignore this path.
+                </p>
+              </div>
+
+              <div>
+                <label className="text-subtle text-xs font-medium mb-1.5 block">Style Prompt</label>
+                <textarea
+                  value={stylePrompt}
+                  onChange={(e) => setStylePrompt(e.target.value)}
+                  disabled={!supportsPromptControls}
+                  placeholder="Warm, polished investor briefing tone with measured emphasis."
+                  rows={3}
+                  className="w-full bg-surface border border-edge rounded-lg px-3 py-2 text-sm text-primary placeholder:text-muted disabled:opacity-50 disabled:cursor-not-allowed focus:border-accent transition-colors resize-none"
+                />
+              </div>
+
+              <div>
+                <label className="text-subtle text-xs font-medium mb-1.5 block">Instruct</label>
+                <textarea
+                  value={instruct}
+                  onChange={(e) => setInstruct(e.target.value)}
+                  disabled={!supportsPromptControls}
+                  placeholder="Speak with higher similarity, slightly slower pacing, and clean sentence endings."
+                  rows={3}
+                  className="w-full bg-surface border border-edge rounded-lg px-3 py-2 text-sm text-primary placeholder:text-muted disabled:opacity-50 disabled:cursor-not-allowed focus:border-accent transition-colors resize-none"
+                />
+              </div>
+            </div>
+
             <button
-              onClick={() => setSettings(DEFAULT_VOICE_SETTINGS)}
+              onClick={() => setSettings(
+                selectedVoice
+                  ? {
+                      stability: selectedVoice.settings.stability ?? DEFAULT_VOICE_SETTINGS.stability,
+                      similarity_boost: selectedVoice.settings.similarity_boost ?? DEFAULT_VOICE_SETTINGS.similarity_boost,
+                      style: selectedVoice.settings.style ?? DEFAULT_VOICE_SETTINGS.style,
+                      speed: selectedVoice.settings.speed ?? DEFAULT_VOICE_SETTINGS.speed,
+                    }
+                  : DEFAULT_VOICE_SETTINGS,
+              )}
               className="w-full mt-5 text-muted text-xs hover:text-primary border border-edge rounded-lg py-2 transition-colors"
               type="button"
             >
-              Reset to Defaults
+              Reset to Voice Defaults
+            </button>
+            <button
+              onClick={() => {
+                setStylePrompt('')
+                setInstruct('')
+              }}
+              className="w-full mt-2 text-muted text-xs hover:text-primary border border-edge rounded-lg py-2 transition-colors"
+              type="button"
+            >
+              Clear Prompt Controls
             </button>
           </div>
         </div>

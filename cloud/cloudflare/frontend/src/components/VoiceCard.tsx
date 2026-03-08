@@ -1,6 +1,6 @@
 import { useNavigate } from 'react-router'
 import type { Voice } from '../lib/api'
-import { formatDate } from '../lib/api'
+import { DEFAULT_VOICE_SETTINGS, formatDate } from '../lib/api'
 
 interface VoiceCardProps {
   voice: Voice
@@ -27,6 +27,16 @@ const STATUS_STYLES: Record<string, { bg: string; text: string; dot: string }> =
 export function VoiceCard({ voice }: VoiceCardProps) {
   const navigate = useNavigate()
   const status = STATUS_STYLES[voice.status] ?? STATUS_STYLES.created
+  const lastUpdated = voice.updated_at ?? voice.created_at
+  const src = voice.settings ?? {}
+  const settings = {
+    stability: typeof src.stability === 'number' ? src.stability : DEFAULT_VOICE_SETTINGS.stability,
+    similarity_boost:
+      typeof src.similarity_boost === 'number' ? src.similarity_boost : DEFAULT_VOICE_SETTINGS.similarity_boost,
+    style: typeof src.style === 'number' ? src.style : DEFAULT_VOICE_SETTINGS.style,
+    speed: typeof src.speed === 'number' ? src.speed : DEFAULT_VOICE_SETTINGS.speed,
+  }
+  const settingSummary = `stab ${settings.stability.toFixed(2)} · sim ${settings.similarity_boost.toFixed(2)} · style ${settings.style.toFixed(2)} · speed ${settings.speed.toFixed(2)}`
 
   return (
     <button
@@ -53,11 +63,23 @@ export function VoiceCard({ voice }: VoiceCardProps) {
       )}
 
       {/* Footer */}
-      <div className="flex items-center justify-between text-[11px] font-mono text-muted">
-        <span className="bg-surface px-2 py-0.5 rounded">
-          {voice.model_size || 'base'}
-        </span>
-        <span>{formatDate(voice.created_at)}</span>
+      <div className="space-y-2 text-[11px] font-mono text-muted">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="bg-surface px-2 py-0.5 rounded shrink-0">
+              {voice.model_size || 'base'}
+            </span>
+            {typeof voice.epoch === 'number' && (
+              <span className="bg-surface px-2 py-0.5 rounded shrink-0">
+                epoch {voice.epoch}
+              </span>
+            )}
+          </div>
+          <span className="shrink-0">Updated {formatDate(lastUpdated)}</span>
+        </div>
+        <div className="text-[10px] leading-relaxed text-subtle">
+          {settingSummary}
+        </div>
       </div>
     </button>
   )

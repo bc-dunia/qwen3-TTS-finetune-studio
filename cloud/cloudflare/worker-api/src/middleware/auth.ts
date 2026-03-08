@@ -11,6 +11,13 @@ const unauthorizedResponse = () =>
     { status: 401 }
   );
 
+const isTruthyEnvValue = (value: string | undefined): boolean => {
+  if (!value) {
+    return false;
+  }
+  return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
+};
+
 const extractBearerToken = (authorizationHeader: string | undefined): string | null => {
   if (!authorizationHeader) {
     return null;
@@ -29,6 +36,11 @@ const extractBearerToken = (authorizationHeader: string | undefined): string | n
 
 export const authMiddleware = createMiddleware<AppContext>(async (c, next) => {
   if (c.req.path === "/") {
+    await next();
+    return;
+  }
+
+  if (isTruthyEnvValue(c.env.ALLOW_ANONYMOUS_ACCESS) || !c.env.API_KEY?.trim()) {
     await next();
     return;
   }

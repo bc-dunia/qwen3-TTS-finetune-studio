@@ -17,19 +17,11 @@ const NAV_ITEMS: NavItem[] = [
 
 export function Layout() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem('xi-api-key') ?? '')
-  const [showKey, setShowKey] = useState(false)
   const location = useLocation()
 
   useEffect(() => {
     setSidebarOpen(false)
   }, [location.pathname])
-
-  function saveApiKey(key: string) {
-    setApiKey(key)
-    localStorage.setItem('xi-api-key', key)
-    window.dispatchEvent(new Event('xi-api-key-changed'))
-  }
 
   return (
     <div className="flex h-screen bg-void overflow-hidden">
@@ -97,39 +89,20 @@ export function Layout() {
           ))}
         </nav>
 
-        {/* API Key Section */}
+        {/* Deployment status */}
         <div className="px-4 py-4 border-t border-edge">
           <label className="text-muted text-[10px] font-mono uppercase tracking-widest mb-2 block">
-            API Key
+            Access
           </label>
-          <div className="flex gap-1.5">
-            <input
-              type={showKey ? 'text' : 'password'}
-              value={apiKey}
-              onChange={(e) => saveApiKey(e.target.value)}
-              placeholder="xi-api-key..."
-              className="flex-1 min-w-0 bg-raised border border-edge rounded-md px-2.5 py-1.5 text-xs text-primary placeholder:text-muted font-mono focus:border-accent transition-colors"
-            />
-            <button
-              onClick={() => setShowKey(!showKey)}
-              className="px-2 text-muted hover:text-primary text-[10px] font-mono uppercase shrink-0"
-              type="button"
-            >
-              {showKey ? 'Hide' : 'Show'}
-            </button>
-          </div>
           <div className="mt-2.5 flex items-center gap-2">
-            <div
-              className={`w-1.5 h-1.5 rounded-full ${
-                apiKey
-                  ? 'bg-accent shadow-[0_0_6px_rgba(16,185,129,0.5)]'
-                  : 'bg-error shadow-[0_0_6px_rgba(239,68,68,0.4)]'
-              }`}
-            />
+            <div className="w-1.5 h-1.5 rounded-full bg-accent shadow-[0_0_6px_rgba(16,185,129,0.5)]" />
             <span className="text-muted text-[10px] font-mono tracking-wider">
-              {apiKey ? 'CONNECTED' : 'NO KEY'}
+              PUBLIC MODE
             </span>
           </div>
+          <p className="mt-2 text-[11px] text-subtle">
+            This deployment no longer requires entering an API key in the UI.
+          </p>
         </div>
       </aside>
 

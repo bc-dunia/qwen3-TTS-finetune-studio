@@ -3,7 +3,7 @@ import type { Env } from "../types";
 const OPENAI_TRANSCRIPTION_URL = "https://api.openai.com/v1/audio/transcriptions";
 const DEFAULT_OPENAI_TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe";
 const CLOUDFLARE_TRANSCRIBE_MODEL = "@cf/openai/whisper-large-v3-turbo";
-const NORMALIZED_TEXT_RE = /[^0-9a-zA-Z가-힣]+/g;
+const NORMALIZED_TEXT_RE = /[^\p{Letter}\p{Number}]+/gu;
 
 const LANGUAGE_HINT_TO_CODE: Record<string, string | null> = {
   auto: null,
@@ -43,7 +43,7 @@ const decodeBase64 = (value: string): Uint8Array => {
 };
 
 const normalizeText = (text: string): string =>
-  (text || "").trim().toLowerCase().replace(NORMALIZED_TEXT_RE, "");
+  (text || "").normalize("NFKC").trim().toLowerCase().replace(NORMALIZED_TEXT_RE, "");
 
 const levenshteinRatio = (a: string, b: string): number => {
   if (a === b) {
@@ -64,10 +64,10 @@ const levenshteinRatio = (a: string, b: string): number => {
   return 1 - (prev[b.length] / Math.max(a.length, b.length, 1));
 };
 
-const asrSimilarity = (target: string, prediction: string): number =>
+export const asrSimilarity = (target: string, prediction: string): number =>
   levenshteinRatio(normalizeText(target), normalizeText(prediction));
 
-const resolveLanguageCode = (languageHint: string | null | undefined): string | null => {
+export const resolveAsrLanguageCode = (languageHint: string | null | undefined): string | null => {
   if (!languageHint || !languageHint.trim()) {
     return null;
   }
@@ -145,6 +145,30 @@ const transcribeWithOpenAi = async (
   };
 };
 
+export const transcribeAudioWithReviewAsr = async ({
+  env,
+  audioBase64,
+  languageHint,
+}: {
+  env: Pick<Env, "AI" | "OPENAI_API_KEY" | "OPENAI_TRANSCRIBE_MODEL">;
+  audioBase64: string;
+  languageHint?: string | null;
+}): Promise<{ text: string; provider: string }> => {
+  const resolvedLanguage = resolveAsrLanguageCode(languageHint);
+  const workersAi = env.AI as WorkersAiBinding | undefined;
+  if (workersAi && typeof workersAi.run === "function") {
+    try {
+      return await transcribeWithWorkersAi(workersAi, audioBase64, resolvedLanguage);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Unknown Workers AI error";
+      if (!String(env.OPENAI_API_KEY ?? "").trim()) {
+        throw new Error(`Workers AI transcription failed: ${detail}`);
+      }
+    }
+  }
+  return transcribeWithOpenAi(env, audioBase64, resolvedLanguage);
+};
+
 export const enrichOutputWithReviewAsr = async ({
   env,
   output,
@@ -160,27 +184,13 @@ export const enrichOutputWithReviewAsr = async ({
     return output;
   }
 
-  const resolvedLanguage = resolveLanguageCode(languageHint);
-  let transcription = "";
-  let provider = "";
-  const workersAi = env.AI as WorkersAiBinding | undefined;
-  if (workersAi && typeof workersAi.run === "function") {
-    try {
-      const result = await transcribeWithWorkersAi(workersAi, output.audio, resolvedLanguage);
-      transcription = result.text;
-      provider = result.provider;
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : "Unknown Workers AI error";
-      if (!String(env.OPENAI_API_KEY ?? "").trim()) {
-        throw new Error(`Workers AI transcription failed: ${detail}`);
-      }
-    }
-  }
-  if (!provider) {
-    const result = await transcribeWithOpenAi(env, output.audio, resolvedLanguage);
-    transcription = result.text;
-    provider = result.provider;
-  }
+  const result = await transcribeAudioWithReviewAsr({
+    env,
+    audioBase64: output.audio,
+    languageHint,
+  });
+  const transcription = result.text;
+  const provider = result.provider;
   const quality = output.quality && typeof output.quality === "object" ? { ...output.quality } : {};
   const score = asrSimilarity(expectedText, transcription);
   quality.asr_provider = provider;

@@ -34,12 +34,21 @@ const callGraphQl = async <T>(env: Env, query: string, variables: Record<string,
   return payload.data;
 };
 
-const callRest = async <T>(env: Env, path: string): Promise<T> => {
+const callRest = async <T>(
+  env: Env,
+  path: string,
+  options: {
+    method?: "GET" | "POST" | "PATCH";
+    body?: Record<string, unknown>;
+  } = {}
+): Promise<T> => {
   const response = await fetch(`${RUNPOD_REST_BASE_URL}${path}`, {
-    method: "GET",
+    method: options.method ?? "GET",
     headers: {
+      "Content-Type": "application/json",
       Authorization: `Bearer ${env.RUNPOD_API_KEY}`,
     },
+    body: options.body ? JSON.stringify(options.body) : undefined,
   });
 
   if (!response.ok) {
@@ -213,24 +222,30 @@ export const getTemplateById = async (
   env: Env,
   templateId: string
 ): Promise<{
+  name?: string | null;
   id: string;
   imageName?: string | null;
+  env?: Array<{ key?: string | null; value?: string | null }> | null;
   containerRegistryAuthId?: string | null;
   ports?: string[] | null;
   volumeMountPath?: string | null;
   dockerEntrypoint?: string[] | null;
   dockerStartCmd?: string[] | null;
+  containerDiskInGb?: number | null;
   isServerless?: boolean;
 } | null> => {
   try {
     return await callRest<{
       id: string;
+      name?: string | null;
       imageName?: string | null;
+      env?: Array<{ key?: string | null; value?: string | null }> | null;
       containerRegistryAuthId?: string | null;
       ports?: string[] | null;
       volumeMountPath?: string | null;
       dockerEntrypoint?: string[] | null;
       dockerStartCmd?: string[] | null;
+      containerDiskInGb?: number | null;
       isServerless?: boolean;
     }>(env, `/templates/${templateId}`);
   } catch (error) {
@@ -394,3 +409,97 @@ export const getPodStatus = async (
     machine: data.pod.machine,
   };
 };
+
+export const createTemplate = async (
+  env: Env,
+  input: {
+    name: string;
+    imageName: string;
+    env?: Record<string, string>;
+    containerRegistryAuthId?: string | null;
+    ports?: string[] | null;
+    volumeMountPath?: string | null;
+    dockerEntrypoint?: string[] | null;
+    dockerStartCmd?: string[] | null;
+    containerDiskInGb?: number | null;
+    isServerless?: boolean;
+  }
+): Promise<{
+  id: string;
+  name?: string | null;
+  imageName?: string | null;
+  isServerless?: boolean;
+}> => {
+  return callRest<{
+    id: string;
+    name?: string | null;
+    imageName?: string | null;
+    isServerless?: boolean;
+  }>(env, "/templates", {
+    method: "POST",
+    body: {
+      name: input.name,
+      imageName: input.imageName,
+      env: input.env ?? {},
+      containerRegistryAuthId: input.containerRegistryAuthId ?? undefined,
+      ports: input.ports ?? undefined,
+      volumeMountPath: input.volumeMountPath ?? undefined,
+      dockerEntrypoint: input.dockerEntrypoint ?? undefined,
+      dockerStartCmd: input.dockerStartCmd ?? undefined,
+      containerDiskInGb: input.containerDiskInGb ?? undefined,
+      isServerless: input.isServerless ?? true,
+    },
+  });
+};
+
+export const getServerlessEndpoint = async (
+  env: Env,
+  endpointId: string
+): Promise<{
+  id: string;
+  name?: string | null;
+  templateId?: string | null;
+  workersMin?: number | null;
+  workersMax?: number | null;
+  idleTimeout?: number | null;
+  executionTimeoutMs?: number | null;
+  gpuIds?: string[] | null;
+  scalerType?: string | null;
+} | null> => {
+  try {
+    return await callRest<{
+      id: string;
+      name?: string | null;
+      templateId?: string | null;
+      workersMin?: number | null;
+      workersMax?: number | null;
+      idleTimeout?: number | null;
+      executionTimeoutMs?: number | null;
+      gpuIds?: string[] | null;
+      scalerType?: string | null;
+    }>(env, `/endpoints/${endpointId}`);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("(404)")) {
+      return null;
+    }
+    throw error;
+  }
+};
+
+export const updateServerlessEndpoint = async (
+  env: Env,
+  endpointId: string,
+  updates: Record<string, unknown>
+): Promise<{
+  id: string;
+  name?: string | null;
+  templateId?: string | null;
+}> =>
+  callRest<{
+    id: string;
+    name?: string | null;
+    templateId?: string | null;
+  }>(env, `/endpoints/${endpointId}`, {
+    method: "PATCH",
+    body: updates,
+  });

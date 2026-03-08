@@ -51,6 +51,7 @@ R2_ENDPOINT_URL = "https://3672c083409da5ca133c50e0d06fd0e0.r2.cloudflarestorage
 CORS_ORIGIN = "*"                 # Allowed CORS origin (set to your frontend domain in prod)
 ALLOW_ANONYMOUS_ACCESS = "true"   # Public product mode: frontend can call API without xi-api-key
 OPENAI_TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe"
+OPENAI_REVIEW_MODEL = "gpt-4o-mini"
 
 # ── Secrets (set via wrangler secret put) ────────────────────────────
 # API_KEY              - API authentication key for clients

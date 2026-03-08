@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import adminRoutes from "./routes/admin";
 import datasetRoutes from "./routes/dataset";
 import modelsRoutes from "./routes/models";
 import trainingCallbacksRoutes from "./routes/training-callbacks";
@@ -23,6 +24,7 @@ app.use("*", async (c, next) => {
 app.get("/", (c) => c.json({ status: "ok" }));
 
 app.route("/v1/text-to-speech", ttsRoutes);
+app.route("/v1/admin", adminRoutes);
 app.route("/v1/voices", voicesRoutes);
 app.route("/v1/models", modelsRoutes);
 app.route("/v1/training", trainingRoutes);

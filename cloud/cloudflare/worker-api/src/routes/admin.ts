@@ -8,6 +8,8 @@ import {
   invokeServerlessAsync,
   updateServerlessEndpoint,
 } from "../lib/runpod";
+import { asrSimilarity, transcribeAudioWithReviewAsr } from "../lib/review-asr";
+import { reviewTranscriptEntries } from "../lib/transcript-review";
 import { getVoice } from "../lib/d1";
 import type { AppContext } from "../types";
 
@@ -142,6 +144,15 @@ const sanitizeEndpoint = (endpoint: Awaited<ReturnType<typeof getServerlessEndpo
       }
     : null;
 
+const arrayBufferToBase64 = (buffer: ArrayBuffer): string => {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += 1) {
+    binary += String.fromCharCode(bytes[index]);
+  }
+  return btoa(binary);
+};
+
 app.use("*", async (c, next) => {
   if (!requireAdminKey(c)) {
     return c.json({ detail: { message: "Admin API key required" } }, 401);
@@ -185,6 +196,113 @@ app.get("/r2/list", async (c) => {
       httpEtag: obj.httpEtag,
       contentType: obj.httpMetadata?.contentType ?? null,
     })),
+  });
+});
+
+app.get("/r2/get", async (c) => {
+  const key = String(c.req.query("key") ?? "").trim();
+  const rawLimit = Number(c.req.query("limit") ?? 32768);
+  const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(1_000_000, Math.trunc(rawLimit))) : 32768;
+  if (!key) {
+    return c.json({ detail: { message: "key query parameter is required" } }, 400);
+  }
+
+  const obj = await c.env.R2.get(key);
+  if (!obj) {
+    return c.json({ detail: { message: `R2 object not found: ${key}` } }, 404);
+  }
+
+  const contentType = obj.httpMetadata?.contentType ?? null;
+  const text = await obj.text();
+  const truncated = text.length > limit;
+
+  return c.json({
+    key,
+    size: obj.size,
+    etag: obj.etag,
+    uploaded: obj.uploaded.toISOString(),
+    content_type: contentType,
+    truncated,
+    text: truncated ? text.slice(0, limit) : text,
+  });
+});
+
+app.post("/dataset/review-texts", async (c) => {
+  const body = (await c.req.json().catch(() => ({}))) as {
+    language_code?: string;
+    entries?: Array<{ segment?: string; text?: string; duration?: number }>;
+  };
+  const entries = Array.isArray(body.entries) ? body.entries : [];
+  if (entries.length === 0) {
+    return c.json({ detail: { message: "entries array is required" } }, 400);
+  }
+  if (entries.length > 50) {
+    return c.json({ detail: { message: "entries must contain at most 50 items" } }, 400);
+  }
+
+  const review = await reviewTranscriptEntries({
+    env: c.env,
+    languageCode: body.language_code,
+    entries: entries.map((entry) => ({
+      segment: typeof entry.segment === "string" ? entry.segment : undefined,
+      text: typeof entry.text === "string" ? entry.text : "",
+      duration: typeof entry.duration === "number" ? entry.duration : undefined,
+    })),
+  });
+
+  return c.json(review);
+});
+
+app.post("/dataset/retranscribe", async (c) => {
+  const body = (await c.req.json().catch(() => ({}))) as {
+    language_code?: string;
+    entries?: Array<{ audio_r2_key?: string; text?: string }>;
+  };
+  const entries = Array.isArray(body.entries) ? body.entries : [];
+  if (entries.length === 0) {
+    return c.json({ detail: { message: "entries array is required" } }, 400);
+  }
+  if (entries.length > 20) {
+    return c.json({ detail: { message: "entries must contain at most 20 items" } }, 400);
+  }
+
+  const results = await Promise.all(
+    entries.map(async (entry) => {
+      const audioKey = typeof entry.audio_r2_key === "string" ? entry.audio_r2_key.trim() : "";
+      const sourceText = typeof entry.text === "string" ? entry.text.trim() : "";
+      if (!audioKey) {
+        return {
+          audio_r2_key: audioKey,
+          error: "audio_r2_key is required",
+        };
+      }
+      const obj = await c.env.R2.get(audioKey);
+      if (!obj) {
+        return {
+          audio_r2_key: audioKey,
+          error: `R2 object not found: ${audioKey}`,
+        };
+      }
+
+      const transcription = await transcribeAudioWithReviewAsr({
+        env: c.env,
+        audioBase64: arrayBufferToBase64(await obj.arrayBuffer()),
+        languageHint: body.language_code ?? "ko",
+      });
+
+      return {
+        audio_r2_key: audioKey,
+        provider: transcription.provider,
+        asr_text: transcription.text,
+        source_text: sourceText,
+        asr_score: sourceText ? asrSimilarity(sourceText, transcription.text) : null,
+      };
+    })
+  );
+
+  return c.json({
+    language_code: body.language_code ?? "ko",
+    results,
   });
 });
 

@@ -317,8 +317,9 @@ def transcribe_all(
     return results
 
 
-# ── Step 3.5: LLM Transcription Review (OpenAI GPT-5.2) ──────────────
-OPENAI_MODEL = "gpt-5.2"
+# ── Step 3.5: LLM Transcription Review ───────────────────────────────
+CF_REVIEW_MODEL = "@cf/meta/llama-3.1-8b-instruct"
+OPENAI_MODEL = "gpt-4o-mini"
 
 REVIEW_SYSTEM_PROMPT = """당신은 한국어 음성 전사(STT) 품질 검수 전문가입니다.
 음성 인식 결과를 검토하여 오류를 찾고 수정합니다.
@@ -356,19 +357,45 @@ def get_openai_key() -> str:
             for line in env_path.read_text().splitlines():
                 if line.startswith("OPENAI_API_KEY="):
                     return line.split("=", 1)[1].strip().strip('"')
-    print("ERROR: OPENAI_API_KEY not found. Set it as env var or in .env")
-    sys.exit(1)
+    return ""
+
+
+def parse_review_payload(response_text: str, entries: list[dict]) -> list[dict]:
+    """Parse JSON-ish LLM output into review objects."""
+    try:
+        cleaned = response_text.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed.get("reviews", parsed.get("results", [parsed]))
+        if isinstance(parsed, list):
+            return parsed
+        return [parsed]
+    except json.JSONDecodeError:
+        import re
+
+        json_objects = re.findall(r'\{[^{}]+\}', response_text)
+        reviews = []
+        for obj_str in json_objects:
+            try:
+                reviews.append(json.loads(obj_str))
+            except json.JSONDecodeError:
+                continue
+        if reviews:
+            return reviews
+    print("    Failed to parse LLM response, using originals")
+    return [{"score": 3, "corrected": e["text"], "issues": []} for e in entries]
 
 
 def review_batch_with_llm(
     entries: list[dict],
-    api_key: str,
+    cf_token: str,
+    openai_key: str = "",
     retries: int = 2,
 ) -> list[dict]:
-    """Review a batch of transcriptions using OpenAI GPT-5.2."""
+    """Review a batch of transcriptions using Workers AI first, OpenAI fallback."""
     import requests
-
-    url = "https://api.openai.com/v1/chat/completions"
 
     batch_text = "\n".join(
         f'[{i+1}] (seg={e["segment"]}, {e["duration"]}s): "{e["text"]}"'
@@ -376,72 +403,104 @@ def review_batch_with_llm(
     )
     user_prompt = (
         f"{len(entries)}개의 전사 텍스트를 검수하세요. "
-        f"JSON 배열로 응답하세요. [{len(entries)}개 객체]\n\n{batch_text}"
+        f'최상위는 {{"reviews":[...]}} JSON 객체로 응답하세요.\n\n{batch_text}'
     )
-
-    payload = {
-        "model": OPENAI_MODEL,
-        "messages": [
-            {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        "max_completion_tokens": 4096,
-        "temperature": 0.1,
-        "response_format": {"type": "json_object"},
-    }
 
     for attempt in range(retries):
         try:
-            resp = requests.post(
-                url,
+            cf_resp = requests.post(
+                f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_REVIEW_MODEL}",
                 headers={
-                    "Authorization": f"Bearer {api_key}",
+                    "Authorization": f"Bearer {cf_token}",
                     "Content-Type": "application/json",
                 },
-                json=payload,
+                json={
+                    "messages": [
+                        {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 2048,
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "type": "object",
+                            "properties": {
+                                "reviews": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "score": {"type": "integer"},
+                                            "corrected": {"type": "string"},
+                                            "issues": {
+                                                "type": "array",
+                                                "items": {"type": "string"},
+                                            },
+                                        },
+                                        "required": ["score", "corrected", "issues"],
+                                        "additionalProperties": False,
+                                    },
+                                }
+                            },
+                            "required": ["reviews"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
                 timeout=120,
             )
 
-            if resp.status_code == 429:
-                wait = int(resp.headers.get("Retry-After", str(2 ** attempt + 1)))
-                print(f"    Rate limited, waiting {wait}s...")
+            if cf_resp.status_code == 200:
+                result = cf_resp.json()
+                payload = result.get("result", result)
+                response_text = (
+                    payload.get("response")
+                    if isinstance(payload, dict)
+                    else payload
+                )
+                if isinstance(response_text, dict):
+                    return response_text.get("reviews", [response_text])
+                if isinstance(response_text, str):
+                    return parse_review_payload(response_text, entries)
+            else:
+                print(f"    Workers AI review error {cf_resp.status_code}: {cf_resp.text[:200]}")
+
+            if not openai_key:
+                return [{"score": 3, "corrected": e["text"], "issues": []} for e in entries]
+
+            openai_resp = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {openai_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": OPENAI_MODEL,
+                    "messages": [
+                        {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "max_completion_tokens": 4096,
+                    "temperature": 0.1,
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=120,
+            )
+
+            if openai_resp.status_code == 429:
+                wait = int(openai_resp.headers.get("Retry-After", str(2 ** attempt + 1)))
+                print(f"    OpenAI rate limited, waiting {wait}s...")
                 time.sleep(wait)
                 continue
 
-            if resp.status_code != 200:
-                print(f"    OpenAI API error {resp.status_code}: {resp.text[:200]}")
+            if openai_resp.status_code != 200:
+                print(f"    OpenAI API error {openai_resp.status_code}: {openai_resp.text[:200]}")
                 return [{"score": 3, "corrected": e["text"], "issues": []} for e in entries]
 
-            result = resp.json()
+            result = openai_resp.json()
             response_text = result["choices"][0]["message"]["content"]
-
-            # Parse JSON from response
-            try:
-                cleaned = response_text.strip()
-                if cleaned.startswith("```"):
-                    cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-                parsed = json.loads(cleaned)
-                # Handle {"reviews": [...]} wrapper or direct array
-                if isinstance(parsed, dict):
-                    reviews = parsed.get("reviews", parsed.get("results", [parsed]))
-                elif isinstance(parsed, list):
-                    reviews = parsed
-                else:
-                    reviews = [parsed]
-                return reviews
-            except json.JSONDecodeError:
-                import re
-                json_objects = re.findall(r'\{[^{}]+\}', response_text)
-                reviews = []
-                for obj_str in json_objects:
-                    try:
-                        reviews.append(json.loads(obj_str))
-                    except json.JSONDecodeError:
-                        continue
-                if reviews:
-                    return reviews
-                print(f"    Failed to parse LLM response, using originals")
-                return [{"score": 3, "corrected": e["text"], "issues": []} for e in entries]
+            return parse_review_payload(response_text, entries)
 
         except Exception as e:
             if attempt == retries - 1:
@@ -455,7 +514,8 @@ def review_batch_with_llm(
 def review_transcriptions(
     transcriptions: list[dict],
     work_dir: Path,
-    api_key: str,
+    cf_token: str,
+    openai_key: str = "",
     batch_size: int = 10,
 ) -> list[dict]:
     """Review all transcriptions with LLM, filter low quality, apply corrections."""
@@ -480,7 +540,7 @@ def review_transcriptions(
         end = min(start + batch_size, len(transcriptions))
         batch = transcriptions[start:end]
 
-        reviews = review_batch_with_llm(batch, api_key)
+        reviews = review_batch_with_llm(batch, cf_token, openai_key)
 
         # Merge reviews with original data
         for i, entry in enumerate(batch):
@@ -648,11 +708,11 @@ def main():
     transcriptions = transcribe_all(seg_paths, work_dir, token)
     print()
 
-    # Step 4: LLM Review (OpenAI GPT-5.2)
+    # Step 4: LLM Review
     if not args.skip_review:
-        print("[4/6] LLM transcription review (OpenAI GPT-5.2)")
+        print("[4/6] LLM transcription review (Workers AI first, OpenAI fallback)")
         openai_key = get_openai_key()
-        reviewed = review_transcriptions(transcriptions, work_dir, openai_key, batch_size=10)
+        reviewed = review_transcriptions(transcriptions, work_dir, token, openai_key, batch_size=10)
         print()
     else:
         print("[4/6] LLM review skipped (--skip-review)")

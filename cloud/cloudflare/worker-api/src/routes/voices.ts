@@ -29,6 +29,13 @@ const ALLOWED_AUDIO_CONTENT_TYPES = new Set([
   "audio/wav",
   "audio/x-wav",
   "audio/wave",
+  "audio/mpeg",
+  "audio/mp3",
+  "audio/mp4",
+  "audio/x-m4a",
+  "audio/aac",
+  "audio/flac",
+  "video/mp4",
   "application/octet-stream",
 ]);
 
@@ -109,7 +116,7 @@ app.post("/add", async (c) => {
         return c.json({ detail: { message: `File ${value.name} exceeds 50MB limit` } }, 400);
       }
       if (!ALLOWED_AUDIO_CONTENT_TYPES.has(value.type)) {
-        return c.json({ detail: { message: `Only WAV format is supported for ${value.name}. Please convert your audio to 24kHz mono WAV before uploading.` } }, 400);
+        return c.json({ detail: { message: `Unsupported audio format for ${value.name}. Use WAV, MP3, M4A, FLAC, or MP4 audio.` } }, 400);
       }
       fileEntries.push(value);
     }

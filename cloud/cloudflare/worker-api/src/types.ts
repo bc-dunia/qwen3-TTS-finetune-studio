@@ -18,6 +18,7 @@ export interface Env {
   ALLOW_ANONYMOUS_ACCESS?: string;
   OPENAI_API_KEY?: string;
   OPENAI_TRANSCRIBE_MODEL?: string;
+  OPENAI_REVIEW_MODEL?: string;
 }
 
 export interface VoiceSettings {
@@ -53,6 +54,10 @@ export interface TTSRequest {
   text: string;
   model_id?: string;
   voice_settings?: VoiceSettings;
+  style_prompt?: string;
+  instruct?: string;
+  checkpoint_prefix?: string;
+  checkpoint_epoch?: number;
   seed?: number;
   language_code?: string;
 }

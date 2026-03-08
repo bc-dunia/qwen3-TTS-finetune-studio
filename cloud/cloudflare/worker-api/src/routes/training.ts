@@ -109,6 +109,7 @@ type AsyncValidationFailure = {
 type AsyncCheckpointValidationState = {
   mode: "checkpoint_async";
   run_id: string;
+  run_started_at?: number;
   checkpoint_index: number;
   checkpoint_epoch: number;
   checkpoint_prefix: string;
@@ -127,6 +128,7 @@ type AsyncCheckpointValidationState = {
 type Async06bValidationState = {
   mode: "fast_06b_async";
   run_id: string;
+  run_started_at?: number;
   checkpoint_index: number;
   checkpoint_epoch: number;
   checkpoint_prefix: string;
@@ -147,6 +149,7 @@ type ValidationPlan = {
   minOverall: number;
   minPassRate: number;
   minAsrScore: number;
+  minToneScore: number;
   maxCheckpointsToEval: number;
   prioritizeLatestPassingCheckpoint: boolean;
 };
@@ -184,12 +187,198 @@ const needsCompletedValidation = (job: TrainingJob): boolean => {
   return summary.validation_checked !== true;
 };
 
+const extractDatasetPrefixFromRefAudioKey = (
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>
+): string | null => {
+  const refAudioKey = typeof voice.ref_audio_r2_key === "string" ? voice.ref_audio_r2_key.trim() : "";
+  if (!refAudioKey.endsWith("/ref_audio.wav")) {
+    return null;
+  }
+
+  const datasetPrefix = refAudioKey.slice(0, -"/ref_audio.wav".length).replace(/\/+$/, "");
+  const expectedPrefix = `datasets/${voice.voice_id}/`;
+  if (!datasetPrefix.startsWith(expectedPrefix)) {
+    return null;
+  }
+
+  return datasetPrefix;
+};
+
+const resolveTrainingDatasetPrefix = (
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>,
+  datasetName: string | undefined
+): string => {
+  const requestedDatasetName = typeof datasetName === "string" ? datasetName.trim() : "";
+  if (requestedDatasetName) {
+    return `datasets/${voice.voice_id}/${requestedDatasetName}`;
+  }
+
+  return extractDatasetPrefixFromRefAudioKey(voice) ?? `datasets/${voice.voice_id}`;
+};
+
+const getCurrentReadyVoiceScore = async (
+  c: Context<AppContext>,
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>
+): Promise<number | null> => {
+  const currentPrefix = typeof voice.checkpoint_r2_prefix === "string" ? voice.checkpoint_r2_prefix.trim() : "";
+  if (voice.status !== "ready" || !currentPrefix) {
+    return null;
+  }
+
+  const jobs = await listTrainingJobs(c.env.DB, { voice_id: voice.voice_id, limit: 100 });
+  for (const candidate of jobs) {
+    const summary = candidate.summary ?? {};
+    const selectedPrefix =
+      typeof summary.selected_checkpoint_prefix === "string" ? summary.selected_checkpoint_prefix.trim() : "";
+    if (selectedPrefix === currentPrefix) {
+      const selectedScore = Number(summary.selected_score);
+      if (Number.isFinite(selectedScore)) {
+        return selectedScore;
+      }
+    }
+
+    const manualPrefix =
+      typeof summary.manual_promoted_checkpoint_prefix === "string"
+        ? summary.manual_promoted_checkpoint_prefix.trim()
+        : "";
+    if (manualPrefix === currentPrefix) {
+      const manualScore = Number(summary.manual_promoted_score);
+      if (Number.isFinite(manualScore)) {
+        return manualScore;
+      }
+    }
+  }
+
+  return null;
+};
+
+const chooseCheckpointPromotion = async ({
+  c,
+  voice,
+  candidatePrefix,
+  candidateScore,
+}: {
+  c: Context<AppContext>;
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>;
+  candidatePrefix: string;
+  candidateScore: number;
+}): Promise<{
+  promote: boolean;
+  preservedPrefix: string | null;
+  preservedEpoch: number | null;
+  preservedScore: number | null;
+}> => {
+  const currentPrefix = typeof voice.checkpoint_r2_prefix === "string" ? voice.checkpoint_r2_prefix.trim() : "";
+  if (voice.status !== "ready" || !currentPrefix || currentPrefix === candidatePrefix) {
+    return {
+      promote: true,
+      preservedPrefix: currentPrefix || null,
+      preservedEpoch: voice.epoch,
+      preservedScore: await getCurrentReadyVoiceScore(c, voice),
+    };
+  }
+
+  const currentScore = await getCurrentReadyVoiceScore(c, voice);
+  if (currentScore !== null && candidateScore <= currentScore) {
+    return {
+      promote: false,
+      preservedPrefix: currentPrefix,
+      preservedEpoch: voice.epoch,
+      preservedScore: currentScore,
+    };
+  }
+
+  return {
+    promote: true,
+    preservedPrefix: currentPrefix,
+    preservedEpoch: voice.epoch,
+    preservedScore: currentScore,
+  };
+};
+
 const parseRunNameFromCheckpointPrefix = (prefix: string): string | null => {
   const parts = prefix.split("/");
   if (parts.length < 4 || parts[0] !== "checkpoints") {
     return null;
   }
   return parts[2] || null;
+};
+
+type ManualPromotionCandidate = {
+  prefix: string;
+  epoch: number | null;
+  preset: string | null;
+  score: number | null;
+};
+
+const collectManualPromotionCandidates = (
+  summary: Record<string, unknown>
+): ManualPromotionCandidate[] => {
+  const byPrefix = new Map<string, ManualPromotionCandidate>();
+  const register = (candidate: ManualPromotionCandidate) => {
+    if (!candidate.prefix) {
+      return;
+    }
+    const existing = byPrefix.get(candidate.prefix);
+    byPrefix.set(candidate.prefix, {
+      prefix: candidate.prefix,
+      epoch: candidate.epoch ?? existing?.epoch ?? null,
+      preset: candidate.preset ?? existing?.preset ?? null,
+      score: candidate.score ?? existing?.score ?? null,
+    });
+  };
+
+  const evaluated = Array.isArray(summary.evaluated_checkpoints) ? summary.evaluated_checkpoints : [];
+  for (const value of evaluated) {
+    if (!value || typeof value !== "object") {
+      continue;
+    }
+    const record = value as Record<string, unknown>;
+    const prefix = typeof record.prefix === "string" ? record.prefix.trim() : "";
+    register({
+      prefix,
+      epoch: readNumber(record.epoch),
+      preset: typeof record.preset === "string" ? record.preset.trim() : null,
+      score: readNumber(record.score),
+    });
+  }
+
+  const selectedPrefix =
+    typeof summary.selected_checkpoint_prefix === "string" ? summary.selected_checkpoint_prefix.trim() : "";
+  if (selectedPrefix) {
+    register({
+      prefix: selectedPrefix,
+      epoch: readNumber(summary.selected_checkpoint_epoch),
+      preset: typeof summary.selected_preset === "string" ? summary.selected_preset.trim() : null,
+      score: readNumber(summary.selected_score),
+    });
+  }
+
+  const candidatePrefix =
+    typeof summary.candidate_checkpoint_prefix === "string" ? summary.candidate_checkpoint_prefix.trim() : "";
+  if (candidatePrefix) {
+    register({
+      prefix: candidatePrefix,
+      epoch: readNumber(summary.candidate_checkpoint_epoch),
+      preset: typeof summary.candidate_preset === "string" ? summary.candidate_preset.trim() : null,
+      score: readNumber(summary.candidate_score),
+    });
+  }
+
+  return [...byPrefix.values()];
+};
+
+const resolvePromotionSettings = (
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>,
+  presetName: string | null
+) => {
+  const normalizedPreset = typeof presetName === "string" ? presetName.trim() : "";
+  const presets = getValidationPresets(
+    voice.model_id ?? (voice.model_size || "1.7B"),
+    String(voice.labels?.language ?? "")
+  );
+  const preset = presets.find((value) => value.name === normalizedPreset);
+  return preset?.settings ?? voice.settings ?? {};
 };
 
 const isMissingRunpodRequestError = (error: unknown): error is Error => {
@@ -229,19 +418,103 @@ const shouldPreserveCurrentReadyVoice = (
 
 const shouldKeepReadyVoiceOnValidationFailure = (
   voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>,
-  summary: Record<string, unknown>
-): boolean => shouldPreserveCurrentReadyVoice(voice);
+  summary: Record<string, unknown>,
+  options?: {
+    evaluatedCheckpoints?: CheckpointEvaluation[];
+    validationRunName?: string | null;
+    forceRevalidation?: boolean;
+  }
+): boolean => {
+  if (!shouldPreserveCurrentReadyVoice(voice)) {
+    return false;
+  }
+
+  const currentPrefix =
+    typeof voice.checkpoint_r2_prefix === "string" ? voice.checkpoint_r2_prefix.trim() : "";
+  if (!currentPrefix) {
+    return false;
+  }
+
+  const getRunNameFromPrefix = (prefix: string): string | null => {
+    const parts = prefix.split("/");
+    if (parts.length < 4 || parts[0] !== "checkpoints") {
+      return null;
+    }
+    return parts[2] || null;
+  };
+  const currentRunName = getRunNameFromPrefix(currentPrefix);
+  const referencedPrefixes = new Set<string>();
+  const referencedRunNames = new Set<string>();
+  const registerPrefix = (value: unknown) => {
+    if (typeof value !== "string") {
+      return;
+    }
+    const normalized = value.trim();
+    if (normalized) {
+      referencedPrefixes.add(normalized);
+      const runName = getRunNameFromPrefix(normalized);
+      if (runName) {
+        referencedRunNames.add(runName);
+      }
+    }
+  };
+  const registerRunName = (value: unknown) => {
+    if (typeof value !== "string") {
+      return;
+    }
+    const normalized = value.trim();
+    if (normalized) {
+      referencedRunNames.add(normalized);
+    }
+  };
+
+  registerPrefix(summary.selected_checkpoint_prefix);
+  registerPrefix(summary.candidate_checkpoint_prefix);
+  registerPrefix(summary.manual_promoted_checkpoint_prefix);
+
+  const asyncValidation =
+    summary.async_validation && typeof summary.async_validation === "object"
+      ? (summary.async_validation as Record<string, unknown>)
+      : null;
+  registerPrefix(asyncValidation?.checkpoint_prefix);
+
+  const evaluated = Array.isArray(summary.evaluated_checkpoints) ? summary.evaluated_checkpoints : [];
+  for (const value of evaluated) {
+    if (!value || typeof value !== "object") {
+      continue;
+    }
+    registerPrefix((value as Record<string, unknown>).prefix);
+  }
+
+  for (const evaluation of options?.evaluatedCheckpoints ?? []) {
+    registerPrefix(evaluation.prefix);
+  }
+  registerRunName(options?.validationRunName);
+
+  if (referencedPrefixes.has(currentPrefix)) {
+    return false;
+  }
+
+  const forceRevalidation =
+    options?.forceRevalidation === true || summary.force_revalidation === true;
+  if (forceRevalidation && currentRunName && referencedRunNames.has(currentRunName)) {
+    return false;
+  }
+
+  return true;
+};
 
 type PodStatusDetail = NonNullable<Awaited<ReturnType<typeof getPodStatus>>>;
 
 const FULL_VALIDATION_SEEDS_OFFSET = [123456, 223456] as const;
-const FAST_VALIDATION_SEEDS_OFFSET = [123456] as const;
+const FAST_VALIDATION_SEEDS_OFFSET = [123456, 223456] as const;
 const MAX_CHECKPOINTS_TO_EVAL = 4;
 const MAX_CHECKPOINTS_TO_EVAL_06B = 4;
 const VALIDATION_RETRY_ATTEMPTS = 3;
 const MIN_PASS_RATE_06B = 5 / 6;
 const MIN_PASS_RATE_17B = 5 / 6;
 const PROVISIONING_STALE_MS = 4 * 60 * 1000;
+const VALIDATION_RUN_STALE_MS = 6 * 60 * 1000;
 
 const getRecommendedTrainingDefaults = (modelSize: string): {
   batch_size: number;
@@ -256,13 +529,14 @@ const getRecommendedTrainingDefaults = (modelSize: string): {
   if (modelSize.includes("0.6")) {
     return {
       batch_size: 2,
-      learning_rate: 4e-6,
-      num_epochs: 7,
+      // Keep 0.6B close to the official finetuning recipe; prior higher-LR/lower-subtalker runs were unstable.
+      learning_rate: 2.5e-6,
+      num_epochs: 12,
       gradient_accumulation_steps: 4,
       subtalker_loss_weight: 0.3,
       save_every_n_epochs: 1,
-      seed: 77,
-      gpu_type_id: "NVIDIA A100-SXM4-80GB",
+      seed: 303,
+      gpu_type_id: "NVIDIA L40S",
     };
   }
 
@@ -289,6 +563,18 @@ const GHCR_INDEX_ACCEPT =
 const readNumber = (value: unknown): number | null => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+};
+
+const getValidationRunStartedAt = (
+  persistedState: Record<string, unknown> | null,
+  job: TrainingJob
+): number => {
+  const fromState = readNumber(persistedState?.run_started_at);
+  if (fromState !== null) {
+    return fromState;
+  }
+  const fallback = readNumber(job.completed_at) ?? readNumber(job.updated_at) ?? Date.now();
+  return fallback;
 };
 
 const resolveGhcrAmd64Image = async (imageName: string): Promise<string> => {
@@ -751,13 +1037,29 @@ const getValidationTexts = (lang: string, is06b: boolean): string[] => {
   if (!is06b) {
     return fallback;
   }
+  if (fallback.length >= 3) {
+    return [fallback[1], fallback[2]];
+  }
   if (fallback.length >= 2) {
-    return [fallback[1]];
+    return [fallback[0], fallback[1]];
   }
   return fallback.slice(0, 1);
 };
 
-const getValidationPresets = (modelId: string): ValidationPreset[] => {
+const getSignatureStyleInstruction = (lang: string): string => {
+  switch (lang) {
+    case "ko":
+      return "참고 음성의 특유의 말투와 호흡, 문장 리듬, 억양의 오르내림을 최대한 유지하고 과장하지 말고 자연스럽게 말하세요.";
+    case "ja":
+      return "参照音声の話し方、間の取り方、文のリズム、抑揚をできるだけ保ち、誇張せず自然に話してください。";
+    case "zh":
+      return "尽量保留参考音频特有的说话方式、停连节奏、句子律动和语调起伏，不要夸张，保持自然。";
+    default:
+      return "Preserve the reference voice's natural cadence, pauses, emphasis, and conversational rhythm. Keep the delivery natural and not exaggerated.";
+  }
+};
+
+const getValidationPresets = (modelId: string, lang = ""): ValidationPreset[] => {
   const is06b = modelId.toLowerCase().includes("0.6b");
   const balancedSettings = {
     stability: 0.85,
@@ -771,6 +1073,13 @@ const getValidationPresets = (modelId: string): ValidationPreset[] => {
     style: 0.05,
     speed: 1.0,
   };
+  const signatureStyleSettings = {
+    stability: 0.82,
+    similarity_boost: 0.9,
+    style: 0.18,
+    speed: 0.98,
+  };
+  const signatureInstruction = getSignatureStyleInstruction(lang.toLowerCase());
 
   if (!is06b) {
     return [
@@ -783,6 +1092,14 @@ const getValidationPresets = (modelId: string): ValidationPreset[] => {
         name: "high_similarity",
         payload: { voice_settings: conservativeSettings },
         settings: conservativeSettings,
+      },
+      {
+        name: "signature_style",
+        payload: {
+          voice_settings: signatureStyleSettings,
+          instruct: signatureInstruction,
+        },
+        settings: signatureStyleSettings,
       },
     ];
   }
@@ -814,16 +1131,63 @@ const getValidationPlan = (
   const validationSeedOffsets = is06b ? FAST_VALIDATION_SEEDS_OFFSET : FULL_VALIDATION_SEEDS_OFFSET;
   return {
     is06b,
-    presets: getValidationPresets(modelId),
+    presets: getValidationPresets(modelId, lang),
     validationTexts,
     validationSeedOffsets,
     totalSamples: validationTexts.length * validationSeedOffsets.length,
     minOverall: is06b ? 0.9 : 0.85,
     minPassRate: is06b ? MIN_PASS_RATE_06B : MIN_PASS_RATE_17B,
     minAsrScore: 0.8,
+    minToneScore: is06b ? 0.45 : 0.55,
     maxCheckpointsToEval: is06b ? MAX_CHECKPOINTS_TO_EVAL_06B : MAX_CHECKPOINTS_TO_EVAL,
     prioritizeLatestPassingCheckpoint: is06b,
   };
+};
+
+const buildValidationScoreParts = ({
+  is06b,
+  overall,
+  asr,
+  health,
+  duration,
+  passRate,
+  speaker,
+  tone,
+  speed,
+}: {
+  is06b: boolean;
+  overall: number;
+  asr: number;
+  health: number;
+  duration: number;
+  passRate: number;
+  speaker: number;
+  tone: number;
+  speed: number;
+}): Array<{ value: number; weight: number }> => {
+  const baseWeights = is06b
+    ? { overall: 0.38, asr: 0.22, health: 0.14, duration: 0.08, passRate: 0.08, speaker: 0.20, tone: 0.06, speed: 0.06 }
+    : { overall: 0.34, asr: 0.18, health: 0.12, duration: 0.06, passRate: 0.06, speaker: 0.18, tone: 0.16, speed: 0.10 };
+
+  const parts: Array<{ value: number; weight: number }> = [
+    { value: overall, weight: baseWeights.overall },
+    { value: asr, weight: baseWeights.asr },
+    { value: health, weight: baseWeights.health },
+    { value: duration, weight: baseWeights.duration },
+    { value: passRate, weight: baseWeights.passRate },
+  ];
+
+  if (Number.isFinite(speaker)) {
+    parts.push({ value: speaker, weight: baseWeights.speaker });
+  }
+  if (Number.isFinite(tone)) {
+    parts.push({ value: tone, weight: baseWeights.tone });
+  }
+  if (Number.isFinite(speed)) {
+    parts.push({ value: speed, weight: baseWeights.speed });
+  }
+
+  return parts;
 };
 
 const serializeTrainingJob = (job: TrainingJob): Omit<TrainingJob, "job_token"> => {
@@ -1096,6 +1460,7 @@ const evaluateValidationSample = ({
   referenceText,
   minOverall,
   minAsrScore,
+  minToneScore,
 }: {
   output: { quality?: Record<string, unknown>; audio?: string; error?: unknown } | null;
   fallbackError?: string | null;
@@ -1105,6 +1470,7 @@ const evaluateValidationSample = ({
   referenceText: string;
   minOverall: number;
   minAsrScore: number;
+  minToneScore: number;
 }): ValidationSampleOutcome => {
   if (!output?.audio) {
     const lastErrorDetail =
@@ -1177,7 +1543,7 @@ const evaluateValidationSample = ({
   if (referenceAudioKey && Number.isFinite(speaker) && speaker < 0.75) {
     return fail(`sample ${sampleIndex} seed ${seed} speaker_score=${speaker.toFixed(3)}`);
   }
-  if (referenceAudioKey && Number.isFinite(tone) && tone < 0.45) {
+  if (referenceAudioKey && Number.isFinite(tone) && tone < minToneScore) {
     return fail(`sample ${sampleIndex} seed ${seed} tone_score=${tone.toFixed(3)}`);
   }
   if (referenceAudioKey && referenceText && Number.isFinite(speed) && speed < 0.55) {
@@ -1242,11 +1608,13 @@ const finalizeValidationPresetResult = ({
   preset,
   totalSamples,
   minPassRate,
+  is06b,
 }: {
   accumulator: AsyncValidationAccumulator;
   preset: ValidationPreset;
   totalSamples: number;
   minPassRate: number;
+  is06b: boolean;
 }): CheckpointValidationResult => {
   const passRate = totalSamples > 0 ? accumulator.passed / totalSamples : 0;
   if (accumulator.passed > 0 && passRate >= minPassRate && accumulator.infra_issues === 0) {
@@ -1259,22 +1627,17 @@ const finalizeValidationPresetResult = ({
       accumulator.speaker_samples > 0 ? accumulator.sum_speaker / accumulator.speaker_samples : NaN;
     const meanTone = accumulator.tone_samples > 0 ? accumulator.sum_tone / accumulator.tone_samples : NaN;
     const meanSpeed = accumulator.speed_samples > 0 ? accumulator.sum_speed / accumulator.speed_samples : NaN;
-    const scoreParts: Array<{ value: number; weight: number }> = [
-      { value: meanOverall, weight: 0.38 },
-      { value: meanAsr, weight: 0.22 },
-      { value: meanHealth, weight: 0.14 },
-      { value: meanDuration, weight: 0.08 },
-      { value: passRate, weight: 0.08 },
-    ];
-    if (Number.isFinite(meanSpeaker)) {
-      scoreParts.push({ value: meanSpeaker, weight: 0.20 });
-    }
-    if (Number.isFinite(meanTone)) {
-      scoreParts.push({ value: meanTone, weight: 0.06 });
-    }
-    if (Number.isFinite(meanSpeed)) {
-      scoreParts.push({ value: meanSpeed, weight: 0.06 });
-    }
+    const scoreParts = buildValidationScoreParts({
+      is06b,
+      overall: meanOverall,
+      asr: meanAsr,
+      health: meanHealth,
+      duration: meanDuration,
+      passRate,
+      speaker: meanSpeaker,
+      tone: meanTone,
+      speed: meanSpeed,
+    });
     const totalWeight = scoreParts.reduce((acc, part) => acc + part.weight, 0) || 1;
     const score =
       scoreParts.reduce((acc, part) => acc + (part.value * part.weight), 0) / totalWeight;
@@ -1325,6 +1688,7 @@ const scoreSingleValidationOutput = ({
   referenceAudioKey,
   referenceText,
   is06b,
+  minToneScore,
 }: {
   preset: ValidationPreset;
   seed: number;
@@ -1333,6 +1697,7 @@ const scoreSingleValidationOutput = ({
   referenceAudioKey: string | null;
   referenceText: string;
   is06b: boolean;
+  minToneScore: number;
 }): CheckpointValidationResult => {
   const minOverall = is06b ? 0.9 : 0.85;
   const minAsrScore = 0.8;
@@ -1399,29 +1764,24 @@ const scoreSingleValidationOutput = ({
   if (referenceAudioKey && Number.isFinite(speaker) && speaker < 0.75) {
     return fail(`sample 1 seed ${seed} speaker_score=${speaker.toFixed(3)}`);
   }
-  if (referenceAudioKey && Number.isFinite(tone) && tone < 0.45) {
+  if (referenceAudioKey && Number.isFinite(tone) && tone < minToneScore) {
     return fail(`sample 1 seed ${seed} tone_score=${tone.toFixed(3)}`);
   }
   if (referenceAudioKey && referenceText && Number.isFinite(speed) && speed < 0.55) {
     return fail(`sample 1 seed ${seed} speed_score=${speed.toFixed(3)}`);
   }
 
-  const scoreParts: Array<{ value: number; weight: number }> = [
-    { value: overall, weight: 0.38 },
-    { value: asr, weight: 0.22 },
-    { value: health, weight: 0.14 },
-    { value: duration, weight: 0.08 },
-    { value: 1, weight: 0.08 },
-  ];
-  if (Number.isFinite(speaker)) {
-    scoreParts.push({ value: speaker, weight: 0.20 });
-  }
-  if (Number.isFinite(tone)) {
-    scoreParts.push({ value: tone, weight: 0.06 });
-  }
-  if (Number.isFinite(speed)) {
-    scoreParts.push({ value: speed, weight: 0.06 });
-  }
+  const scoreParts = buildValidationScoreParts({
+    is06b,
+    overall,
+    asr,
+    health,
+    duration,
+    passRate: 1,
+    speaker,
+    tone,
+    speed,
+  });
   const totalWeight = scoreParts.reduce((acc, part) => acc + part.weight, 0) || 1;
   const score = scoreParts.reduce((acc, part) => acc + (part.value * part.weight), 0) / totalWeight;
   const similarityNote = Number.isFinite(speaker) && Number.isFinite(tone)
@@ -1493,13 +1853,26 @@ const advanceAsyncCheckpointValidation = async (
     champion: AsyncValidationChampion,
     evaluations: CheckpointEvaluation[]
   ): Promise<{ status: string; progress: TrainingProgress }> => {
-    await updateVoice(c.env.DB, job.voice_id, {
-      status: "ready",
-      checkpoint_r2_prefix: champion.prefix,
-      run_name: parseRunNameFromCheckpointPrefix(champion.prefix),
-      epoch: champion.epoch,
-      settings: champion.preset_settings,
+    const promotion = await chooseCheckpointPromotion({
+      c,
+      voice,
+      candidatePrefix: champion.prefix,
+      candidateScore: champion.score,
     });
+
+    if (promotion.promote) {
+      await updateVoice(c.env.DB, job.voice_id, {
+        status: "ready",
+        checkpoint_r2_prefix: champion.prefix,
+        run_name: parseRunNameFromCheckpointPrefix(champion.prefix),
+        epoch: champion.epoch,
+        settings: champion.preset_settings,
+      });
+    }
+
+    const validationMessage = promotion.promote
+      ? champion.message
+      : `${champion.message} | kept current ready checkpoint score=${(promotion.preservedScore ?? 0).toFixed(3)} >= candidate_score=${champion.score.toFixed(3)}`;
     await updateTrainingJob(c.env.DB, job.job_id, {
       status: "completed",
       completed_at: job.completed_at ?? Date.now(),
@@ -1509,11 +1882,15 @@ const advanceAsyncCheckpointValidation = async (
         validation_in_progress: false,
         validation_checked: true,
         validation_passed: true,
-        validation_message: champion.message,
-        selected_checkpoint_prefix: champion.prefix,
-        selected_checkpoint_epoch: champion.epoch,
-        selected_preset: champion.preset_name,
-        selected_score: champion.score,
+        validation_message: validationMessage,
+        selected_checkpoint_prefix: promotion.promote ? champion.prefix : promotion.preservedPrefix,
+        selected_checkpoint_epoch: promotion.promote ? champion.epoch : promotion.preservedEpoch,
+        selected_preset: promotion.promote ? champion.preset_name : "kept_existing_best",
+        selected_score: promotion.promote ? champion.score : promotion.preservedScore,
+        candidate_checkpoint_prefix: champion.prefix,
+        candidate_checkpoint_epoch: champion.epoch,
+        candidate_preset: champion.preset_name,
+        candidate_score: champion.score,
         evaluated_checkpoints: evaluations,
         async_validation: null,
       },
@@ -1525,7 +1902,13 @@ const advanceAsyncCheckpointValidation = async (
     message: string,
     evaluations: CheckpointEvaluation[]
   ): Promise<{ status: string; progress: TrainingProgress }> => {
-    if (!shouldKeepReadyVoiceOnValidationFailure(voice, currentSummary)) {
+    if (
+      !shouldKeepReadyVoiceOnValidationFailure(voice, currentSummary, {
+        evaluatedCheckpoints: evaluations,
+        validationRunName: parseRunNameFromCheckpointPrefix(candidateCheckpoints[0]?.r2_prefix ?? ""),
+        forceRevalidation: currentSummary.force_revalidation === true,
+      })
+    ) {
       await updateVoice(c.env.DB, job.voice_id, {
         status: "created",
         checkpoint_r2_prefix: null,
@@ -1535,8 +1918,8 @@ const advanceAsyncCheckpointValidation = async (
     }
 
     await updateTrainingJob(c.env.DB, job.job_id, {
-      status: "failed",
-      error_message: message,
+      status: "completed",
+      error_message: null,
       completed_at: job.completed_at ?? Date.now(),
       progress,
       summary: {
@@ -1546,12 +1929,17 @@ const advanceAsyncCheckpointValidation = async (
         validation_checked: true,
         validation_passed: false,
         validation_failed: true,
+        validation_rejected: true,
         validation_message: message,
+        selected_checkpoint_prefix: null,
+        selected_checkpoint_epoch: null,
+        selected_preset: null,
+        selected_score: null,
         evaluated_checkpoints: evaluations,
         async_validation: null,
       },
     });
-    return { status: "failed", progress };
+    return { status: "completed", progress };
   };
 
   const startValidationSample = async ({
@@ -1606,6 +1994,7 @@ const advanceAsyncCheckpointValidation = async (
     const nextState: AsyncCheckpointValidationState = {
       mode: "checkpoint_async",
       run_id: String(runpodResponse.id ?? ""),
+      run_started_at: Date.now(),
       checkpoint_index: checkpointIndex,
       checkpoint_epoch: checkpoint.epoch,
       checkpoint_prefix: checkpoint.r2_prefix,
@@ -1692,7 +2081,14 @@ const advanceAsyncCheckpointValidation = async (
     c.env.RUNPOD_ENDPOINT_ID,
     runId
   );
-  const runStatus = String(runpodResponse.status ?? "UNKNOWN");
+  const runStartedAt = getValidationRunStartedAt(persistedState, job);
+  const runAgeMs = Math.max(0, Date.now() - runStartedAt);
+  const rawRunStatus = String(runpodResponse.status ?? "UNKNOWN");
+  const runTimedOut =
+    rawRunStatus !== "COMPLETED" &&
+    rawRunStatus !== "FAILED" &&
+    runAgeMs > VALIDATION_RUN_STALE_MS;
+  const runStatus = runTimedOut ? "FAILED" : rawRunStatus;
   const sampleOrdinal = textIndex * plan.validationSeedOffsets.length + seedIndex + 1;
   if (runStatus !== "COMPLETED" && runStatus !== "FAILED") {
     await updateTrainingJob(c.env.DB, job.job_id, {
@@ -1709,6 +2105,7 @@ const advanceAsyncCheckpointValidation = async (
         evaluated_checkpoints: existingEvaluations,
         async_validation: {
           ...persistedState,
+          run_started_at: runStartedAt,
           evaluations: existingEvaluations,
         },
       },
@@ -1733,7 +2130,9 @@ const advanceAsyncCheckpointValidation = async (
     }
   }
   const fallbackError =
-    typeof enrichedOutput?.error === "string"
+    runTimedOut
+      ? `validation request timed out after ${Math.round(runAgeMs / 1000)}s`
+      : typeof enrichedOutput?.error === "string"
       ? enrichedOutput.error
       : typeof runpodResponse.error === "string"
         ? runpodResponse.error
@@ -1750,6 +2149,7 @@ const advanceAsyncCheckpointValidation = async (
     referenceText: typeof persistedState.reference_text === "string" ? persistedState.reference_text : "",
     minOverall: plan.minOverall,
     minAsrScore: plan.minAsrScore,
+    minToneScore: plan.minToneScore,
   });
   const nextPresetStats = applyValidationSampleOutcome(
     normalizeValidationAccumulator(persistedState.preset_stats),
@@ -1780,6 +2180,7 @@ const advanceAsyncCheckpointValidation = async (
     preset,
     totalSamples: plan.totalSamples,
     minPassRate: plan.minPassRate,
+    is06b: plan.is06b,
   });
   const nextCheckpointBestPassing =
     presetResult.ok &&
@@ -1900,7 +2301,12 @@ const advanceAsync06bCheckpointValidation = async (
   currentSummary: Record<string, unknown>,
   candidateCheckpoints: CheckpointCandidate[]
 ): Promise<{ status: string; progress: TrainingProgress }> => {
-  const preset = getValidationPresets(voice.model_id ?? "qwen3-tts-0.6b")[0];
+  const preset = getValidationPresets(
+    voice.model_id ?? "qwen3-tts-0.6b",
+    typeof (job.config as Record<string, unknown>).whisper_language === "string"
+      ? String((job.config as Record<string, unknown>).whisper_language).toLowerCase()
+      : String(voice.labels?.language ?? "")
+  )[0];
   const validationText = getValidationTexts(
     typeof (job.config as Record<string, unknown>).whisper_language === "string"
       ? String((job.config as Record<string, unknown>).whisper_language).toLowerCase()
@@ -1942,8 +2348,8 @@ const advanceAsync06bCheckpointValidation = async (
     const checkpoint = candidateCheckpoints[checkpointIndex];
     if (!checkpoint) {
       await updateTrainingJob(c.env.DB, job.job_id, {
-        status: "failed",
-        error_message: "No remaining checkpoints to validate",
+        status: "completed",
+        error_message: null,
         completed_at: job.completed_at ?? Date.now(),
         progress,
         summary: {
@@ -1952,12 +2358,17 @@ const advanceAsync06bCheckpointValidation = async (
           validation_checked: true,
           validation_passed: false,
           validation_failed: true,
+          validation_rejected: true,
           validation_message: "No remaining checkpoints to validate",
+          selected_checkpoint_prefix: null,
+          selected_checkpoint_epoch: null,
+          selected_preset: null,
+          selected_score: null,
           evaluated_checkpoints: evaluations,
           async_validation: null,
         },
       });
-      return { status: "failed", progress };
+      return { status: "completed", progress };
     }
     const reference = referenceAudioKey !== null || referenceText
       ? { referenceAudioKey, referenceText }
@@ -1975,6 +2386,7 @@ const advanceAsync06bCheckpointValidation = async (
     const nextState: Async06bValidationState = {
       mode: "fast_06b_async",
       run_id: String(runpodResponse.id ?? ""),
+      run_started_at: Date.now(),
       checkpoint_index: checkpointIndex,
       checkpoint_epoch: checkpoint.epoch,
       checkpoint_prefix: checkpoint.r2_prefix,
@@ -2015,7 +2427,14 @@ const advanceAsync06bCheckpointValidation = async (
     c.env.RUNPOD_ENDPOINT_ID,
     persistedState.run_id
   );
-  const runStatus = String(runpodResponse.status ?? "UNKNOWN");
+  const runStartedAt = getValidationRunStartedAt(persistedState, job);
+  const runAgeMs = Math.max(0, Date.now() - runStartedAt);
+  const rawRunStatus = String(runpodResponse.status ?? "UNKNOWN");
+  const runTimedOut =
+    rawRunStatus !== "COMPLETED" &&
+    rawRunStatus !== "FAILED" &&
+    runAgeMs > VALIDATION_RUN_STALE_MS;
+  const runStatus = runTimedOut ? "FAILED" : rawRunStatus;
   if (runStatus !== "COMPLETED" && runStatus !== "FAILED") {
     await updateTrainingJob(c.env.DB, job.job_id, {
       status: "completed",
@@ -2027,6 +2446,7 @@ const advanceAsync06bCheckpointValidation = async (
         validation_message: `Validation still running for checkpoint epoch ${currentEpoch} (${runStatus.toLowerCase()})`,
         async_validation: {
           ...persistedState,
+          run_started_at: runStartedAt,
           evaluations: existingEvaluations,
         },
       },
@@ -2049,7 +2469,9 @@ const advanceAsync06bCheckpointValidation = async (
     }
   }
   const asyncFailureDetail =
-    typeof enrichedOutput?.error === "string"
+    runTimedOut
+      ? `validation request timed out after ${Math.round(runAgeMs / 1000)}s`
+      : typeof enrichedOutput?.error === "string"
       ? enrichedOutput.error
       : typeof runpodResponse.error === "string"
         ? runpodResponse.error
@@ -2064,6 +2486,7 @@ const advanceAsync06bCheckpointValidation = async (
           referenceAudioKey: referenceAudioKey,
           referenceText,
           is06b: true,
+          minToneScore: 0.45,
         })
       : {
           ok: false,
@@ -2089,15 +2512,30 @@ const advanceAsync06bCheckpointValidation = async (
   ];
 
   if (result.ok) {
-    await updateVoice(c.env.DB, job.voice_id, {
-      status: "ready",
-      checkpoint_r2_prefix: typeof currentPrefix === "string" ? currentPrefix : candidateCheckpoints[currentIndex].r2_prefix,
-      run_name: parseRunNameFromCheckpointPrefix(
-        typeof currentPrefix === "string" ? currentPrefix : candidateCheckpoints[currentIndex].r2_prefix
-      ),
-      epoch: typeof currentEpoch === "number" ? currentEpoch : candidateCheckpoints[currentIndex].epoch,
-      settings: result.presetSettings,
+    const promotedPrefix =
+      typeof currentPrefix === "string" ? currentPrefix : candidateCheckpoints[currentIndex].r2_prefix;
+    const promotedEpoch =
+      typeof currentEpoch === "number" ? currentEpoch : candidateCheckpoints[currentIndex].epoch;
+    const promotion = await chooseCheckpointPromotion({
+      c,
+      voice,
+      candidatePrefix: promotedPrefix,
+      candidateScore: result.aggregateScore,
     });
+
+    if (promotion.promote) {
+      await updateVoice(c.env.DB, job.voice_id, {
+        status: "ready",
+        checkpoint_r2_prefix: promotedPrefix,
+        run_name: parseRunNameFromCheckpointPrefix(promotedPrefix),
+        epoch: promotedEpoch,
+        settings: result.presetSettings,
+      });
+    }
+
+    const validationMessage = promotion.promote
+      ? result.message
+      : `${result.message} | kept current ready checkpoint score=${(promotion.preservedScore ?? 0).toFixed(3)} >= candidate_score=${result.aggregateScore.toFixed(3)}`;
     await updateTrainingJob(c.env.DB, job.job_id, {
       status: "completed",
       completed_at: job.completed_at ?? Date.now(),
@@ -2108,13 +2546,15 @@ const advanceAsync06bCheckpointValidation = async (
           validation_in_progress: false,
           validation_checked: true,
           validation_passed: true,
-        validation_message: result.message,
-        selected_checkpoint_prefix:
-          typeof currentPrefix === "string" ? currentPrefix : candidateCheckpoints[currentIndex].r2_prefix,
-        selected_checkpoint_epoch:
-          typeof currentEpoch === "number" ? currentEpoch : candidateCheckpoints[currentIndex].epoch,
-        selected_preset: result.presetName,
-        selected_score: result.aggregateScore,
+        validation_message: validationMessage,
+        selected_checkpoint_prefix: promotion.promote ? promotedPrefix : promotion.preservedPrefix,
+        selected_checkpoint_epoch: promotion.promote ? promotedEpoch : promotion.preservedEpoch,
+        selected_preset: promotion.promote ? result.presetName : "kept_existing_best",
+        selected_score: promotion.promote ? result.aggregateScore : promotion.preservedScore,
+        candidate_checkpoint_prefix: promotedPrefix,
+        candidate_checkpoint_epoch: promotedEpoch,
+        candidate_preset: result.presetName,
+        candidate_score: result.aggregateScore,
         evaluated_checkpoints: nextEvaluations,
         async_validation: null,
       },
@@ -2136,7 +2576,13 @@ const advanceAsync06bCheckpointValidation = async (
     return startCheckpointValidation(nextIndex, nextEvaluations);
   }
 
-  if (!shouldKeepReadyVoiceOnValidationFailure(voice, currentSummary)) {
+  if (
+    !shouldKeepReadyVoiceOnValidationFailure(voice, currentSummary, {
+      evaluatedCheckpoints: nextEvaluations,
+      validationRunName: parseRunNameFromCheckpointPrefix(candidateCheckpoints[0]?.r2_prefix ?? ""),
+      forceRevalidation: currentSummary.force_revalidation === true,
+    })
+  ) {
     await updateVoice(c.env.DB, job.voice_id, {
       status: "created",
       checkpoint_r2_prefix: null,
@@ -2146,8 +2592,8 @@ const advanceAsync06bCheckpointValidation = async (
   }
 
   await updateTrainingJob(c.env.DB, job.job_id, {
-    status: "failed",
-    error_message: result.message,
+    status: "completed",
+    error_message: null,
     completed_at: job.completed_at ?? Date.now(),
     progress,
     summary: {
@@ -2157,12 +2603,17 @@ const advanceAsync06bCheckpointValidation = async (
       validation_checked: true,
       validation_passed: false,
       validation_failed: true,
+      validation_rejected: true,
       validation_message: result.message,
+      selected_checkpoint_prefix: null,
+      selected_checkpoint_epoch: null,
+      selected_preset: null,
+      selected_score: null,
       evaluated_checkpoints: nextEvaluations,
       async_validation: null,
     },
   });
-  return { status: "failed", progress };
+  return { status: "completed", progress };
 };
 
 const validateTrainedCheckpoint = async (
@@ -2174,7 +2625,7 @@ const validateTrainedCheckpoint = async (
   const jobConfig = job.config as Record<string, unknown>;
   const lang = typeof jobConfig.whisper_language === "string" ? jobConfig.whisper_language.toLowerCase() : "";
   const datasetPrefix = String(job.dataset_r2_prefix ?? "").replace(/\/+$/, "");
-  const presets = getValidationPresets(voice.model_id ?? "qwen3-tts-1.7b");
+  const presets = getValidationPresets(voice.model_id ?? "qwen3-tts-1.7b", lang);
   const is06b = String(voice.model_id ?? "").toLowerCase().includes("0.6b");
   const validationTexts = getValidationTexts(lang, is06b);
   const validationSeedOffsets = is06b ? FAST_VALIDATION_SEEDS_OFFSET : FULL_VALIDATION_SEEDS_OFFSET;
@@ -2396,22 +2847,17 @@ const validateTrainedCheckpoint = async (
         const meanSpeaker = speakerSamples > 0 ? (sumSpeaker / speakerSamples) : NaN;
         const meanTone = toneSamples > 0 ? (sumTone / toneSamples) : NaN;
         const meanSpeed = speedSamples > 0 ? (sumSpeed / speedSamples) : NaN;
-        const scoreParts: Array<{ value: number; weight: number }> = [
-          { value: meanOverall, weight: 0.38 },
-          { value: meanAsr, weight: 0.22 },
-          { value: meanHealth, weight: 0.14 },
-          { value: meanDuration, weight: 0.08 },
-          { value: passRate, weight: 0.08 },
-        ];
-        if (Number.isFinite(meanSpeaker)) {
-          scoreParts.push({ value: meanSpeaker, weight: 0.20 });
-        }
-        if (Number.isFinite(meanTone)) {
-          scoreParts.push({ value: meanTone, weight: 0.06 });
-        }
-        if (Number.isFinite(meanSpeed)) {
-          scoreParts.push({ value: meanSpeed, weight: 0.06 });
-        }
+        const scoreParts = buildValidationScoreParts({
+          is06b: true,
+          overall: meanOverall,
+          asr: meanAsr,
+          health: meanHealth,
+          duration: meanDuration,
+          passRate,
+          speaker: meanSpeaker,
+          tone: meanTone,
+          speed: meanSpeed,
+        });
         const totalWeight = scoreParts.reduce((acc, part) => acc + part.weight, 0) || 1;
         const score = scoreParts.reduce((acc, part) => acc + (part.value * part.weight), 0) / totalWeight;
         const similarityNote = Number.isFinite(meanSpeaker) && Number.isFinite(meanTone)
@@ -2614,14 +3060,26 @@ const reconcileJobStatus = async (
 const RECONCILE_TIMEOUT_MS = 25000;
 const COMPLETED_VALIDATION_TIMEOUT_MS = 180000;
 
+const getExecutionCtx = (c: Context<AppContext>): ExecutionContext | undefined =>
+  (c as unknown as { executionCtx?: ExecutionContext }).executionCtx;
+
+const waitForBackgroundTask = (c: Context<AppContext>, promise: Promise<unknown>) => {
+  getExecutionCtx(c)?.waitUntil(
+    promise
+      .then(() => undefined)
+      .catch(() => undefined)
+  );
+};
+
 const reconcileJobStatusWithTimeout = async (
   c: Context<AppContext>,
   job: TrainingJob,
   timeoutMs = RECONCILE_TIMEOUT_MS
 ): Promise<boolean> => {
   let timedOut = false;
+  const reconcilePromise = reconcileJobStatus(c, job);
   await Promise.race([
-    reconcileJobStatus(c, job),
+    reconcilePromise,
     new Promise<void>((resolve) =>
       setTimeout(() => {
         timedOut = true;
@@ -2629,6 +3087,9 @@ const reconcileJobStatusWithTimeout = async (
       }, timeoutMs)
     ),
   ]);
+  if (timedOut) {
+    waitForBackgroundTask(c, reconcilePromise);
+  }
   return !timedOut;
 };
 
@@ -2662,7 +3123,7 @@ app.post("/start", async (c) => {
   const jobToken = crypto.randomUUID();
   const workerUrl = getWorkerOrigin(c);
   const runName = `run_${jobId.slice(0, 8)}`;
-  const datasetPrefix = body.dataset_name ? `datasets/${body.voice_id}/${body.dataset_name}` : `datasets/${body.voice_id}`;
+  const datasetPrefix = resolveTrainingDatasetPrefix(voice, body.dataset_name);
   const config = body.config ?? {};
   const cfg = config as Record<string, unknown>;
   const modelSize = typeof config.model_size === "string" && config.model_size
@@ -2908,12 +3369,6 @@ app.get("/:job_id", async (c) => {
       : RECONCILE_TIMEOUT_MS;
     const reconciled = await reconcileJobStatusWithTimeout(c, job, timeoutMs);
     if (!reconciled) {
-      const execCtx = (c as unknown as { executionCtx?: ExecutionContext }).executionCtx;
-      execCtx?.waitUntil(
-        reconcileJobStatus(c, job)
-          .then(() => undefined)
-          .catch(() => undefined)
-      );
       return c.json({
         ...serializeTrainingJob(job),
         summary: {
@@ -3004,12 +3459,7 @@ app.post("/:job_id/reconcile", async (c) => {
     });
   }
 
-  const execCtx = (c as unknown as { executionCtx?: ExecutionContext }).executionCtx;
-  execCtx?.waitUntil(
-    reconcileJobStatus(c, job)
-      .then(() => undefined)
-      .catch(() => undefined)
-  );
+  waitForBackgroundTask(c, reconcileJobStatus(c, job));
 
   return c.json({
     status: "accepted",
@@ -3066,19 +3516,72 @@ app.post("/:job_id/revalidate", async (c) => {
   }
 
   const reconciled = await reconcileJobStatusWithTimeout(c, refreshedJob, COMPLETED_VALIDATION_TIMEOUT_MS);
-  if (!reconciled) {
-    const execCtx = (c as unknown as { executionCtx?: ExecutionContext }).executionCtx;
-    execCtx?.waitUntil(
-      reconcileJobStatus(c, refreshedJob)
-        .then(() => undefined)
-        .catch(() => undefined)
-    );
-  }
 
   const updatedJob = await getTrainingJob(c.env.DB, jobId);
   return c.json({
     status: reconciled ? "started" : "accepted",
     job: serializeTrainingJob(updatedJob ?? refreshedJob),
+  });
+});
+
+app.post("/:job_id/promote", async (c) => {
+  const jobId = c.req.param("job_id");
+  const body = (await c.req.json().catch(() => ({}))) as {
+    checkpoint_prefix?: string;
+  };
+  const checkpointPrefix = typeof body.checkpoint_prefix === "string" ? body.checkpoint_prefix.trim() : "";
+  if (!checkpointPrefix) {
+    return c.json({ detail: { message: "checkpoint_prefix is required" } }, 400);
+  }
+
+  const job = await getTrainingJob(c.env.DB, jobId);
+  if (!job) {
+    return c.json({ detail: { message: "Training job not found" } }, 404);
+  }
+
+  const voice = await getVoice(c.env.DB, job.voice_id);
+  if (!voice) {
+    return c.json({ detail: { message: "Voice not found" } }, 404);
+  }
+
+  const summary = (job.summary ?? {}) as Record<string, unknown>;
+  const candidate = collectManualPromotionCandidates(summary).find((value) => value.prefix === checkpointPrefix);
+  if (!candidate) {
+    return c.json(
+      { detail: { message: "checkpoint_prefix was not found among the job's evaluated checkpoints" } },
+      404
+    );
+  }
+
+  await updateVoice(c.env.DB, job.voice_id, {
+    status: "ready",
+    checkpoint_r2_prefix: candidate.prefix,
+    run_name: parseRunNameFromCheckpointPrefix(candidate.prefix),
+    epoch: candidate.epoch,
+    settings: resolvePromotionSettings(voice, candidate.preset),
+  });
+
+  await updateTrainingJob(c.env.DB, jobId, {
+    summary: {
+      ...summary,
+      selected_checkpoint_prefix: candidate.prefix,
+      selected_checkpoint_epoch: candidate.epoch,
+      selected_preset: candidate.preset,
+      selected_score: candidate.score,
+      manual_promoted_checkpoint_prefix: candidate.prefix,
+      manual_promoted_checkpoint_epoch: candidate.epoch,
+      manual_promoted_preset: candidate.preset,
+      manual_promoted_score: candidate.score,
+      manual_promotion_at: Date.now(),
+    },
+  });
+
+  const updatedVoice = await getVoice(c.env.DB, job.voice_id);
+  const updatedJob = await getTrainingJob(c.env.DB, jobId);
+  return c.json({
+    status: "ok",
+    voice: updatedVoice,
+    job: updatedJob ? serializeTrainingJob(updatedJob) : serializeTrainingJob(job),
   });
 });
 

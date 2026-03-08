@@ -162,7 +162,7 @@ export const listVoices = async (
   }
 
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-  const sql = `SELECT * FROM voices ${whereClause} ORDER BY created_at DESC`;
+  const sql = `SELECT * FROM voices ${whereClause} ORDER BY updated_at DESC, created_at DESC`;
 
   const result = await db.prepare(sql).bind(...bindings).all<DbVoiceRow>();
   return (result.results ?? []).map(mapVoice);

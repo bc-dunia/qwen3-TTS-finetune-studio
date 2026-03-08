@@ -1,6 +1,8 @@
 import { Hono } from "hono";
 import { authMiddleware } from "../middleware/auth";
 import { getVoice, updateVoice } from "../lib/d1";
+import { asrSimilarity, transcribeAudioWithReviewAsr } from "../lib/review-asr";
+import { reviewTranscriptEntries } from "../lib/transcript-review";
 import type { AppContext, CreateDatasetRequest, DatasetInfo } from "../types";
 
 const app = new Hono<AppContext>();
@@ -11,6 +13,38 @@ const SAFE_DATASET_NAME_RE = /^[a-zA-Z0-9._-]{1,128}$/;
 const extractFilename = (r2Key: string): string => {
   const parts = r2Key.split("/");
   return parts[parts.length - 1] ?? r2Key;
+};
+
+const arrayBufferToBase64 = (buffer: ArrayBuffer): string => {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += 1) {
+    binary += String.fromCharCode(bytes[index]);
+  }
+  return btoa(binary);
+};
+
+const getVoiceDatasetRootPrefix = (voiceId: string): string => `datasets/${voiceId}/`;
+
+const isRawDatasetUploadKey = (voiceId: string, key: string): boolean => {
+  const prefix = getVoiceDatasetRootPrefix(voiceId);
+  if (!key.startsWith(prefix)) {
+    return false;
+  }
+  const remainder = key.slice(prefix.length);
+  return Boolean(remainder) && !remainder.includes("/");
+};
+
+const isAudioDatasetFile = (key: string): boolean => {
+  const lower = key.toLowerCase();
+  return (
+    lower.endsWith(".wav") ||
+    lower.endsWith(".wave") ||
+    lower.endsWith(".mp3") ||
+    lower.endsWith(".mp4") ||
+    lower.endsWith(".m4a") ||
+    lower.endsWith(".flac")
+  );
 };
 
 // POST /v1/dataset/:voice_id — Create a finalized dataset (train_raw.jsonl + copies files)
@@ -148,6 +182,37 @@ app.post("/:voice_id", async (c) => {
   });
 });
 
+app.get("/:voice_id/raw-files", async (c) => {
+  const voiceId = c.req.param("voice_id");
+
+  const voice = await getVoice(c.env.DB, voiceId);
+  if (!voice) {
+    return c.json({ detail: { message: "Voice not found" } }, 404);
+  }
+
+  const limitRaw = Number(c.req.query("limit") ?? 500);
+  const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(1000, Math.trunc(limitRaw))) : 500;
+  const prefix = getVoiceDatasetRootPrefix(voiceId);
+  const listing = await c.env.R2.list({ prefix, limit: 1000 });
+  const files = listing.objects
+    .filter((obj) => isRawDatasetUploadKey(voiceId, obj.key) && isAudioDatasetFile(obj.key))
+    .slice(0, limit)
+    .map((obj) => ({
+      key: obj.key,
+      filename: extractFilename(obj.key),
+      size: obj.size,
+      uploaded: obj.uploaded.toISOString(),
+      content_type: obj.httpMetadata?.contentType ?? null,
+    }))
+    .sort((a, b) => Date.parse(b.uploaded) - Date.parse(a.uploaded));
+
+  return c.json({
+    voice_id: voiceId,
+    prefix,
+    files,
+  });
+});
+
 // GET /v1/dataset/:voice_id — List datasets for a voice
 app.get("/:voice_id", async (c) => {
   const voiceId = c.req.param("voice_id");
@@ -181,6 +246,140 @@ app.get("/:voice_id", async (c) => {
   }
 
   return c.json({ datasets });
+});
+
+app.post("/:voice_id/select", async (c) => {
+  const voiceId = c.req.param("voice_id");
+  const voice = await getVoice(c.env.DB, voiceId);
+  if (!voice) {
+    return c.json({ detail: { message: "Voice not found" } }, 404);
+  }
+
+  const body = (await c.req.json().catch(() => ({}))) as {
+    dataset_name?: string;
+  };
+  const datasetName = typeof body.dataset_name === "string" ? body.dataset_name.trim() : "";
+  if (!datasetName || !SAFE_DATASET_NAME_RE.test(datasetName)) {
+    return c.json({ detail: { message: "dataset_name is required" } }, 400);
+  }
+
+  const refAudioKey = `datasets/${voiceId}/${datasetName}/ref_audio.wav`;
+  const refHead = await c.env.R2.head(refAudioKey);
+  if (!refHead) {
+    return c.json({ detail: { message: `Dataset ref_audio not found: ${refAudioKey}` } }, 404);
+  }
+
+  await updateVoice(c.env.DB, voiceId, {
+    ref_audio_r2_key: refAudioKey,
+  });
+
+  return c.json({
+    status: "ok",
+    dataset_name: datasetName,
+    ref_audio_r2_key: refAudioKey,
+  });
+});
+
+app.post("/:voice_id/retranscribe", async (c) => {
+  const voiceId = c.req.param("voice_id");
+  const voice = await getVoice(c.env.DB, voiceId);
+  if (!voice) {
+    return c.json({ detail: { message: "Voice not found" } }, 404);
+  }
+
+  const body = (await c.req.json().catch(() => ({}))) as {
+    language_code?: string;
+    entries?: Array<{ audio_r2_key?: string; text?: string }>;
+  };
+  const entries = Array.isArray(body.entries) ? body.entries : [];
+  if (entries.length === 0) {
+    return c.json({ detail: { message: "entries array is required" } }, 400);
+  }
+  if (entries.length > 50) {
+    return c.json({ detail: { message: "entries must contain at most 50 items" } }, 400);
+  }
+
+  const prefix = getVoiceDatasetRootPrefix(voiceId);
+  const results = await Promise.all(
+    entries.map(async (entry) => {
+      const audioKey = typeof entry.audio_r2_key === "string" ? entry.audio_r2_key.trim() : "";
+      const sourceText = typeof entry.text === "string" ? entry.text.trim() : "";
+      if (!audioKey) {
+        return {
+          audio_r2_key: audioKey,
+          error: "audio_r2_key is required",
+        };
+      }
+      if (!audioKey.startsWith(prefix)) {
+        return {
+          audio_r2_key: audioKey,
+          error: `audio_r2_key must belong to ${prefix}`,
+        };
+      }
+
+      const obj = await c.env.R2.get(audioKey);
+      if (!obj) {
+        return {
+          audio_r2_key: audioKey,
+          error: `R2 object not found: ${audioKey}`,
+        };
+      }
+
+      const transcription = await transcribeAudioWithReviewAsr({
+        env: c.env,
+        audioBase64: arrayBufferToBase64(await obj.arrayBuffer()),
+        languageHint: body.language_code ?? voice.labels?.language ?? "ko",
+      });
+
+      return {
+        audio_r2_key: audioKey,
+        provider: transcription.provider,
+        asr_text: transcription.text,
+        source_text: sourceText,
+        asr_score: sourceText ? asrSimilarity(sourceText, transcription.text) : null,
+      };
+    })
+  );
+
+  return c.json({
+    voice_id: voiceId,
+    language_code: body.language_code ?? voice.labels?.language ?? "ko",
+    results,
+  });
+});
+
+app.post("/:voice_id/review-texts", async (c) => {
+  const voiceId = c.req.param("voice_id");
+  const voice = await getVoice(c.env.DB, voiceId);
+  if (!voice) {
+    return c.json({ detail: { message: "Voice not found" } }, 404);
+  }
+
+  const body = (await c.req.json().catch(() => ({}))) as {
+    entries?: Array<{ segment?: string; text?: string; duration?: number }>;
+  };
+  const entries = Array.isArray(body.entries) ? body.entries : [];
+  if (entries.length === 0) {
+    return c.json({ detail: { message: "entries array is required" } }, 400);
+  }
+  if (entries.length > 100) {
+    return c.json({ detail: { message: "entries must contain at most 100 items" } }, 400);
+  }
+
+  const review = await reviewTranscriptEntries({
+    env: c.env,
+    languageCode: voice.labels?.language,
+    entries: entries.map((entry) => ({
+      segment: typeof entry.segment === "string" ? entry.segment : undefined,
+      text: typeof entry.text === "string" ? entry.text : "",
+      duration: typeof entry.duration === "number" ? entry.duration : undefined,
+    })),
+  });
+
+  return c.json({
+    voice_id: voiceId,
+    ...review,
+  });
 });
 
 export default app;

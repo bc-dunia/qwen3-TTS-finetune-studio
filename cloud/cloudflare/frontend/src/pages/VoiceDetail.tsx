@@ -5,6 +5,7 @@ import {
   deleteVoice,
   getSpeechGenerationStatus,
   startSpeechGenerationAsync,
+  type SpeechGenerationOptions,
   type Voice,
   type VoiceSettings,
   DEFAULT_VOICE_SETTINGS,
@@ -35,6 +36,8 @@ export function VoiceDetail() {
 
   // Quick generate
   const [text, setText] = useState('')
+  const [stylePrompt, setStylePrompt] = useState('')
+  const [instruct, setInstruct] = useState('')
   const [generating, setGenerating] = useState(false)
   const [generateStatus, setGenerateStatus] = useState('')
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null)
@@ -49,15 +52,6 @@ export function VoiceDetail() {
     let cancelled = false
 
     async function load() {
-      const apiKey = (localStorage.getItem('xi-api-key') ?? '').trim()
-      if (!apiKey) {
-        if (!cancelled) {
-          setError('Missing API key. Enter your xi-api-key in the left sidebar.')
-          setLoading(false)
-        }
-        return
-      }
-
       try {
         const data = await fetchVoice(voiceId)
         if (!cancelled) {
@@ -74,13 +68,8 @@ export function VoiceDetail() {
     }
 
     load()
-    const onApiKeyChanged = () => {
-      load()
-    }
-    window.addEventListener('xi-api-key-changed', onApiKeyChanged)
     return () => {
       cancelled = true
-      window.removeEventListener('xi-api-key-changed', onApiKeyChanged)
     }
   }, [voiceId])
 
@@ -93,7 +82,11 @@ export function VoiceDetail() {
     setAudioBlob(null)
 
     try {
-      const asyncJob = await startSpeechGenerationAsync(voiceId, text.trim(), settings)
+      const promptOptions: SpeechGenerationOptions = {
+        stylePrompt: stylePrompt.trim() || undefined,
+        instruct: instruct.trim() || undefined,
+      }
+      const asyncJob = await startSpeechGenerationAsync(voiceId, text.trim(), settings, promptOptions)
       let completed = false
       let attempts = 0
       while (attempts < 180) {
@@ -171,6 +164,7 @@ export function VoiceDetail() {
   }
 
   if (!voice) return null
+  const supportsPromptControls = Boolean(voice.model_size?.includes('1.7'))
 
   const statusStyles: Record<string, string> = {
     ready: 'bg-accent-dim text-accent',
@@ -206,9 +200,27 @@ export function VoiceDetail() {
           )}
           <div className="flex items-center gap-4 mt-3 text-muted text-xs font-mono">
             <span>Model: {voice.model_size || 'base'}</span>
-            <span>Created: {formatDate(voice.created_at)}</span>
+            <span>Updated: {formatDate(voice.updated_at ?? voice.created_at)}</span>
+            {typeof voice.epoch === 'number' && <span>Epoch: {voice.epoch}</span>}
+            {voice.run_name && <span>Run: {voice.run_name}</span>}
             <span>ID: {voice.voice_id.slice(0, 12)}...</span>
           </div>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            onClick={() => navigate(`/voices/${voice.voice_id}/dataset`)}
+            className="inline-flex items-center rounded-lg border border-edge px-3 py-2 text-[11px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent"
+            type="button"
+          >
+            Dataset Studio
+          </button>
+          <button
+            onClick={() => navigate(`/voices/${voice.voice_id}/compare`)}
+            className="inline-flex items-center rounded-lg border border-edge px-3 py-2 text-[11px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent"
+            type="button"
+          >
+            Compare Checkpoints
+          </button>
         </div>
       </div>
 
@@ -216,6 +228,9 @@ export function VoiceDetail() {
         {/* Voice Settings */}
         <div className="bg-raised border border-edge rounded-xl p-5">
           <h2 className="text-heading font-semibold text-sm mb-5">Voice Settings</h2>
+          <div className="mb-4 rounded-lg border border-edge bg-surface px-3 py-2 text-[11px] font-mono text-subtle">
+            Current preset: stab {settings.stability.toFixed(2)} · sim {settings.similarity_boost.toFixed(2)} · style {settings.style.toFixed(2)} · speed {settings.speed.toFixed(2)}
+          </div>
           <div className="space-y-5">
             <SettingSlider
               label="Stability"
@@ -257,6 +272,39 @@ export function VoiceDetail() {
               leftLabel="0.5x"
               rightLabel="2.0x"
             />
+          </div>
+
+          <div className="mt-5 pt-5 border-t border-edge space-y-3">
+            <div>
+              <h3 className="text-heading text-xs font-semibold">Prompt Controls</h3>
+              <p className="text-muted text-[10px] mt-1 leading-relaxed">
+                Applied on `1.7B` voices. `0.6B` custom voices ignore this path.
+              </p>
+            </div>
+
+            <div>
+              <label className="text-subtle text-xs font-medium mb-1.5 block">Style Prompt</label>
+              <textarea
+                value={stylePrompt}
+                onChange={(e) => setStylePrompt(e.target.value)}
+                disabled={!supportsPromptControls}
+                placeholder="Calm, high-authority market briefing tone with crisp phrasing."
+                rows={3}
+                className="w-full bg-surface border border-edge rounded-lg px-3 py-2 text-sm text-primary placeholder:text-muted disabled:opacity-50 disabled:cursor-not-allowed focus:border-accent transition-colors resize-none"
+              />
+            </div>
+
+            <div>
+              <label className="text-subtle text-xs font-medium mb-1.5 block">Instruct</label>
+              <textarea
+                value={instruct}
+                onChange={(e) => setInstruct(e.target.value)}
+                disabled={!supportsPromptControls}
+                placeholder="Stay highly similar to the source speaker and end sentences with controlled emphasis."
+                rows={3}
+                className="w-full bg-surface border border-edge rounded-lg px-3 py-2 text-sm text-primary placeholder:text-muted disabled:opacity-50 disabled:cursor-not-allowed focus:border-accent transition-colors resize-none"
+              />
+            </div>
           </div>
         </div>
 
