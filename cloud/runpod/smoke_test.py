@@ -27,13 +27,9 @@ def main() -> int:
         "einops",
         "librosa",
         "torchaudio",
-    ]
-
-    # Optional: nice-to-have but not strictly required for training
-    optional_modules = [
-        "runpod",
         "faster_whisper",
     ]
+    optional_modules = ["runpod"]
 
     for module in required_modules:
         try:

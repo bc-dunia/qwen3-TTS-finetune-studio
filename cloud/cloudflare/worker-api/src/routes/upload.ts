@@ -8,6 +8,8 @@ app.use("*", authMiddleware);
 
 const sanitizeFileName = (name: string): string => name.replace(/[^a-zA-Z0-9._-]/g, "_");
 const MULTIPART_CHUNK_SIZE_BYTES = 8 * 1024 * 1024;
+const getContentType = (value: string | null | undefined): string =>
+  String(value ?? "").trim() || "application/octet-stream";
 const sanitizeVoiceId = (voiceId: string | undefined): string => {
   const rawId = sanitizeFileName(voiceId ?? "shared");
   return rawId && rawId !== "." && rawId !== ".." ? rawId : "shared";
@@ -135,6 +137,30 @@ app.post("/multipart/abort", async (c) => {
 });
 
 app.post("/raw", async (c) => {
+  const directFilename = String(c.req.query("filename") ?? "").trim();
+  if (directFilename) {
+    const voiceId = sanitizeVoiceId(c.req.query("voice_id") ?? undefined);
+    const safeFilename = sanitizeFileName(directFilename);
+    const contentType = getContentType(c.req.query("content_type") ?? c.req.header("content-type"));
+    const body = c.req.raw.body;
+
+    if (!body) {
+      return c.json({ detail: { message: "request body is required" } }, 400);
+    }
+
+    const key = `datasets/${voiceId}/${Date.now()}_${crypto.randomUUID()}_${safeFilename}`;
+    await c.env.R2.put(key, body, {
+      httpMetadata: {
+        contentType,
+      },
+    });
+
+    return c.json({
+      r2_key: key,
+      content_type: contentType,
+    });
+  }
+
   const form = await c.req.formData();
   const fileValue = form.get("file");
   const voiceId = sanitizeVoiceId(
@@ -146,7 +172,7 @@ app.post("/raw", async (c) => {
   }
 
   const safeFilename = sanitizeFileName(fileValue.name || "upload.bin");
-  const contentType = fileValue.type || "application/octet-stream";
+  const contentType = getContentType(fileValue.type);
   const key = `datasets/${voiceId}/${Date.now()}_${crypto.randomUUID()}_${safeFilename}`;
 
   await c.env.R2.put(key, await fileValue.arrayBuffer(), {

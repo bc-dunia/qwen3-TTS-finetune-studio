@@ -1,15 +1,20 @@
 import { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router'
 import {
+  ApiError,
   fetchVoices,
   createVoiceDraft,
   deleteVoice,
+  startTraining,
   uploadVoiceDatasetFile,
   type UploadProgress,
   type Voice,
   type VoiceModelSize,
 } from '../lib/api'
 import { VoiceCard } from '../components/VoiceCard'
+
+const LONGFORM_RAW_UPLOAD_THRESHOLD_BYTES = 32 * 1024 * 1024
+const LONGFORM_RAW_UPLOAD_EXTENSIONS = ['.mp3', '.mp4', '.m4a', '.flac']
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
@@ -36,6 +41,20 @@ function isSupportedUploadFile(file: File): boolean {
     lowerName.endsWith('.m4a') ||
     lowerName.endsWith('.flac')
   )
+}
+
+function hasMatchingExtension(name: string, extensions: string[]): boolean {
+  const lowerName = name.toLowerCase()
+  return extensions.some((extension) => lowerName.endsWith(extension))
+}
+
+function shouldAutoStartTrainingFromRawUploads(files: File[]): boolean {
+  if (files.length === 0) return false
+  const longFormFiles = files.filter((file) =>
+    file.size >= LONGFORM_RAW_UPLOAD_THRESHOLD_BYTES ||
+    hasMatchingExtension(file.name, LONGFORM_RAW_UPLOAD_EXTENSIONS),
+  )
+  return longFormFiles.length > 0 && (files.length <= 3 || longFormFiles.length === files.length)
 }
 
 export function Voices() {
@@ -214,6 +233,14 @@ function CreateVoiceModal({
     return `/voices/${voiceId}/dataset${query ? `?${query}` : ''}`
   }
 
+  function buildTrainingTarget(voiceId: string): string {
+    const params = new URLSearchParams({
+      voiceId,
+      recommended: '1',
+    })
+    return `/training?${params.toString()}`
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     if (!name.trim() || audioFiles.length === 0) return
@@ -258,10 +285,27 @@ function CreateVoiceModal({
         uploadedCount += 1
       }
 
+      const shouldStartTrainingFromRaw = autoPrepare && shouldAutoStartTrainingFromRawUploads(audioFiles)
+      if (shouldStartTrainingFromRaw) {
+        setStatusText('Upload complete. Starting raw-media preprocessing and training...')
+        try {
+          await startTraining(voice_id, {})
+        } catch (err) {
+          if (!(err instanceof ApiError) || err.status !== 409) {
+            throw err
+          }
+        }
+
+        setUploadProgress(null)
+        navigate(openTrainingWhenReady ? buildTrainingTarget(voice_id) : `/voices/${voice_id}`)
+        onCreated()
+        return
+      }
+
       setStatusText('Upload complete. Opening Dataset Studio...')
       setUploadProgress(null)
-      onCreated()
       navigate(buildDatasetTarget(voice_id))
+      onCreated()
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to create voice'
       setUploadProgress(null)
@@ -273,8 +317,8 @@ function CreateVoiceModal({
         }
         setError(`${message} Empty draft voice was removed.`)
       } else if (createdVoiceId && uploadedCount > 0) {
-        onCreated()
         navigate(buildDatasetTarget(createdVoiceId, true))
+        onCreated()
         return
       } else {
         setError(message)
@@ -387,7 +431,7 @@ function CreateVoiceModal({
                   Training Audio Files <span className="text-error">*</span>
                 </label>
                 <div className="mb-2 rounded-lg border border-edge bg-raised px-3 py-2 text-[11px] leading-relaxed text-subtle">
-                  Files upload through the API into storage, then Dataset Studio can auto-transcribe, auto-review, and prepare the active dataset.
+                  Files upload through the API into storage. Short clips continue to Dataset Studio for transcription and cleanup; large MP3, M4A, FLAC, or MP4 source files automatically start the raw-media training pipeline after upload.
                   Best results: 24kHz mono WAV, 3-15s per clip, clean speech only, at least 10 minutes total.
                 </div>
                 <div
@@ -454,7 +498,7 @@ function CreateVoiceModal({
                   multiple
                   onChange={(e) => {
                     const files = e.target.files ? Array.from(e.target.files) : []
-                    addAudioFiles(files)
+                    addAudioFiles(files.filter((file) => isSupportedUploadFile(file)))
                     e.target.value = ''
                   }}
                   className="hidden"

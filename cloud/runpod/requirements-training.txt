@@ -10,6 +10,8 @@ huggingface-hub>=0.23.0
 
 # Audio (soundfile used by training handler directly)
 soundfile>=0.12.0
+librosa>=0.10.0
+faster-whisper>=1.1.0
 
 # R2 / S3 client
 boto3>=1.34.0

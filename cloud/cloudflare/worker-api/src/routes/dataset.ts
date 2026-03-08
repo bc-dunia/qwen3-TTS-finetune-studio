@@ -9,10 +9,37 @@ const app = new Hono<AppContext>();
 app.use("*", authMiddleware);
 
 const SAFE_DATASET_NAME_RE = /^[a-zA-Z0-9._-]{1,128}$/;
+const REFERENCE_AUDIO_EXTENSIONS = [".wav", ".wave", ".mp3", ".mp4", ".m4a", ".flac"];
 
 const extractFilename = (r2Key: string): string => {
   const parts = r2Key.split("/");
   return parts[parts.length - 1] ?? r2Key;
+};
+
+const getAudioExtension = (r2Key: string): string => {
+  const filename = extractFilename(r2Key).toLowerCase();
+  const matched = REFERENCE_AUDIO_EXTENSIONS.find((extension) => filename.endsWith(extension));
+  return matched ?? ".wav";
+};
+
+const getReferenceAudioFilename = (r2Key: string): string => `ref_audio${getAudioExtension(r2Key)}`;
+
+const getContentType = (value: string | null | undefined): string =>
+  String(value ?? "").trim() || "application/octet-stream";
+
+const findDatasetReferenceAudioKey = async (
+  bucket: R2Bucket,
+  voiceId: string,
+  datasetName: string
+): Promise<string | null> => {
+  for (const extension of REFERENCE_AUDIO_EXTENSIONS) {
+    const key = `datasets/${voiceId}/${datasetName}/ref_audio${extension}`;
+    const head = await bucket.head(key);
+    if (head) {
+      return key;
+    }
+  }
+  return null;
 };
 
 const arrayBufferToBase64 = (buffer: ArrayBuffer): string => {
@@ -109,14 +136,18 @@ app.post("/:voice_id", async (c) => {
   }
 
   const datasetPrefix = `datasets/${voiceId}/${body.dataset_name}`;
+  const refAudioFilename = getReferenceAudioFilename(body.ref_audio_r2_key);
+  const refAudioKey = `${datasetPrefix}/${refAudioFilename}`;
 
   // Copy ref_audio to dataset directory with a fixed name
   const refAudioObj = await c.env.R2.get(body.ref_audio_r2_key);
   if (!refAudioObj) {
     return c.json({ detail: { message: "Failed to read ref_audio from R2" } }, 500);
   }
-  await c.env.R2.put(`${datasetPrefix}/ref_audio.wav`, refAudioObj.body, {
-    httpMetadata: { contentType: "audio/wav" },
+  await c.env.R2.put(refAudioKey, refAudioObj.body, {
+    httpMetadata: {
+      contentType: getContentType(refHead.httpMetadata?.contentType ?? refAudioObj.httpMetadata?.contentType),
+    },
   });
 
   // Copy all audio files to dataset directory and build JSONL lines
@@ -133,14 +164,16 @@ app.post("/:voice_id", async (c) => {
       return c.json({ detail: { message: `Failed to read audio from R2: ${item.audio_r2_key}` } }, 500);
     }
     await c.env.R2.put(`${datasetPrefix}/${audioFilename}`, audioObj.body, {
-      httpMetadata: { contentType: "audio/wav" },
+      httpMetadata: {
+        contentType: getContentType(audioObj.httpMetadata?.contentType),
+      },
     });
 
     // Build JSONL line with paths matching where training_handler.py downloads to
     const line = JSON.stringify({
       audio: `/tmp/dataset/${audioFilename}`,
       text: item.text.trim(),
-      ref_audio: "/tmp/dataset/ref_audio.wav",
+      ref_audio: `/tmp/dataset/${refAudioFilename}`,
     });
     jsonlLines.push(line);
   }
@@ -152,33 +185,31 @@ app.post("/:voice_id", async (c) => {
   });
 
   const refText = typeof body.ref_text === "string" ? body.ref_text.trim() : "";
-  if (refText) {
-    await c.env.R2.put(
-      `${datasetPrefix}/reference_profile.json`,
-      JSON.stringify(
-        {
-          reference_audio_key: `${datasetPrefix}/ref_audio.wav`,
-          reference_text: refText,
-        },
-        null,
-        2,
-      ),
+  await c.env.R2.put(
+    `${datasetPrefix}/reference_profile.json`,
+    JSON.stringify(
       {
-        httpMetadata: { contentType: "application/json" },
+        reference_audio_key: refAudioKey,
+        reference_text: refText,
       },
-    );
-  }
+      null,
+      2,
+    ),
+    {
+      httpMetadata: { contentType: "application/json" },
+    },
+  );
 
   // Update voice with ref_audio_r2_key
   await updateVoice(c.env.DB, voiceId, {
-    ref_audio_r2_key: `${datasetPrefix}/ref_audio.wav`,
+    ref_audio_r2_key: refAudioKey,
   });
 
   return c.json({
     dataset_name: body.dataset_name,
     dataset_r2_prefix: datasetPrefix,
     items_count: body.items.length,
-    ref_audio_r2_key: `${datasetPrefix}/ref_audio.wav`,
+    ref_audio_r2_key: refAudioKey,
   });
 });
 
@@ -263,10 +294,9 @@ app.post("/:voice_id/select", async (c) => {
     return c.json({ detail: { message: "dataset_name is required" } }, 400);
   }
 
-  const refAudioKey = `datasets/${voiceId}/${datasetName}/ref_audio.wav`;
-  const refHead = await c.env.R2.head(refAudioKey);
-  if (!refHead) {
-    return c.json({ detail: { message: `Dataset ref_audio not found: ${refAudioKey}` } }, 404);
+  const refAudioKey = await findDatasetReferenceAudioKey(c.env.R2, voiceId, datasetName);
+  if (!refAudioKey) {
+    return c.json({ detail: { message: `Dataset ref_audio not found under datasets/${voiceId}/${datasetName}` } }, 404);
   }
 
   await updateVoice(c.env.DB, voiceId, {

@@ -73,7 +73,7 @@ function getRecommendedTrainingPreset(modelSize: string) {
 }
 
 function inferDatasetNameFromRefAudioKey(refAudioKey: string | null | undefined): string | null {
-  if (!refAudioKey || !refAudioKey.endsWith('/ref_audio.wav')) {
+  if (!refAudioKey || !/\/ref_audio\.[^/]+$/i.test(refAudioKey)) {
     return null
   }
 
@@ -527,17 +527,18 @@ export function Training() {
   }
 
   function applySuggestedConfig(config: TrainingConfig) {
-    setBatchSize(config.batch_size)
-    setEpochs(config.num_epochs)
-    setLearningRate(config.learning_rate)
-    setTrainingSeed(config.seed ?? 42)
-    setGradientAccumulationSteps(config.gradient_accumulation_steps ?? 4)
+    const fallbackPreset = getRecommendedTrainingPreset(config.model_size ?? selectedVoice?.model_size ?? '1.7B')
+    setBatchSize(config.batch_size ?? fallbackPreset.batchSize)
+    setEpochs(config.num_epochs ?? fallbackPreset.epochs)
+    setLearningRate(config.learning_rate ?? fallbackPreset.learningRate)
+    setTrainingSeed(config.seed ?? fallbackPreset.seed)
+    setGradientAccumulationSteps(config.gradient_accumulation_steps ?? fallbackPreset.gradientAccumulationSteps)
     setSubtalkerLossWeight(
-      config.subtalker_loss_weight ?? (config.model_size?.includes('0.6') ? 0.3 : 0.2),
+      config.subtalker_loss_weight ?? fallbackPreset.subtalkerLossWeight,
     )
-    setSaveEveryNEpochs(config.save_every_n_epochs ?? 1)
+    setSaveEveryNEpochs(config.save_every_n_epochs ?? fallbackPreset.saveEveryNEpochs)
     setTrainingLanguage(config.whisper_language ?? 'ko')
-    setGpuTypeId(config.gpu_type_id ?? '')
+    setGpuTypeId(config.gpu_type_id ?? fallbackPreset.gpuTypeId)
   }
 
   const jobsByRecency = [...jobs].sort(

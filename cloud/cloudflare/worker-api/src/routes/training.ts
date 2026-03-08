@@ -179,6 +179,8 @@ const ACTIVE_JOB_STATUSES = new Set([
   "uploading",
 ]);
 
+const REFERENCE_AUDIO_KEY_RE = /\/ref_audio\.[^/]+$/i;
+
 const needsCompletedValidation = (job: TrainingJob): boolean => {
   if (job.status !== "completed") {
     return false;
@@ -191,11 +193,11 @@ const extractDatasetPrefixFromRefAudioKey = (
   voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>
 ): string | null => {
   const refAudioKey = typeof voice.ref_audio_r2_key === "string" ? voice.ref_audio_r2_key.trim() : "";
-  if (!refAudioKey.endsWith("/ref_audio.wav")) {
+  if (!REFERENCE_AUDIO_KEY_RE.test(refAudioKey)) {
     return null;
   }
 
-  const datasetPrefix = refAudioKey.slice(0, -"/ref_audio.wav".length).replace(/\/+$/, "");
+  const datasetPrefix = refAudioKey.replace(REFERENCE_AUDIO_KEY_RE, "").replace(/\/+$/, "");
   const expectedPrefix = `datasets/${voice.voice_id}/`;
   if (!datasetPrefix.startsWith(expectedPrefix)) {
     return null;
@@ -704,23 +706,6 @@ const createTrainingPodForJob = async (
   pod: { podId: string; desiredStatus: string };
   summary: Record<string, unknown>;
 }> => {
-  const templateId = getConfiguredTrainingTemplateId(c);
-  if (templateId) {
-    const pod = await createPod(
-      c.env,
-      templateId,
-      getTrainingGpuType(job),
-      buildTrainingPodEnv(c, job)
-    );
-    return {
-      pod,
-      summary: {
-        training_launch_mode: "template",
-        training_template_id: templateId,
-      },
-    };
-  }
-
   const imageName = getConfiguredTrainingImageName(c);
   if (imageName) {
     const dockerArgs = getConfiguredTrainingDockerArgs(c);
@@ -741,6 +726,23 @@ const createTrainingPodForJob = async (
         training_image_name: imageName,
         training_docker_args: dockerArgs,
         training_volume_mount_path: volumeMountPath,
+      },
+    };
+  }
+
+  const templateId = getConfiguredTrainingTemplateId(c);
+  if (templateId) {
+    const pod = await createPod(
+      c.env,
+      templateId,
+      getTrainingGpuType(job),
+      buildTrainingPodEnv(c, job)
+    );
+    return {
+      pod,
+      summary: {
+        training_launch_mode: "template",
+        training_template_id: templateId,
       },
     };
   }

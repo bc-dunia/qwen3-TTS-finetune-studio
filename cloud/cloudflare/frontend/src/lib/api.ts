@@ -72,9 +72,9 @@ export interface TrainingProgress {
 }
 
 export interface TrainingConfig {
-  batch_size: number
-  num_epochs: number
-  learning_rate: number
+  batch_size?: number
+  num_epochs?: number
+  learning_rate?: number
   model_size?: string
   gradient_accumulation_steps?: number
   subtalker_loss_weight?: number
@@ -815,17 +815,21 @@ async function uploadFileViaWorker(
     return
   }
 
-  const formData = new FormData()
-  formData.append('voice_id', voiceId)
-  formData.append('file', file)
-
   if (typeof XMLHttpRequest !== 'undefined') {
     const apiKey = getApiKey()
     await new Promise<void>((resolve, reject) => {
+      const url = new URL(`${API_URL}/v1/upload/raw`)
+      url.searchParams.set('voice_id', voiceId)
+      url.searchParams.set('filename', file.name)
+      url.searchParams.set('content_type', file.type || 'application/octet-stream')
+
       const xhr = new XMLHttpRequest()
-      xhr.open('POST', `${API_URL}/v1/upload/raw`)
+      xhr.open('POST', url.toString())
       if (apiKey) {
         xhr.setRequestHeader('xi-api-key', apiKey)
+      }
+      if (file.type) {
+        xhr.setRequestHeader('Content-Type', file.type)
       }
 
       xhr.upload.addEventListener('progress', (event) => {
@@ -866,7 +870,7 @@ async function uploadFileViaWorker(
         reject(new ApiError(`Upload cancelled for ${file.name}`, xhr.status || 0))
       })
 
-      xhr.send(formData)
+      xhr.send(file)
     })
     return
   }
@@ -876,10 +880,18 @@ async function uploadFileViaWorker(
     totalBytes: file.size,
   })
 
-  const response = await fetch(`${API_URL}/v1/upload/raw`, {
+  const url = new URL(`${API_URL}/v1/upload/raw`)
+  url.searchParams.set('voice_id', voiceId)
+  url.searchParams.set('filename', file.name)
+  url.searchParams.set('content_type', file.type || 'application/octet-stream')
+
+  const response = await fetch(url.toString(), {
     method: 'POST',
-    headers: authHeaders(),
-    body: formData,
+    headers: {
+      ...authHeaders(),
+      ...(file.type ? { 'Content-Type': file.type } : {}),
+    },
+    body: file,
   })
 
   if (!response.ok) {

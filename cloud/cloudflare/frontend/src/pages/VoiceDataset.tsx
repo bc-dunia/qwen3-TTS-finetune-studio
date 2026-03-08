@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router'
 import {
+  ApiError,
   createFinalizedDataset,
   fetchVoice,
   fetchVoiceDatasets,
@@ -9,6 +10,7 @@ import {
   reviewDatasetTexts,
   retranscribeDatasetEntries,
   selectVoiceDataset,
+  startTraining,
   type RawDatasetFile,
   type Voice,
 } from '../lib/api'
@@ -23,11 +25,14 @@ type DraftRow = RawDatasetFile & {
 }
 
 type AutoPrepareProgress = {
-  phase: 'transcribe' | 'review' | 'create' | 'select' | 'done'
+  phase: 'transcribe' | 'review' | 'create' | 'select' | 'start' | 'done'
   completed: number
   total: number
   detail: string
 }
+
+const LONGFORM_RAW_UPLOAD_THRESHOLD_BYTES = 32 * 1024 * 1024
+const LONGFORM_RAW_UPLOAD_EXTENSIONS = ['.mp3', '.mp4', '.m4a', '.flac']
 
 function getDefaultDatasetName(): string {
   const date = new Date()
@@ -37,13 +42,31 @@ function getDefaultDatasetName(): string {
   return `curated_clean_${y}${m}${d}`
 }
 
+function isReferenceAudioKey(refAudioKey: string | null | undefined): boolean {
+  return Boolean(refAudioKey && /\/ref_audio\.[^/]+$/i.test(refAudioKey))
+}
+
 function inferCurrentDatasetName(voice: Voice | null): string | null {
   const refAudioKey = voice?.ref_audio_r2_key
-  if (!refAudioKey || !refAudioKey.endsWith('/ref_audio.wav')) {
+  if (!isReferenceAudioKey(refAudioKey)) {
     return null
   }
-  const parts = refAudioKey.split('/').filter(Boolean)
+  const parts = String(refAudioKey).split('/').filter(Boolean)
   return parts.length >= 4 ? parts[2] ?? null : null
+}
+
+function hasMatchingExtension(name: string, extensions: string[]): boolean {
+  const lowerName = name.toLowerCase()
+  return extensions.some((extension) => lowerName.endsWith(extension))
+}
+
+function shouldUseRawTrainingPipeline(rows: RawDatasetFile[]): boolean {
+  if (rows.length === 0) return false
+  const longFormRows = rows.filter((row) =>
+    row.size >= LONGFORM_RAW_UPLOAD_THRESHOLD_BYTES ||
+    hasMatchingExtension(row.filename, LONGFORM_RAW_UPLOAD_EXTENSIONS),
+  )
+  return longFormRows.length > 0 && (rows.length <= 3 || longFormRows.length === rows.length)
 }
 
 function mergeDraftRows(rawFiles: RawDatasetFile[], previous: DraftRow[]): DraftRow[] {
@@ -70,12 +93,14 @@ function chunkArray<T>(items: T[], size: number): T[][] {
   return chunks
 }
 
-function encodeTrainingQuery(voiceId: string, datasetName: string): string {
+function encodeTrainingQuery(voiceId: string, datasetName?: string): string {
   const params = new URLSearchParams({
     voiceId,
-    datasetName,
     recommended: '1',
   })
+  if (datasetName) {
+    params.set('datasetName', datasetName)
+  }
   return `/training?${params.toString()}`
 }
 
@@ -104,6 +129,7 @@ export function VoiceDataset() {
   const autoPrepareRequested = searchParams.get('autoPrepare') === '1'
   const openTrainingWhenReady = searchParams.get('openTraining') === '1'
   const partialUploadWarning = searchParams.get('uploadWarning') === '1'
+  const useRawTrainingPipeline = shouldUseRawTrainingPipeline(rows)
 
   async function loadData() {
     if (!voiceId) return
@@ -427,13 +453,62 @@ export function VoiceDataset() {
     }
   }
 
+  async function runRawTrainingAutoStart(options?: { navigateToTraining?: boolean }) {
+    if (!voiceId || !voice) return
+
+    setBusyAction('auto')
+    setError('')
+    setMessage('')
+    setAutoProgress({
+      phase: 'start',
+      completed: 0,
+      total: 1,
+      detail: 'Large raw upload detected. Starting preprocessing and training directly from the raw media.',
+    })
+
+    try {
+      await startTraining(voiceId, {})
+      setAutoProgress({
+        phase: 'done',
+        completed: 1,
+        total: 1,
+        detail: 'Training job started. Segmentation and transcription will run on the training worker.',
+      })
+      setMessage('Started training directly from the raw upload. Segmentation, transcription, filtering, and reference selection now run automatically during preprocessing.')
+      if (options?.navigateToTraining) {
+        navigate(encodeTrainingQuery(voiceId))
+      }
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 409) {
+        setAutoProgress({
+          phase: 'done',
+          completed: 1,
+          total: 1,
+          detail: 'A training job is already active for this voice.',
+        })
+        setMessage('A training job is already active for this voice. Following the existing raw-media preprocessing run.')
+        if (options?.navigateToTraining) {
+          navigate(encodeTrainingQuery(voiceId))
+        }
+        return
+      }
+      setError(err instanceof Error ? err.message : 'Failed to start training from raw uploads')
+    } finally {
+      setBusyAction('')
+    }
+  }
+
   useEffect(() => {
     if (loading || rows.length === 0 || !autoPrepareRequested || autoStartedRef.current) {
       return
     }
     autoStartedRef.current = true
+    if (useRawTrainingPipeline) {
+      void runRawTrainingAutoStart({ navigateToTraining: openTrainingWhenReady })
+      return
+    }
     void runAutoPrepare({ navigateToTraining: openTrainingWhenReady })
-  }, [loading, rows.length, autoPrepareRequested, openTrainingWhenReady])
+  }, [loading, rows.length, autoPrepareRequested, openTrainingWhenReady, useRawTrainingPipeline])
 
   if (loading) {
     return (
@@ -514,6 +589,12 @@ export function VoiceDataset() {
         </div>
       )}
 
+      {useRawTrainingPipeline && (
+        <div className="rounded-lg border border-accent/20 bg-accent-dim px-4 py-3 text-sm text-accent">
+          Large raw media was detected. This voice should skip clip-by-clip browser transcription and start training directly from the uploaded source so segmentation and ASR run on the training worker.
+        </div>
+      )}
+
       <div className="grid lg:grid-cols-[340px_1fr] gap-6">
         <div className="space-y-6">
           <div className="bg-raised border border-edge rounded-xl p-5 space-y-4">
@@ -569,7 +650,9 @@ export function VoiceDataset() {
             <div>
               <h2 className="text-heading font-semibold text-sm">Finalize New Dataset</h2>
               <p className="text-subtle text-xs mt-1">
-                Choose the raw clips you want, correct their transcripts, and create a clean dataset for the next training run.
+                {useRawTrainingPipeline
+                  ? 'Large raw uploads should go straight to training. The training worker will segment, transcribe, filter, and choose the reference clip automatically.'
+                  : 'Choose the raw clips you want, correct their transcripts, and create a clean dataset for the next training run.'}
               </p>
             </div>
 
@@ -610,7 +693,7 @@ export function VoiceDataset() {
             <div className="flex flex-wrap gap-2">
               <button
                 onClick={handleRetranscribeSelected}
-                disabled={busyAction !== '' || selectedRows.length === 0}
+                disabled={useRawTrainingPipeline || busyAction !== '' || selectedRows.length === 0}
                 className="inline-flex items-center rounded-lg border border-edge px-3 py-2 text-[11px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent disabled:opacity-50"
                 type="button"
               >
@@ -618,19 +701,25 @@ export function VoiceDataset() {
               </button>
               <button
                 onClick={handleReviewSelected}
-                disabled={busyAction !== '' || selectedRows.length === 0}
+                disabled={useRawTrainingPipeline || busyAction !== '' || selectedRows.length === 0}
                 className="inline-flex items-center rounded-lg border border-edge px-3 py-2 text-[11px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent disabled:opacity-50"
                 type="button"
               >
                 Review Selected Texts
               </button>
               <button
-                onClick={() => { void runAutoPrepare() }}
-                disabled={busyAction !== '' || selectedRows.length === 0 || !datasetName.trim()}
+                onClick={() => {
+                  if (useRawTrainingPipeline) {
+                    void runRawTrainingAutoStart({ navigateToTraining: true })
+                    return
+                  }
+                  void runAutoPrepare()
+                }}
+                disabled={busyAction !== '' || selectedRows.length === 0 || (!useRawTrainingPipeline && !datasetName.trim())}
                 className="inline-flex items-center rounded-lg border border-accent/40 bg-accent-dim px-3 py-2 text-[11px] font-semibold text-accent transition-colors hover:border-accent hover:text-accent-light disabled:opacity-50"
                 type="button"
               >
-                Auto Prepare Selected
+                {useRawTrainingPipeline ? 'Start Training From Raw Uploads' : 'Auto Prepare Selected'}
               </button>
               <button
                 onClick={() => setRows((previous) => previous.map((row) => ({ ...row, selected: true })))}
@@ -652,7 +741,7 @@ export function VoiceDataset() {
 
             <button
               onClick={handleCreateDataset}
-              disabled={busyAction !== '' || selectedRows.length === 0 || !referenceAudioKey || !datasetName.trim()}
+              disabled={useRawTrainingPipeline || busyAction !== '' || selectedRows.length === 0 || !referenceAudioKey || !datasetName.trim()}
               className="w-full bg-accent hover:bg-accent-light text-void font-semibold text-sm py-2.5 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
               type="button"
             >
