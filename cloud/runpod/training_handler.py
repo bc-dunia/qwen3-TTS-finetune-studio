@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -58,6 +59,7 @@ MIN_TRANSCRIPT_CHARS = 6
 MIN_CONFIDENCE = 0.55
 MAX_DUPLICATES_PER_TEXT = 2
 MAX_UPLOADED_CHECKPOINTS = 4
+HEARTBEAT_INTERVAL_SEC = 30.0
 
 
 @dataclass
@@ -428,18 +430,37 @@ def stream_subprocess(
         bufsize=1,
     )
     assert proc.stdout is not None
-    next_heartbeat_at = time.time() + 30.0
-    for raw in proc.stdout:
-        now = time.time()
-        if heartbeat is not None and now >= next_heartbeat_at:
-            heartbeat()
-            next_heartbeat_at = now + 30.0
-        line = raw.rstrip("\n")
-        if not line.strip():
-            continue
-        LOGGER.info("[subprocess] %s", line)
-        callback(line)
-    return proc.wait()
+    stop_heartbeat = threading.Event()
+    heartbeat_thread: threading.Thread | None = None
+    if heartbeat is not None:
+        def heartbeat_loop() -> None:
+            while not stop_heartbeat.wait(HEARTBEAT_INTERVAL_SEC):
+                if proc.poll() is not None:
+                    return
+                try:
+                    heartbeat()
+                except Exception:
+                    LOGGER.exception("Subprocess heartbeat callback failed")
+
+        heartbeat_thread = threading.Thread(
+            target=heartbeat_loop,
+            name="subprocess-heartbeat",
+            daemon=True,
+        )
+        heartbeat_thread.start()
+
+    try:
+        for raw in proc.stdout:
+            line = raw.rstrip("\n")
+            if not line.strip():
+                continue
+            LOGGER.info("[subprocess] %s", line)
+            callback(line)
+        return proc.wait()
+    finally:
+        stop_heartbeat.set()
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=1.0)
 
 
 def rewrite_jsonl_paths(jsonl_path: Path, dataset_dir: Path) -> None:
@@ -600,17 +621,35 @@ def _probe_duration_seconds(audio_path: Path) -> float:
     return float(sf.info(str(audio_path)).duration)
 
 
-def _run_ffmpeg_capture(command: list[str]) -> str:
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
-    if result.returncode != 0:
+def _run_ffmpeg_capture(
+    command: list[str], *, heartbeat: Callable[[], None] | None = None
+) -> str:
+    proc = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    while True:
+        try:
+            stdout, stderr = proc.communicate(timeout=HEARTBEAT_INTERVAL_SEC)
+            break
+        except subprocess.TimeoutExpired:
+            if heartbeat is not None:
+                heartbeat()
+
+    if proc.returncode != 0:
         raise RuntimeError(
-            f"ffmpeg failed (exit={result.returncode}): {' '.join(command)}\n{result.stderr}"
+            f"ffmpeg failed (exit={proc.returncode}): {' '.join(command)}\n{stderr}"
         )
-    return (result.stdout or "") + (result.stderr or "")
+    return (stdout or "") + (stderr or "")
 
 
 def _detect_silence_intervals(
-    audio_path: Path, noise_db: int = -30, min_silence: float = 0.5
+    audio_path: Path,
+    noise_db: int = -30,
+    min_silence: float = 0.5,
+    heartbeat: Callable[[], None] | None = None,
 ) -> list[tuple[float, float]]:
     cmd = [
         "ffmpeg",
@@ -623,7 +662,7 @@ def _detect_silence_intervals(
         "null",
         "-",
     ]
-    output = _run_ffmpeg_capture(cmd)
+    output = _run_ffmpeg_capture(cmd, heartbeat=heartbeat)
     starts: list[float] = []
     ends: list[float] = []
     for line in output.splitlines():
@@ -644,9 +683,11 @@ def _detect_silence_intervals(
     return intervals
 
 
-def _build_speech_segments(audio_path: Path) -> list[tuple[float, float]]:
+def _build_speech_segments(
+    audio_path: Path, heartbeat: Callable[[], None] | None = None
+) -> list[tuple[float, float]]:
     duration = _probe_duration_seconds(audio_path)
-    silences = _detect_silence_intervals(audio_path)
+    silences = _detect_silence_intervals(audio_path, heartbeat=heartbeat)
 
     speech_intervals: list[tuple[float, float]] = []
     cursor = 0.0
@@ -805,7 +846,13 @@ def preprocess_raw_audio(
             "pcm_s16le",
             str(converted_path),
         ]
-        _run_ffmpeg_capture(cmd)
+        _run_ffmpeg_capture(
+            cmd,
+            heartbeat=lambda idx=idx: status.heartbeat(
+                progress={"step": idx - 1, "total": len(source_audio)},
+                message=f"ffmpeg conversion still running ({idx}/{len(source_audio)})",
+            ),
+        )
         wav_inputs.append(converted_path)
 
         status.write(
@@ -831,7 +878,13 @@ def preprocess_raw_audio(
         }
     )
     for file_idx, wav_path in enumerate(wav_inputs, start=1):
-        segments = _build_speech_segments(wav_path)
+        segments = _build_speech_segments(
+            wav_path,
+            heartbeat=lambda file_idx=file_idx: status.heartbeat(
+                progress={"step": file_idx - 1, "total": len(wav_inputs)},
+                message=f"VAD segmentation still running ({file_idx}/{len(wav_inputs)})",
+            ),
+        )
         for start_sec, dur_sec in segments:
             if dur_sec < 1.0:
                 continue
@@ -855,7 +908,13 @@ def preprocess_raw_audio(
                 "pcm_s16le",
                 str(out_path),
             ]
-            _run_ffmpeg_capture(cmd)
+            _run_ffmpeg_capture(
+                cmd,
+                heartbeat=lambda file_idx=file_idx: status.heartbeat(
+                    progress={"step": file_idx - 1, "total": len(wav_inputs)},
+                    message=f"Segment export still running ({file_idx}/{len(wav_inputs)})",
+                ),
+            )
             all_segments.append(out_path)
 
         status.write(

@@ -19,6 +19,7 @@ export interface Env {
   OPENAI_API_KEY?: string;
   OPENAI_TRANSCRIBE_MODEL?: string;
   OPENAI_REVIEW_MODEL?: string;
+  WORKER_PUBLIC_URL?: string;
 }
 
 export interface VoiceSettings {

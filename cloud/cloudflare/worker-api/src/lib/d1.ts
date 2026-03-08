@@ -516,3 +516,10 @@ export const getTrainingLogChunk = async (
 
   return mapTrainingLogChunk(row);
 };
+
+export const deleteTrainingLogChunks = async (
+  db: D1Database,
+  jobId: string
+): Promise<void> => {
+  await db.prepare("DELETE FROM training_log_chunks WHERE job_id = ?").bind(jobId).run();
+};

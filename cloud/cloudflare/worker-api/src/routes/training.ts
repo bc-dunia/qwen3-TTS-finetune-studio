@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import {
   createTrainingJob,
+  deleteTrainingLogChunks,
   getTrainingJob,
   getTrainingLogChunk,
   getVoice,
@@ -22,7 +23,7 @@ import {
 } from "../lib/runpod";
 import { enrichOutputWithReviewAsr } from "../lib/review-asr";
 import { authMiddleware } from "../middleware/auth";
-import type { AppContext, TrainingConfig, TrainingJob, TrainingProgress } from "../types";
+import type { AppContext, Env, TrainingConfig, TrainingJob, TrainingProgress } from "../types";
 
 const app = new Hono<AppContext>();
 app.use("*", authMiddleware);
@@ -31,6 +32,7 @@ type TrainingStatusBlob = {
   status?: string;
   progress?: TrainingProgress;
   checkpoints?: Array<{ epoch?: number; r2_prefix?: string }>;
+  updated_at?: string;
 };
 
 type ValidationPreset = {
@@ -178,6 +180,27 @@ const ACTIVE_JOB_STATUSES = new Set([
   "training",
   "uploading",
 ]);
+const ACTIVE_RUNTIME_RECOVERY_STATUSES = new Set([
+  "pending",
+  "running",
+  "downloading",
+  "preprocessing",
+  "preparing",
+  "training",
+  "uploading",
+]);
+const ACTIVE_STAGE_STALE_MS: Record<string, number> = {
+  pending: 5 * 60 * 1000,
+  running: 12 * 60 * 1000,
+  downloading: 10 * 60 * 1000,
+  preprocessing: 30 * 60 * 1000,
+  preparing: 20 * 60 * 1000,
+  training: 12 * 60 * 1000,
+  uploading: 20 * 60 * 1000,
+};
+const MAX_STALL_RECOVERY_ATTEMPTS = 3;
+const DEFAULT_WORKER_PUBLIC_URL = "https://qwen-tts-api.brian-367.workers.dev";
+const TRAINING_SWEEP_LIMIT = 100;
 
 const REFERENCE_AUDIO_KEY_RE = /\/ref_audio\.[^/]+$/i;
 
@@ -558,13 +581,39 @@ const MAX_PROVISIONING_RECOVERY_ATTEMPTS = 2;
 const OVERALL_SCORE_ERROR_RE = /overall_score=([0-9.]+)/i;
 const VALIDATION_ASR_ERROR_KEY = "openai_asr_error";
 
-const getWorkerOrigin = (c: Context<AppContext>): string => new URL(c.req.url).origin;
+const resolveWorkerPublicUrl = (env: Pick<Env, "WORKER_PUBLIC_URL">, requestUrl?: string | null): string => {
+  if (typeof requestUrl === "string" && requestUrl.trim()) {
+    return new URL(requestUrl).origin;
+  }
+  const configured = env.WORKER_PUBLIC_URL?.trim();
+  return configured ? configured.replace(/\/+$/, "") : DEFAULT_WORKER_PUBLIC_URL;
+};
+
+const getWorkerOrigin = (c: Context<AppContext>): string => resolveWorkerPublicUrl(c.env, c.req.url);
+const createSyntheticContext = (env: Env, workerOrigin: string): Context<AppContext> =>
+  ({
+    env,
+    req: {
+      url: `${workerOrigin.replace(/\/+$/, "")}/`,
+    },
+  } as unknown as Context<AppContext>);
 const GHCR_INDEX_ACCEPT =
   "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json";
 
 const readNumber = (value: unknown): number | null => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+};
+
+const readTimestamp = (value: unknown): number | null => {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
 };
 
 const getValidationRunStartedAt = (
@@ -994,6 +1043,174 @@ const recoverStalledProvisioningJob = async (
       summary: {
         ...nextSummary,
         provisioning_recovery_failed: true,
+      },
+    });
+    return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
+  }
+};
+
+const getStaleThresholdMs = (status: string): number | null => {
+  return ACTIVE_STAGE_STALE_MS[status] ?? null;
+};
+
+const getLatestActivityAt = async (
+  c: Context<AppContext>,
+  job: TrainingJob,
+  parsedStatus: TrainingStatusBlob | null
+): Promise<number> => {
+  const timestamps = [
+    readTimestamp(parsedStatus?.updated_at),
+    readNumber(job.last_heartbeat_at),
+    readNumber(job.updated_at),
+    readNumber(job.started_at),
+    readNumber(job.created_at),
+  ].filter((value): value is number => value !== null);
+  const latestChunk = await listTrainingLogChunks(c.env.DB, job.job_id, 1);
+  if (latestChunk[0]) {
+    timestamps.push(latestChunk[0].created_at);
+  }
+  return timestamps.length > 0 ? Math.max(...timestamps) : Date.now();
+};
+
+const deleteR2Prefix = async (bucket: R2Bucket, prefix: string): Promise<number> => {
+  let deleted = 0;
+  let cursor: string | undefined;
+  do {
+    const page = await bucket.list({ prefix, cursor, limit: 1000 });
+    for (const object of page.objects) {
+      await bucket.delete(object.key);
+      deleted += 1;
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  return deleted;
+};
+
+const clearRecoveredJobArtifacts = async (c: Context<AppContext>, jobId: string): Promise<void> => {
+  await c.env.R2.delete(`jobs/${jobId}/status.json`);
+  await deleteR2Prefix(c.env.R2, `jobs/${jobId}/logs/`);
+  await deleteTrainingLogChunks(c.env.DB, jobId);
+};
+
+const recoverStalledActiveJob = async (
+  c: Context<AppContext>,
+  job: TrainingJob,
+  parsedStatus: TrainingStatusBlob | null
+): Promise<TrainingJob> => {
+  const effectiveStatus =
+    typeof parsedStatus?.status === "string" && parsedStatus.status.trim()
+      ? parsedStatus.status.trim()
+      : job.status;
+  if (!ACTIVE_RUNTIME_RECOVERY_STATUSES.has(effectiveStatus)) {
+    return job;
+  }
+
+  const staleThresholdMs = getStaleThresholdMs(effectiveStatus);
+  if (staleThresholdMs === null) {
+    return job;
+  }
+
+  const latestActivityAt = await getLatestActivityAt(c, job, parsedStatus);
+  const inactiveMs = Math.max(0, Date.now() - latestActivityAt);
+  if (inactiveMs < staleThresholdMs) {
+    return job;
+  }
+
+  const summary = (job.summary ?? {}) as Record<string, unknown>;
+  const attempts = readNumber(summary.stall_recovery_attempts) ?? 0;
+  const lastMessage = typeof summary.last_message === "string" ? summary.last_message.trim() : "";
+  const previousPodIds = Array.isArray(summary.previous_runpod_pod_ids)
+    ? summary.previous_runpod_pod_ids.filter((value): value is string => typeof value === "string")
+    : [];
+
+  let podStatus: PodStatusDetail | null = null;
+  try {
+    podStatus = job.runpod_pod_id ? await getPodStatus(c.env, job.runpod_pod_id) : null;
+  } catch (error) {
+    console.warn(`Failed to inspect pod ${job.runpod_pod_id ?? "unknown"} for stalled job ${job.job_id}:`, error);
+  }
+
+  const podState = getProvisioningState(podStatus) || String(podStatus?.runtimeStatus ?? "").trim().toLowerCase() || "unknown";
+  const baseSummary = {
+    ...summary,
+    stall_recovery_attempts: attempts + 1,
+    last_stall_stage: effectiveStatus,
+    last_stall_activity_at: latestActivityAt,
+    last_stall_inactive_ms: inactiveMs,
+    last_stall_pod_state: podState,
+    last_recovery_at: Date.now(),
+    previous_runpod_pod_ids: Array.from(
+      new Set([...previousPodIds, ...(job.runpod_pod_id ? [job.runpod_pod_id] : [])])
+    ),
+  };
+  const reason =
+    `Training job stalled in ${effectiveStatus} for ${Math.round(inactiveMs / 60000)} minute(s)` +
+    (lastMessage ? `; last_message=${lastMessage}` : "") +
+    (job.runpod_pod_id ? `; pod=${job.runpod_pod_id}` : "") +
+    (podState ? `; pod_state=${podState}` : "");
+
+  if (attempts >= MAX_STALL_RECOVERY_ATTEMPTS) {
+    if (job.runpod_pod_id) {
+      await terminatePod(c.env, job.runpod_pod_id).catch(() => false);
+    }
+    await updateTrainingJob(c.env.DB, job.job_id, {
+      status: "failed",
+      error_message: `${reason}. Recovery attempts exhausted.`,
+      completed_at: Date.now(),
+      summary: {
+        ...baseSummary,
+        stall_recovery_exhausted: true,
+      },
+    });
+    return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
+  }
+
+  if (!job.job_token) {
+    await updateTrainingJob(c.env.DB, job.job_id, {
+      status: "failed",
+      error_message: `${reason}. Missing job_token; cannot recreate pod.`,
+      completed_at: Date.now(),
+      summary: {
+        ...baseSummary,
+        stall_recovery_failed: true,
+      },
+    });
+    return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
+  }
+
+  if (job.runpod_pod_id) {
+    await terminatePod(c.env, job.runpod_pod_id).catch(() => false);
+  }
+
+  await clearRecoveredJobArtifacts(c, job.job_id);
+
+  try {
+    const launchResult = await createTrainingPodForJob(c, job);
+    await updateTrainingJob(c.env.DB, job.job_id, {
+      runpod_pod_id: launchResult.pod.podId,
+      status: "provisioning",
+      progress: {},
+      error_message: null,
+      last_heartbeat_at: null,
+      started_at: Date.now(),
+      completed_at: null,
+      summary: {
+        ...baseSummary,
+        ...launchResult.summary,
+        last_recovery_mode: "restart_same_job",
+      },
+    });
+    return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
+  } catch (error) {
+    await updateTrainingJob(c.env.DB, job.job_id, {
+      status: "failed",
+      error_message: `${reason}. Failed to recreate pod: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      completed_at: Date.now(),
+      summary: {
+        ...baseSummary,
+        stall_recovery_failed: true,
       },
     });
     return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
@@ -2930,6 +3147,7 @@ const reconcileJobStatus = async (
 
   if (!statusBlob) {
     currentJob = await recoverStalledProvisioningJob(c, currentJob);
+    currentJob = await recoverStalledActiveJob(c, currentJob, null);
     return { status: currentJob.status, progress: currentJob.progress };
   }
 
@@ -2947,9 +3165,26 @@ const reconcileJobStatus = async (
       progress,
       completed_at: status === "completed" ? job.completed_at ?? Date.now() : job.completed_at,
     });
+    currentJob = {
+      ...job,
+      status,
+      progress,
+      completed_at: status === "completed" ? job.completed_at ?? Date.now() : job.completed_at,
+    };
+  } else {
+    currentJob = {
+      ...job,
+      status,
+      progress,
+    };
   }
 
-  if (status === "completed" && !job.summary?.validation_checked) {
+  currentJob = await recoverStalledActiveJob(c, currentJob, parsedStatus);
+  if (currentJob.job_id === job.job_id && currentJob.status !== status) {
+    return { status: currentJob.status, progress: currentJob.progress };
+  }
+
+  if (currentJob.status === "completed" && !currentJob.summary?.validation_checked) {
     const voice = await getVoice(c.env.DB, job.voice_id);
     if (!voice) {
       const message = "Voice record missing for validation";
@@ -2957,13 +3192,13 @@ const reconcileJobStatus = async (
         status: "failed",
         error_message: message,
         summary: {
-          ...(job.summary ?? {}),
+          ...(currentJob.summary ?? {}),
           validation_failed: true,
           validation_checked: true,
           validation_passed: false,
           validation_message: message,
         },
-        completed_at: job.completed_at ?? Date.now(),
+        completed_at: currentJob.completed_at ?? Date.now(),
         progress,
       });
       return { status: "failed", progress };
@@ -2978,19 +3213,19 @@ const reconcileJobStatus = async (
         status: "failed",
         error_message: message,
         summary: {
-          ...(job.summary ?? {}),
+          ...(currentJob.summary ?? {}),
           validation_failed: true,
           validation_checked: true,
           validation_passed: false,
           validation_message: message,
         },
-        completed_at: job.completed_at ?? Date.now(),
+        completed_at: currentJob.completed_at ?? Date.now(),
         progress,
       });
       return { status: "failed", progress };
     }
 
-    const currentSummary = (job.summary ?? {}) as Record<string, unknown>;
+    const currentSummary = (currentJob.summary ?? {}) as Record<string, unknown>;
     const forceRevalidation = currentSummary.force_revalidation === true;
     const persistedReadyCheckpoint =
       voice.status === "ready" &&
@@ -3002,7 +3237,7 @@ const reconcileJobStatus = async (
     if (persistedReadyCheckpoint && !forceRevalidation) {
       await updateTrainingJob(c.env.DB, job.job_id, {
         status: "completed",
-        completed_at: job.completed_at ?? Date.now(),
+        completed_at: currentJob.completed_at ?? Date.now(),
         progress,
         summary: {
           ...currentSummary,
@@ -3041,22 +3276,22 @@ const reconcileJobStatus = async (
         status: "failed",
         error_message: message,
         summary: {
-          ...(job.summary ?? {}),
+          ...(currentJob.summary ?? {}),
           validation_failed: true,
           validation_checked: true,
           validation_passed: false,
           validation_message: message,
         },
-        completed_at: job.completed_at ?? Date.now(),
+        completed_at: currentJob.completed_at ?? Date.now(),
         progress,
       });
       return { status: "failed", progress };
     }
 
-    return advanceAsyncCheckpointValidation(c, voice, job, progress, currentSummary, candidateCheckpoints);
+    return advanceAsyncCheckpointValidation(c, voice, currentJob, progress, currentSummary, candidateCheckpoints);
   }
 
-  return { status, progress };
+  return { status: currentJob.status, progress: currentJob.progress };
 };
 
 const RECONCILE_TIMEOUT_MS = 25000;
@@ -3093,6 +3328,41 @@ const reconcileJobStatusWithTimeout = async (
     waitForBackgroundTask(c, reconcilePromise);
   }
   return !timedOut;
+};
+
+export const runTrainingSupervisorSweep = async (
+  env: Env
+): Promise<{ checked: number; reconciled: number; timed_out: number; failed: number }> => {
+  const jobs = await listTrainingJobs(env.DB, { limit: TRAINING_SWEEP_LIMIT });
+  const candidates = jobs.filter((job) => ACTIVE_JOB_STATUSES.has(job.status) || needsCompletedValidation(job));
+  const syntheticContext = createSyntheticContext(env, resolveWorkerPublicUrl(env));
+  let reconciled = 0;
+  let timedOut = 0;
+  let failed = 0;
+
+  for (const job of candidates) {
+    try {
+      const timeoutMs = needsCompletedValidation(job)
+        ? COMPLETED_VALIDATION_TIMEOUT_MS
+        : RECONCILE_TIMEOUT_MS;
+      const completed = await reconcileJobStatusWithTimeout(syntheticContext, job, timeoutMs);
+      if (completed) {
+        reconciled += 1;
+      } else {
+        timedOut += 1;
+      }
+    } catch (error) {
+      failed += 1;
+      console.warn(`Training supervisor sweep failed for ${job.job_id}:`, error);
+    }
+  }
+
+  return {
+    checked: candidates.length,
+    reconciled,
+    timed_out: timedOut,
+    failed,
+  };
 };
 
 app.post("/start", async (c) => {

@@ -2,7 +2,7 @@ import type { Env } from "../types";
 
 const CLOUDFLARE_REVIEW_MODEL = "@cf/meta/llama-3.1-8b-instruct";
 const OPENAI_REVIEW_URL = "https://api.openai.com/v1/chat/completions";
-const DEFAULT_OPENAI_REVIEW_MODEL = "gpt-4o-mini";
+const DEFAULT_OPENAI_REVIEW_MODEL = "gpt-5-mini";
 
 const normalizeLanguageCode = (value: string | undefined): string => {
   const normalized = (value ?? "").trim().toLowerCase();

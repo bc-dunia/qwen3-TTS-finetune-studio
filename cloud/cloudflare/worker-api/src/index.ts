@@ -4,11 +4,11 @@ import adminRoutes from "./routes/admin";
 import datasetRoutes from "./routes/dataset";
 import modelsRoutes from "./routes/models";
 import trainingCallbacksRoutes from "./routes/training-callbacks";
-import trainingRoutes from "./routes/training";
+import trainingRoutes, { runTrainingSupervisorSweep } from "./routes/training";
 import ttsRoutes from "./routes/tts";
 import uploadRoutes from "./routes/upload";
 import voicesRoutes from "./routes/voices";
-import type { AppContext } from "./types";
+import type { AppContext, Env } from "./types";
 
 const app = new Hono<AppContext>();
 
@@ -46,4 +46,21 @@ app.onError((err, c) => {
   return c.json({ detail: { status: "error", message } }, 500);
 });
 
-export default app;
+const fetch = app.fetch;
+
+const scheduled: ExportedHandlerScheduledHandler<Env> = async (_controller, env, ctx) => {
+  ctx.waitUntil(
+    runTrainingSupervisorSweep(env)
+      .then((result) => {
+        console.log("Training supervisor sweep completed", result);
+      })
+      .catch((error) => {
+        console.error("Training supervisor sweep failed", error);
+      })
+  );
+};
+
+export default {
+  fetch,
+  scheduled,
+};
