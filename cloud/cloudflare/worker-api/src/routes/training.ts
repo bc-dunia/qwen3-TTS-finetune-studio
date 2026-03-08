@@ -757,12 +757,13 @@ const createTrainingPodForJob = async (
 }> => {
   const imageName = getConfiguredTrainingImageName(c);
   if (imageName) {
+    const resolvedImageName = await resolveGhcrAmd64Image(imageName).catch(() => imageName);
     const dockerArgs = getConfiguredTrainingDockerArgs(c);
     const volumeMountPath = getConfiguredTrainingVolumeMountPath(c);
     const pod = await createPodDirect(c.env, {
       gpuTypeId: getTrainingGpuType(job),
       envVars: buildTrainingPodEnv(c, job),
-      imageName,
+      imageName: resolvedImageName,
       dockerArgs,
       name: `qwen3-tts-training-${job.job_id.slice(0, 8)}`,
       cloudType: "ALL",
@@ -773,6 +774,7 @@ const createTrainingPodForJob = async (
       summary: {
         training_launch_mode: "direct_image",
         training_image_name: imageName,
+        training_resolved_image_name: resolvedImageName,
         training_docker_args: dockerArgs,
         training_volume_mount_path: volumeMountPath,
       },
