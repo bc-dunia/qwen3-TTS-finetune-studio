@@ -1192,6 +1192,11 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
             num_candidates = 3 if model_id == "qwen3-tts-0.6b" else 2
         num_candidates = max(1, min(5, num_candidates))
         review_cfg = inp.get("quality_review") or {}
+        allow_below_threshold = bool(
+            review_cfg.get("allow_below_threshold", False)
+            if isinstance(review_cfg, dict)
+            else False
+        )
 
         storage = _r2_storage_cls()()
         try:
@@ -1308,9 +1313,10 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         gen_ms = best_candidate["gen_ms"]
         quality = best_candidate["quality"]
         min_accept_score = 0.9 if model_id == "qwen3-tts-0.6b" else 0.82
-        allow_below_threshold = bool(review_cfg.get("allow_below_threshold"))
-        accepted = float(quality["overall_score"]) >= min_accept_score
-        if not accepted and not allow_below_threshold:
+        allow_below_threshold = bool(review_cfg.get("allow_below_threshold", False))
+        below_threshold = float(quality["overall_score"]) < min_accept_score
+        accepted = not below_threshold
+        if below_threshold and not allow_below_threshold:
             return {
                 "error": (
                     f"Generated audio below quality threshold: "
@@ -1347,6 +1353,12 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                 "retries": retries,
             },
         }
+        if below_threshold:
+            out["warning"] = (
+                "Generated audio below quality threshold: "
+                f"overall_score={float(quality['overall_score']):.3f} "
+                f"required={min_accept_score:.3f}"
+            )
         if "asr_score" in quality:
             out["quality"]["asr_score"] = float(quality["asr_score"])
             out["quality"]["asr_similarity"] = float(quality.get("asr_similarity", 0.0))
