@@ -867,16 +867,13 @@ const recoverStalledProvisioningJob = async (
     return job;
   }
 
-  if (!isProvisioningPodStalled(podStatus)) {
-    return job;
-  }
-  if (!podStatus) {
+  if (podStatus && !isProvisioningPodStalled(podStatus)) {
     return job;
   }
 
   const summary = (job.summary ?? {}) as Record<string, unknown>;
   const attempts = readNumber(summary.provisioning_recovery_attempts) ?? 0;
-  const podState = getProvisioningState(podStatus) || "unknown";
+  const podState = podStatus ? (getProvisioningState(podStatus) || "unknown") : "missing";
   const previousPodIds = Array.isArray(summary.previous_runpod_pod_ids)
     ? summary.previous_runpod_pod_ids.filter((value): value is string => typeof value === "string")
     : [];
@@ -889,8 +886,8 @@ const recoverStalledProvisioningJob = async (
   };
   const reason =
     `RunPod pod stalled in provisioning for ${Math.round(ageMs / 60000)} minute(s): ` +
-    `state=${podState} uptime=${podStatus.uptimeSeconds ?? podStatus.runtime?.uptimeInSeconds ?? "n/a"}s ` +
-    `image=${podStatus.imageName ?? "unknown"} template=${podStatus.templateId ?? "unknown"}`;
+    `state=${podState} uptime=${podStatus?.uptimeSeconds ?? podStatus?.runtime?.uptimeInSeconds ?? "n/a"}s ` +
+    `image=${podStatus?.imageName ?? "unknown"} template=${podStatus?.templateId ?? "unknown"}`;
 
   if (!job.job_token) {
     await updateTrainingJob(c.env.DB, job.job_id, {
@@ -908,7 +905,7 @@ const recoverStalledProvisioningJob = async (
   const templateId = getConfiguredTrainingTemplateId(c);
   const hasTriedDirectFallback = summary.provisioning_direct_fallback_attempted === true;
   const hasTriedDigestFallback = summary.provisioning_digest_fallback_attempted === true;
-  if (!templateId && podStatus.imageName) {
+  if (!templateId && podStatus?.imageName) {
     let template: Awaited<ReturnType<typeof getTemplateById>> = null;
     try {
       if (podStatus.templateId) {
