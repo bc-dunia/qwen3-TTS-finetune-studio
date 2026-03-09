@@ -459,6 +459,13 @@ const shouldKeepReadyVoiceOnValidationFailure = (
   if (!currentPrefix) {
     return false;
   }
+  const manualPromotedPrefix =
+    typeof summary.manual_promoted_checkpoint_prefix === "string"
+      ? summary.manual_promoted_checkpoint_prefix.trim()
+      : "";
+  if (manualPromotedPrefix && manualPromotedPrefix === currentPrefix) {
+    return true;
+  }
 
   const getRunNameFromPrefix = (prefix: string): string | null => {
     const parts = prefix.split("/");
@@ -1264,6 +1271,79 @@ const getValidationTexts = (lang: string, is06b: boolean): string[] => {
   return fallback.slice(0, 1);
 };
 
+const inferValidationLanguage = (...values: Array<string | null | undefined>): string => {
+  const joined = values
+    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    .join(" ")
+    .trim();
+  if (!joined) {
+    return "en";
+  }
+
+  const normalizedHint = joined.toLowerCase().trim().replace(/_/g, "-");
+  const directMap: Record<string, string> = {
+    auto: "en",
+    ko: "ko",
+    "ko-kr": "ko",
+    korean: "ko",
+    en: "en",
+    "en-us": "en",
+    "en-gb": "en",
+    english: "en",
+    ja: "ja",
+    "ja-jp": "ja",
+    japanese: "ja",
+    jp: "ja",
+    zh: "zh",
+    "zh-cn": "zh",
+    "zh-tw": "zh",
+    chinese: "zh",
+    cn: "zh",
+  };
+  if (directMap[normalizedHint]) {
+    return directMap[normalizedHint];
+  }
+
+  if (/[가-힣]/.test(joined)) {
+    return "ko";
+  }
+  if (/[ぁ-ゖァ-ヺ]/.test(joined)) {
+    return "ja";
+  }
+  if (/[一-龯]/.test(joined)) {
+    return "zh";
+  }
+  return "en";
+};
+
+const normalizeValidationInferenceLanguage = (
+  language: string | null | undefined
+): string | null => {
+  const normalized = (language ?? "").trim().toLowerCase().replace(/_/g, "-");
+  if (!normalized || normalized === "auto") {
+    return null;
+  }
+  const aliases: Record<string, string> = {
+    ko: "korean",
+    "ko-kr": "korean",
+    korean: "korean",
+    en: "english",
+    "en-us": "english",
+    "en-gb": "english",
+    english: "english",
+    ja: "japanese",
+    "ja-jp": "japanese",
+    japanese: "japanese",
+    jp: "japanese",
+    zh: "chinese",
+    "zh-cn": "chinese",
+    "zh-tw": "chinese",
+    chinese: "chinese",
+    cn: "chinese",
+  };
+  return aliases[normalized] ?? normalized;
+};
+
 const getSignatureStyleInstruction = (lang: string): string => {
   switch (lang) {
     case "ko":
@@ -1343,8 +1423,12 @@ const getValidationPlan = (
   const modelId = voice.model_id ?? "qwen3-tts-1.7b";
   const is06b = modelId.toLowerCase().includes("0.6b");
   const jobConfig = job.config as Record<string, unknown>;
-  const lang =
-    typeof jobConfig.whisper_language === "string" ? jobConfig.whisper_language.toLowerCase() : "";
+  const lang = inferValidationLanguage(
+    typeof jobConfig.whisper_language === "string" ? jobConfig.whisper_language : undefined,
+    voice.labels?.language,
+    voice.name,
+    voice.speaker_name
+  );
   const validationTexts = getValidationTexts(lang, is06b);
   const validationSeedOffsets = is06b ? FAST_VALIDATION_SEEDS_OFFSET : FULL_VALIDATION_SEEDS_OFFSET;
   return {
@@ -1596,6 +1680,7 @@ const buildValidationPayload = ({
   seed,
   referenceAudioKey,
   referenceText,
+  languageHint,
 }: {
   voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>;
   checkpointPrefix: string;
@@ -1604,12 +1689,15 @@ const buildValidationPayload = ({
   seed: number;
   referenceAudioKey: string | null;
   referenceText: string;
+  languageHint: string | null;
 }): Record<string, unknown> => ({
   text: validationText,
   voice_id: voice.voice_id,
   speaker_name: voice.speaker_name,
   model_id: voice.model_id ?? "qwen3-tts-1.7b",
-  language: "auto",
+  ...(normalizeValidationInferenceLanguage(languageHint)
+    ? { language: normalizeValidationInferenceLanguage(languageHint) }
+    : {}),
   seed,
   quality_review: {
     enable_asr: false,
@@ -1630,15 +1718,15 @@ const buildValidationPayload = ({
 const getValidationLanguageHint = (
   voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>,
   job: TrainingJob
-): string => {
+): string | null => {
   const jobConfig = job.config as Record<string, unknown>;
-  if (typeof jobConfig.whisper_language === "string" && jobConfig.whisper_language.trim()) {
-    return jobConfig.whisper_language.trim();
-  }
-  if (voice.labels && typeof voice.labels.language === "string" && voice.labels.language.trim()) {
-    return voice.labels.language.trim();
-  }
-  return "auto";
+  const inferred = inferValidationLanguage(
+    typeof jobConfig.whisper_language === "string" ? jobConfig.whisper_language : undefined,
+    voice.labels?.language,
+    voice.name,
+    voice.speaker_name
+  );
+  return inferred || null;
 };
 
 const annotateAsrFailure = (
@@ -2206,6 +2294,7 @@ const advanceAsyncCheckpointValidation = async (
       seed,
       referenceAudioKey: reference.referenceAudioKey,
       referenceText: reference.referenceText,
+      languageHint: getValidationLanguageHint(voice, job),
     });
     const runpodResponse = await invokeServerlessAsync(c.env, c.env.RUNPOD_ENDPOINT_ID, payload);
     const sampleOrdinal = textIndex * plan.validationSeedOffsets.length + seedIndex + 1;
@@ -2599,6 +2688,7 @@ const advanceAsync06bCheckpointValidation = async (
       seed,
       referenceAudioKey: reference.referenceAudioKey,
       referenceText: reference.referenceText,
+      languageHint: getValidationLanguageHint(voice, job),
     });
     const runpodResponse = await invokeServerlessAsync(c.env, c.env.RUNPOD_ENDPOINT_ID, payload);
     const nextState: Async06bValidationState = {
@@ -2898,12 +2988,14 @@ const validateTrainedCheckpoint = async (
       for (let i = 0; i < validationTexts.length; i += 1) {
         for (const seedOffset of validationSeedOffsets) {
           const seed = seedOffset + i;
+          const languageHint = getValidationLanguageHint(voice, job);
+          const normalizedLanguage = normalizeValidationInferenceLanguage(languageHint);
           const payload: Record<string, unknown> = {
             text: validationTexts[i],
             voice_id: voice.voice_id,
             speaker_name: voice.speaker_name,
             model_id: voice.model_id ?? "qwen3-tts-1.7b",
-            language: "auto",
+            ...(normalizedLanguage ? { language: normalizedLanguage } : {}),
             seed,
             quality_review: {
               enable_asr: false,
