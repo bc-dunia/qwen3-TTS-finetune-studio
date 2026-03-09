@@ -56,6 +56,35 @@ type DbTrainingLogChunkRow = {
   lines: number | null;
 };
 
+type DbDatasetPreprocessCacheRow = {
+  cache_id: string;
+  voice_id: string;
+  dataset_r2_prefix: string;
+  dataset_signature: string;
+  cache_r2_prefix: string;
+  train_raw_r2_key: string;
+  ref_audio_r2_key: string | null;
+  reference_profile_r2_key: string | null;
+  source_file_count: number | null;
+  segments_created: number | null;
+  segments_accepted: number | null;
+  accepted_duration_min: number | null;
+  created_at: number;
+  updated_at: number;
+};
+
+type DbDatasetPreprocessCacheEntryRow = {
+  entry_id: string;
+  cache_id: string;
+  seq: number;
+  audio_path: string;
+  audio_r2_key: string;
+  text: string;
+  included: number;
+  created_at: number;
+  updated_at: number;
+};
+
 const parseJson = <T>(value: string | null | undefined, fallback: T): T => {
   if (!value) {
     return fallback;
@@ -119,6 +148,35 @@ export type TrainingLogChunk = {
   lines: number | null;
 };
 
+export type DatasetPreprocessCache = {
+  cache_id: string;
+  voice_id: string;
+  dataset_r2_prefix: string;
+  dataset_signature: string;
+  cache_r2_prefix: string;
+  train_raw_r2_key: string;
+  ref_audio_r2_key: string | null;
+  reference_profile_r2_key: string | null;
+  source_file_count: number | null;
+  segments_created: number | null;
+  segments_accepted: number | null;
+  accepted_duration_min: number | null;
+  created_at: number;
+  updated_at: number;
+};
+
+export type DatasetPreprocessCacheEntry = {
+  entry_id: string;
+  cache_id: string;
+  seq: number;
+  audio_path: string;
+  audio_r2_key: string;
+  text: string;
+  included: boolean;
+  created_at: number;
+  updated_at: number;
+};
+
 const mapTrainingLogChunk = (row: DbTrainingLogChunkRow): TrainingLogChunk => ({
   job_id: row.job_id,
   seq: row.seq,
@@ -126,6 +184,39 @@ const mapTrainingLogChunk = (row: DbTrainingLogChunkRow): TrainingLogChunk => ({
   created_at: row.created_at,
   bytes: row.bytes,
   lines: row.lines,
+});
+
+const mapDatasetPreprocessCache = (
+  row: DbDatasetPreprocessCacheRow
+): DatasetPreprocessCache => ({
+  cache_id: row.cache_id,
+  voice_id: row.voice_id,
+  dataset_r2_prefix: row.dataset_r2_prefix,
+  dataset_signature: row.dataset_signature,
+  cache_r2_prefix: row.cache_r2_prefix,
+  train_raw_r2_key: row.train_raw_r2_key,
+  ref_audio_r2_key: row.ref_audio_r2_key,
+  reference_profile_r2_key: row.reference_profile_r2_key,
+  source_file_count: row.source_file_count,
+  segments_created: row.segments_created,
+  segments_accepted: row.segments_accepted,
+  accepted_duration_min: row.accepted_duration_min,
+  created_at: row.created_at,
+  updated_at: row.updated_at,
+});
+
+const mapDatasetPreprocessCacheEntry = (
+  row: DbDatasetPreprocessCacheEntryRow
+): DatasetPreprocessCacheEntry => ({
+  entry_id: row.entry_id,
+  cache_id: row.cache_id,
+  seq: row.seq,
+  audio_path: row.audio_path,
+  audio_r2_key: row.audio_r2_key,
+  text: row.text,
+  included: row.included === 1,
+  created_at: row.created_at,
+  updated_at: row.updated_at,
 });
 
 export const getVoice = async (db: D1Database, voiceId: string): Promise<Voice | null> => {
@@ -522,4 +613,176 @@ export const deleteTrainingLogChunks = async (
   jobId: string
 ): Promise<void> => {
   await db.prepare("DELETE FROM training_log_chunks WHERE job_id = ?").bind(jobId).run();
+};
+
+export const getDatasetPreprocessCache = async (
+  db: D1Database,
+  voiceId: string,
+  datasetR2Prefix: string,
+  datasetSignature: string
+): Promise<DatasetPreprocessCache | null> => {
+  const row = await db
+    .prepare(
+      `SELECT * FROM dataset_preprocess_caches
+       WHERE voice_id = ? AND dataset_r2_prefix = ? AND dataset_signature = ?
+       LIMIT 1`
+    )
+    .bind(voiceId, datasetR2Prefix, datasetSignature)
+    .first<DbDatasetPreprocessCacheRow>();
+
+  return row ? mapDatasetPreprocessCache(row) : null;
+};
+
+export const getDatasetPreprocessCacheById = async (
+  db: D1Database,
+  cacheId: string
+): Promise<DatasetPreprocessCache | null> => {
+  const row = await db
+    .prepare("SELECT * FROM dataset_preprocess_caches WHERE cache_id = ? LIMIT 1")
+    .bind(cacheId)
+    .first<DbDatasetPreprocessCacheRow>();
+
+  return row ? mapDatasetPreprocessCache(row) : null;
+};
+
+export const upsertDatasetPreprocessCache = async (
+  db: D1Database,
+  cache: DatasetPreprocessCache
+): Promise<void> => {
+  await db
+    .prepare(
+      `INSERT INTO dataset_preprocess_caches (
+        cache_id, voice_id, dataset_r2_prefix, dataset_signature, cache_r2_prefix,
+        train_raw_r2_key, ref_audio_r2_key, reference_profile_r2_key,
+        source_file_count, segments_created, segments_accepted, accepted_duration_min,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(voice_id, dataset_r2_prefix, dataset_signature) DO UPDATE SET
+        cache_r2_prefix = excluded.cache_r2_prefix,
+        train_raw_r2_key = excluded.train_raw_r2_key,
+        ref_audio_r2_key = excluded.ref_audio_r2_key,
+        reference_profile_r2_key = excluded.reference_profile_r2_key,
+        source_file_count = excluded.source_file_count,
+        segments_created = excluded.segments_created,
+        segments_accepted = excluded.segments_accepted,
+        accepted_duration_min = excluded.accepted_duration_min,
+        updated_at = excluded.updated_at`
+    )
+    .bind(
+      cache.cache_id,
+      cache.voice_id,
+      cache.dataset_r2_prefix,
+      cache.dataset_signature,
+      cache.cache_r2_prefix,
+      cache.train_raw_r2_key,
+      cache.ref_audio_r2_key,
+      cache.reference_profile_r2_key,
+      cache.source_file_count,
+      cache.segments_created,
+      cache.segments_accepted,
+      cache.accepted_duration_min,
+      cache.created_at,
+      cache.updated_at
+    )
+    .run();
+};
+
+export const getDatasetPreprocessCacheEntry = async (
+  db: D1Database,
+  entryId: string
+): Promise<DatasetPreprocessCacheEntry | null> => {
+  const row = await db
+    .prepare("SELECT * FROM dataset_preprocess_cache_entries WHERE entry_id = ? LIMIT 1")
+    .bind(entryId)
+    .first<DbDatasetPreprocessCacheEntryRow>();
+
+  return row ? mapDatasetPreprocessCacheEntry(row) : null;
+};
+
+export const listDatasetPreprocessCacheEntries = async (
+  db: D1Database,
+  cacheId: string
+): Promise<DatasetPreprocessCacheEntry[]> => {
+  const result = await db
+    .prepare(
+      `SELECT * FROM dataset_preprocess_cache_entries
+       WHERE cache_id = ?
+       ORDER BY seq ASC`
+    )
+    .bind(cacheId)
+    .all<DbDatasetPreprocessCacheEntryRow>();
+
+  return (result.results ?? []).map(mapDatasetPreprocessCacheEntry);
+};
+
+export const replaceDatasetPreprocessCacheEntries = async (
+  db: D1Database,
+  cacheId: string,
+  entries: DatasetPreprocessCacheEntry[]
+): Promise<void> => {
+  await db
+    .prepare("DELETE FROM dataset_preprocess_cache_entries WHERE cache_id = ?")
+    .bind(cacheId)
+    .run();
+
+  if (entries.length === 0) {
+    return;
+  }
+
+  const chunkSize = 100;
+  for (let index = 0; index < entries.length; index += chunkSize) {
+    const chunk = entries.slice(index, index + chunkSize);
+    await db.batch(
+      chunk.map((entry) =>
+        db
+          .prepare(
+            `INSERT INTO dataset_preprocess_cache_entries (
+              entry_id, cache_id, seq, audio_path, audio_r2_key, text, included, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .bind(
+            entry.entry_id,
+            cacheId,
+            entry.seq,
+            entry.audio_path,
+            entry.audio_r2_key,
+            entry.text,
+            entry.included ? 1 : 0,
+            entry.created_at,
+            entry.updated_at
+          )
+      )
+    );
+  }
+};
+
+export const updateDatasetPreprocessCacheEntry = async (
+  db: D1Database,
+  entryId: string,
+  updates: {
+    text?: string;
+    included?: boolean;
+    updated_at?: number;
+  }
+): Promise<void> => {
+  const fields: string[] = [];
+  const bindings: Array<string | number> = [];
+
+  if (updates.text !== undefined) {
+    fields.push("text = ?");
+    bindings.push(updates.text);
+  }
+  if (updates.included !== undefined) {
+    fields.push("included = ?");
+    bindings.push(updates.included ? 1 : 0);
+  }
+
+  fields.push("updated_at = ?");
+  bindings.push(updates.updated_at ?? Date.now());
+
+  bindings.push(entryId);
+  await db
+    .prepare(`UPDATE dataset_preprocess_cache_entries SET ${fields.join(", ")} WHERE entry_id = ?`)
+    .bind(...bindings)
+    .run();
 };

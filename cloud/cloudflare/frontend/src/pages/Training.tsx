@@ -11,11 +11,16 @@ import {
   revalidateTrainingJob,
   fetchTrainingLogs,
   fetchTrainingLogChunkText,
+  fetchTrainingPreprocessCache,
   type DatasetInfo,
+  type DatasetPreprocessCacheEntry,
   type TrainingLogChunk,
+  type TrainingPreprocessCacheResponse,
   type Voice,
   type TrainingJob,
   type TrainingConfig,
+  updateTrainingPreprocessCache,
+  updateTrainingPreprocessEntry,
   formatDateTime,
   formatDurationMs,
   formatTime,
@@ -1135,7 +1140,7 @@ function JobCard({
           className="inline-flex items-center rounded-lg border border-edge px-3 py-2 text-[11px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent"
           type="button"
         >
-          View Logs
+          Inspect Run
         </button>
       </div>
 
@@ -1147,6 +1152,12 @@ function JobCard({
         <span>lr={job.config.learning_rate}</span>
         {typeof job.config.seed === 'number' && <span>seed={job.config.seed}</span>}
         {job.config.gpu_type_id && <span>gpu={job.config.gpu_type_id}</span>}
+        {typeof job.summary?.preprocess_cache_lookup === 'string' && (
+          <span>cache={job.summary.preprocess_cache_lookup}</span>
+        )}
+        {typeof job.summary?.preprocess_cache_segments_accepted === 'number' && (
+          <span>segments={job.summary.preprocess_cache_segments_accepted}</span>
+        )}
       </div>
 
       {showLogs && (
@@ -1170,6 +1181,23 @@ function Metric({ label, value }: { label: string; value: string }) {
   )
 }
 
+function formatBytes(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  let size = value
+  let unitIndex = 0
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024
+    unitIndex += 1
+  }
+  return `${size >= 10 || unitIndex === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unitIndex]}`
+}
+
+function getPathLabel(path: string): string {
+  const parts = path.split('/').filter(Boolean)
+  return parts[parts.length - 1] ?? path
+}
+
 function JobLogsModal({
   job,
   onClose,
@@ -1177,15 +1205,26 @@ function JobLogsModal({
   job: TrainingJob
   onClose: () => void
 }) {
+  const [activeTab, setActiveTab] = useState<'logs' | 'transcripts'>('logs')
   const [chunks, setChunks] = useState<TrainingLogChunk[]>([])
   const [selectedSeq, setSelectedSeq] = useState<number | null>(null)
   const [content, setContent] = useState('')
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState('')
+  const [loadingLogs, setLoadingLogs] = useState(true)
+  const [logError, setLogError] = useState('')
+  const [preprocess, setPreprocess] = useState<TrainingPreprocessCacheResponse | null>(null)
+  const [loadingPreprocess, setLoadingPreprocess] = useState(true)
+  const [preprocessError, setPreprocessError] = useState('')
+  const [selectedEntryId, setSelectedEntryId] = useState<string | null>(null)
+  const [entryDraft, setEntryDraft] = useState('')
+  const [entryIncluded, setEntryIncluded] = useState(true)
+  const [referenceDraft, setReferenceDraft] = useState('')
+  const [transcriptQuery, setTranscriptQuery] = useState('')
+  const [saving, setSaving] = useState<'entry' | 'reference' | ''>('')
+  const [saveMessage, setSaveMessage] = useState('')
 
   async function loadLogs(options?: { keepSelection?: boolean }) {
-    setLoading(true)
-    setError('')
+    setLoadingLogs(true)
+    setLogError('')
     try {
       const response = await fetchTrainingLogs(job.job_id, 20)
       setChunks(response.chunks)
@@ -1200,46 +1239,178 @@ function JobLogsModal({
         setContent('')
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load logs')
+      setLogError(err instanceof Error ? err.message : 'Failed to load logs')
     } finally {
-      setLoading(false)
+      setLoadingLogs(false)
+    }
+  }
+
+  async function loadPreprocess(options?: { keepSelection?: boolean }) {
+    setLoadingPreprocess(true)
+    setPreprocessError('')
+    try {
+      const response = await fetchTrainingPreprocessCache(job.job_id)
+      setPreprocess(response)
+      const keepSelection =
+        options?.keepSelection &&
+        selectedEntryId !== null &&
+        response.entries.some((entry) => entry.entry_id === selectedEntryId)
+      const targetEntry = keepSelection
+        ? response.entries.find((entry) => entry.entry_id === selectedEntryId) ?? null
+        : response.entries[0] ?? null
+      setSelectedEntryId(targetEntry?.entry_id ?? null)
+      setReferenceDraft(response.reference_text ?? '')
+    } catch (err) {
+      setPreprocessError(err instanceof Error ? err.message : 'Failed to load cached transcripts')
+    } finally {
+      setLoadingPreprocess(false)
     }
   }
 
   useEffect(() => {
-    void loadLogs()
+    void Promise.all([
+      loadLogs(),
+      loadPreprocess(),
+    ])
   }, [job.job_id])
 
   useEffect(() => {
     if (!shouldPollJob(job)) return
     const interval = setInterval(() => {
       void loadLogs({ keepSelection: true })
+      void loadPreprocess({ keepSelection: true })
     }, 10000)
     return () => clearInterval(interval)
   }, [job])
 
   async function handleSelectSeq(seq: number) {
     setSelectedSeq(seq)
-    setLoading(true)
-    setError('')
+    setLoadingLogs(true)
+    setLogError('')
     try {
       setContent(await fetchTrainingLogChunkText(job.job_id, seq))
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load log chunk')
+      setLogError(err instanceof Error ? err.message : 'Failed to load log chunk')
     } finally {
-      setLoading(false)
+      setLoadingLogs(false)
+    }
+  }
+
+  const entries = preprocess?.entries ?? []
+  const includedEntries = entries.filter((entry) => entry.included)
+  const filteredEntries = entries.filter((entry) => {
+    const query = transcriptQuery.trim().toLowerCase()
+    if (!query) return true
+    return (
+      entry.text.toLowerCase().includes(query) ||
+      entry.audio_path.toLowerCase().includes(query)
+    )
+  })
+  const selectedEntry =
+    entries.find((entry) => entry.entry_id === selectedEntryId) ??
+    filteredEntries[0] ??
+    null
+  const totalLogBytes = chunks.reduce((sum, chunk) => sum + (chunk.bytes ?? 0), 0)
+  const totalLogLines = chunks.reduce((sum, chunk) => sum + (chunk.lines ?? 0), 0)
+  const firstChunkAt = chunks.length > 0 ? chunks[chunks.length - 1]?.created_at ?? null : null
+  const lastChunkAt = chunks[0]?.created_at ?? null
+  const cacheLookup =
+    typeof job.summary?.preprocess_cache_lookup === 'string'
+      ? job.summary.preprocess_cache_lookup
+      : preprocess?.cache
+        ? 'hit'
+        : 'miss'
+
+  useEffect(() => {
+    if (!selectedEntry) {
+      setEntryDraft('')
+      setEntryIncluded(true)
+      return
+    }
+    setEntryDraft(selectedEntry.text)
+    setEntryIncluded(selectedEntry.included)
+  }, [selectedEntry?.entry_id, selectedEntry?.text, selectedEntry?.included])
+
+  async function handleSaveEntry() {
+    if (!selectedEntry) return
+    setSaving('entry')
+    setSaveMessage('')
+    try {
+      const response = await updateTrainingPreprocessEntry(job.job_id, selectedEntry.entry_id, {
+        text: entryDraft,
+        included: entryIncluded,
+      })
+      setPreprocess((previous) => {
+        if (!previous) return previous
+        return {
+          ...previous,
+          entries: previous.entries.map((entry) =>
+            entry.entry_id === response.entry.entry_id ? response.entry : entry,
+          ),
+        }
+      })
+      setSaveMessage('Transcript entry saved to the reusable cache.')
+    } catch (err) {
+      setPreprocessError(err instanceof Error ? err.message : 'Failed to save transcript entry')
+    } finally {
+      setSaving('')
+    }
+  }
+
+  async function handleSaveReference() {
+    setSaving('reference')
+    setSaveMessage('')
+    try {
+      const response = await updateTrainingPreprocessCache(job.job_id, {
+        reference_text: referenceDraft,
+      })
+      setPreprocess((previous) => (
+        previous
+          ? {
+              ...previous,
+              reference_text: response.reference_text,
+            }
+          : previous
+      ))
+      setSaveMessage('Reference text updated.')
+    } catch (err) {
+      setPreprocessError(err instanceof Error ? err.message : 'Failed to save reference text')
+    } finally {
+      setSaving('')
     }
   }
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-      <div className="grid h-[80vh] w-full max-w-6xl grid-cols-[280px_1fr] gap-4 rounded-2xl border border-edge bg-surface p-4">
-        <div className="flex min-h-0 flex-col rounded-xl border border-edge bg-raised">
-          <div className="flex items-center justify-between border-b border-edge px-4 py-3">
-            <div>
-              <div className="text-heading text-sm font-semibold">Logs</div>
-              <div className="text-[10px] font-mono text-muted">{job.job_id.slice(0, 12)}</div>
+      <div className="flex h-[88vh] w-full max-w-7xl flex-col rounded-2xl border border-edge bg-surface p-4">
+        <div className="mb-4 flex items-start justify-between gap-4">
+          <div>
+            <div className="text-heading text-sm font-semibold">Run Inspector</div>
+            <div className="text-[10px] font-mono text-muted">{job.job_id.slice(0, 12)}</div>
+            <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <Metric label="Status" value={job.status} />
+              <Metric label="Cache" value={String(cacheLookup)} />
+              <Metric label="Logs" value={String(chunks.length)} />
+              <Metric label="Entries" value={preprocess?.cache ? `${includedEntries.length}/${entries.length}` : '—'} />
             </div>
+            <div className="mt-3 flex flex-wrap gap-4 text-[10px] font-mono text-muted">
+              {lastChunkAt !== null && <span>last_log={formatDateTime(lastChunkAt)}</span>}
+              {firstChunkAt !== null && <span>first_log={formatDateTime(firstChunkAt)}</span>}
+              {preprocess?.cache?.updated_at ? <span>cache_updated={formatDateTime(preprocess.cache.updated_at)}</span> : null}
+              {preprocess?.hydrated_from_r2 ? <span>cache_sync=refreshed</span> : null}
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => {
+                void loadLogs({ keepSelection: true })
+                void loadPreprocess({ keepSelection: true })
+              }}
+              className="rounded-lg border border-edge px-3 py-2 text-[11px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent"
+              type="button"
+            >
+              Refresh
+            </button>
             <button
               onClick={onClose}
               className="text-muted hover:text-primary"
@@ -1248,59 +1419,245 @@ function JobLogsModal({
               Close
             </button>
           </div>
-          <div className="flex-1 space-y-2 overflow-y-auto p-3">
-            <button
-              onClick={() => { void loadLogs({ keepSelection: true }) }}
-              className="w-full rounded-lg border border-edge px-3 py-2 text-left text-[11px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent"
-              type="button"
-            >
-              Refresh Log Index
-            </button>
-            {chunks.length === 0 ? (
-              <div className="rounded-lg border border-dashed border-edge bg-surface px-3 py-6 text-center text-sm text-subtle">
-                No log chunks yet.
-              </div>
-            ) : (
-              chunks.map((chunk) => (
-                <button
-                  key={chunk.seq}
-                  onClick={() => { void handleSelectSeq(chunk.seq) }}
-                  className={`w-full rounded-lg border px-3 py-2 text-left transition-colors ${
-                    selectedSeq === chunk.seq
-                      ? 'border-accent bg-accent-dim/20'
-                      : 'border-edge bg-surface hover:border-accent/40'
-                  }`}
-                  type="button"
-                >
-                  <div className="text-[11px] font-mono text-primary">chunk #{chunk.seq}</div>
-                  <div className="mt-1 text-[10px] font-mono text-muted">
-                    {formatDateTime(chunk.created_at)}
-                  </div>
-                </button>
-              ))
-            )}
-          </div>
         </div>
 
-        <div className="flex min-h-0 flex-col rounded-xl border border-edge bg-raised">
-          <div className="flex items-center justify-between border-b border-edge px-4 py-3">
-            <div className="text-heading text-sm font-semibold">Chunk Content</div>
-            {selectedSeq !== null && (
-              <div className="text-[10px] font-mono text-muted">seq={selectedSeq}</div>
-            )}
-          </div>
-          <div className="min-h-0 flex-1 overflow-auto p-4">
-            {error ? (
-              <div className="rounded-lg border border-error/20 bg-error-dim px-3 py-2 text-error text-sm">
-                {error}
-              </div>
-            ) : loading ? (
-              <div className="text-sm text-muted">Loading…</div>
-            ) : (
-              <pre className="whitespace-pre-wrap break-words text-[12px] leading-relaxed text-primary">{content || 'No log content.'}</pre>
-            )}
-          </div>
+        <div className="mb-4 flex gap-2">
+          <button
+            onClick={() => setActiveTab('logs')}
+            className={`rounded-lg px-3 py-2 text-[11px] font-semibold transition-colors ${
+              activeTab === 'logs'
+                ? 'bg-accent text-void'
+                : 'border border-edge text-primary hover:border-accent hover:text-accent'
+            }`}
+            type="button"
+          >
+            Logs
+          </button>
+          <button
+            onClick={() => setActiveTab('transcripts')}
+            className={`rounded-lg px-3 py-2 text-[11px] font-semibold transition-colors ${
+              activeTab === 'transcripts'
+                ? 'bg-accent text-void'
+                : 'border border-edge text-primary hover:border-accent hover:text-accent'
+            }`}
+            type="button"
+          >
+            Cached Transcripts
+          </button>
         </div>
+
+        {activeTab === 'logs' ? (
+          <div className="grid min-h-0 flex-1 grid-cols-[280px_1fr] gap-4">
+            <div className="flex min-h-0 flex-col rounded-xl border border-edge bg-raised">
+              <div className="border-b border-edge px-4 py-3">
+                <div className="text-heading text-sm font-semibold">Log Index</div>
+                <div className="mt-1 flex flex-wrap gap-3 text-[10px] font-mono text-muted">
+                  <span>bytes={formatBytes(totalLogBytes)}</span>
+                  <span>lines={totalLogLines}</span>
+                </div>
+              </div>
+              <div className="flex-1 space-y-2 overflow-y-auto p-3">
+                {chunks.length === 0 ? (
+                  <div className="rounded-lg border border-dashed border-edge bg-surface px-3 py-6 text-center text-sm text-subtle">
+                    No log chunks yet.
+                  </div>
+                ) : (
+                  chunks.map((chunk) => (
+                    <button
+                      key={chunk.seq}
+                      onClick={() => { void handleSelectSeq(chunk.seq) }}
+                      className={`w-full rounded-lg border px-3 py-2 text-left transition-colors ${
+                        selectedSeq === chunk.seq
+                          ? 'border-accent bg-accent-dim/20'
+                          : 'border-edge bg-surface hover:border-accent/40'
+                      }`}
+                      type="button"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="text-[11px] font-mono text-primary">chunk #{chunk.seq}</div>
+                        {typeof chunk.lines === 'number' && (
+                          <div className="text-[10px] font-mono text-muted">{chunk.lines} lines</div>
+                        )}
+                      </div>
+                      <div className="mt-1 text-[10px] font-mono text-muted">
+                        {formatDateTime(chunk.created_at)}
+                      </div>
+                    </button>
+                  ))
+                )}
+              </div>
+            </div>
+
+            <div className="flex min-h-0 flex-col rounded-xl border border-edge bg-raised">
+              <div className="flex items-center justify-between border-b border-edge px-4 py-3">
+                <div className="text-heading text-sm font-semibold">Chunk Content</div>
+                {selectedSeq !== null && (
+                  <div className="text-[10px] font-mono text-muted">seq={selectedSeq}</div>
+                )}
+              </div>
+              <div className="min-h-0 flex-1 overflow-auto p-4">
+                {logError ? (
+                  <div className="rounded-lg border border-error/20 bg-error-dim px-3 py-2 text-error text-sm">
+                    {logError}
+                  </div>
+                ) : loadingLogs ? (
+                  <div className="text-sm text-muted">Loading…</div>
+                ) : (
+                  <pre className="whitespace-pre-wrap break-words text-[12px] leading-relaxed text-primary">{content || 'No log content.'}</pre>
+                )}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="grid min-h-0 flex-1 grid-cols-[320px_1fr] gap-4">
+            <div className="flex min-h-0 flex-col rounded-xl border border-edge bg-raised">
+              <div className="border-b border-edge px-4 py-3">
+                <div className="text-heading text-sm font-semibold">Transcript Cache</div>
+                <div className="mt-2 grid grid-cols-2 gap-3 text-[10px] font-mono text-muted">
+                  <span>accepted={preprocess?.cache?.segments_accepted ?? '—'}</span>
+                  <span>minutes={preprocess?.cache?.accepted_duration_min ?? '—'}</span>
+                  <span>source_files={preprocess?.cache?.source_file_count ?? '—'}</span>
+                  <span>signature={preprocess?.cache?.dataset_signature?.slice(0, 10) ?? '—'}</span>
+                </div>
+                <input
+                  value={transcriptQuery}
+                  onChange={(event) => setTranscriptQuery(event.target.value)}
+                  className="mt-3 w-full rounded-lg border border-edge bg-surface px-3 py-2 text-sm text-primary outline-none transition-colors focus:border-accent"
+                  placeholder="Search transcripts or segment names"
+                />
+              </div>
+              <div className="flex-1 space-y-2 overflow-y-auto p-3">
+                {loadingPreprocess ? (
+                  <div className="text-sm text-muted">Loading cached transcripts…</div>
+                ) : preprocessError ? (
+                  <div className="rounded-lg border border-error/20 bg-error-dim px-3 py-2 text-error text-sm">
+                    {preprocessError}
+                  </div>
+                ) : !preprocess?.cache ? (
+                  <div className="rounded-lg border border-dashed border-edge bg-surface px-3 py-6 text-center text-sm text-subtle">
+                    This run has no reusable preprocess cache yet.
+                  </div>
+                ) : filteredEntries.length === 0 ? (
+                  <div className="rounded-lg border border-dashed border-edge bg-surface px-3 py-6 text-center text-sm text-subtle">
+                    No transcript entries match this filter.
+                  </div>
+                ) : (
+                  filteredEntries.map((entry) => (
+                    <button
+                      key={entry.entry_id}
+                      onClick={() => setSelectedEntryId(entry.entry_id)}
+                      className={`w-full rounded-lg border px-3 py-2 text-left transition-colors ${
+                        selectedEntry?.entry_id === entry.entry_id
+                          ? 'border-accent bg-accent-dim/20'
+                          : 'border-edge bg-surface hover:border-accent/40'
+                      }`}
+                      type="button"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="text-[11px] font-mono text-primary">#{entry.seq}</div>
+                        <div className={`text-[10px] font-mono ${entry.included ? 'text-accent' : 'text-muted'}`}>
+                          {entry.included ? 'included' : 'excluded'}
+                        </div>
+                      </div>
+                      <div className="mt-1 truncate text-[11px] text-primary">{getPathLabel(entry.audio_path)}</div>
+                      <div className="mt-1 line-clamp-2 text-[11px] text-subtle">{entry.text}</div>
+                    </button>
+                  ))
+                )}
+              </div>
+            </div>
+
+            <div className="flex min-h-0 flex-col rounded-xl border border-edge bg-raised">
+              <div className="border-b border-edge px-4 py-3">
+                <div className="text-heading text-sm font-semibold">Transcript Editor</div>
+                {saveMessage && (
+                  <div className="mt-2 rounded-lg border border-accent/20 bg-accent-dim/20 px-3 py-2 text-[11px] text-primary">
+                    {saveMessage}
+                  </div>
+                )}
+              </div>
+              <div className="min-h-0 flex-1 overflow-y-auto p-4">
+                {!preprocess?.cache ? (
+                  <div className="text-sm text-muted">
+                    Long-form raw-media runs will populate a reusable transcript cache here after preprocessing finishes.
+                  </div>
+                ) : (
+                  <div className="space-y-6">
+                    <section className="rounded-xl border border-edge bg-surface p-4">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-primary text-sm font-semibold">Reference Text</div>
+                          <div className="text-[11px] text-subtle">Used with the cached reference audio for follow-up retrains.</div>
+                        </div>
+                        <button
+                          onClick={() => { void handleSaveReference() }}
+                          disabled={saving !== ''}
+                          className="rounded-lg border border-edge px-3 py-2 text-[11px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent disabled:opacity-50"
+                          type="button"
+                        >
+                          {saving === 'reference' ? 'Saving…' : 'Save Reference'}
+                        </button>
+                      </div>
+                      <textarea
+                        value={referenceDraft}
+                        onChange={(event) => setReferenceDraft(event.target.value)}
+                        className="mt-3 min-h-24 w-full rounded-lg border border-edge bg-raised px-3 py-2 text-sm text-primary outline-none transition-colors focus:border-accent"
+                      />
+                    </section>
+
+                    <section className="rounded-xl border border-edge bg-surface p-4">
+                      {!selectedEntry ? (
+                        <div className="text-sm text-muted">Select a transcript entry to review and edit it.</div>
+                      ) : (
+                        <>
+                          <div className="flex flex-wrap items-start justify-between gap-3">
+                            <div>
+                              <div className="text-primary text-sm font-semibold">
+                                Segment #{selectedEntry.seq}
+                              </div>
+                              <div className="mt-1 text-[11px] font-mono text-muted">
+                                {selectedEntry.audio_path}
+                              </div>
+                            </div>
+                            <label className="inline-flex items-center gap-2 text-[11px] font-semibold text-primary">
+                              <input
+                                type="checkbox"
+                                checked={entryIncluded}
+                                onChange={(event) => setEntryIncluded(event.target.checked)}
+                                className="h-4 w-4 rounded border-edge bg-surface"
+                              />
+                              Include In Future Retrains
+                            </label>
+                          </div>
+
+                          <textarea
+                            value={entryDraft}
+                            onChange={(event) => setEntryDraft(event.target.value)}
+                            className="mt-4 min-h-40 w-full rounded-lg border border-edge bg-raised px-3 py-2 text-sm text-primary outline-none transition-colors focus:border-accent"
+                          />
+
+                          <div className="mt-4 flex items-center justify-between gap-3">
+                            <div className="text-[11px] text-subtle">
+                              Editing here rewrites the cached <code>train_raw.jsonl</code> used by the next retrain.
+                            </div>
+                            <button
+                              onClick={() => { void handleSaveEntry() }}
+                              disabled={saving !== ''}
+                              className="rounded-lg bg-accent px-3 py-2 text-[11px] font-semibold text-void transition-colors hover:bg-accent-light disabled:opacity-50"
+                              type="button"
+                            >
+                              {saving === 'entry' ? 'Saving…' : 'Save Entry'}
+                            </button>
+                          </div>
+                        </>
+                      )}
+                    </section>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )

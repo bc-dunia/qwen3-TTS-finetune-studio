@@ -87,6 +87,8 @@ class JobConfig:
     worker_api_url: str | None = None
     job_token: str | None = None
     whisper_language: str | None = None  # None = auto-detect; e.g. "ko", "en", "zh", "ja"
+    dataset_signature: str | None = None
+    preprocess_cache_r2_prefix: str | None = None
 
 
 class UnrecoverableError(Exception):
@@ -181,6 +183,32 @@ class WorkerReporter:
                 "lines": lines,
             },
         )
+
+    def report_preprocess_cache(
+        self,
+        *,
+        dataset_signature: str,
+        cache_r2_prefix: str,
+        train_raw_r2_key: str,
+        ref_audio_r2_key: str | None,
+        reference_profile_r2_key: str | None,
+        source_file_count: int | None,
+        segments_created: int | None,
+        segments_accepted: int | None,
+        accepted_duration_min: float | None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "dataset_signature": dataset_signature,
+            "cache_r2_prefix": cache_r2_prefix,
+            "train_raw_r2_key": train_raw_r2_key,
+            "ref_audio_r2_key": ref_audio_r2_key,
+            "reference_profile_r2_key": reference_profile_r2_key,
+            "source_file_count": source_file_count,
+            "segments_created": segments_created,
+            "segments_accepted": segments_accepted,
+            "accepted_duration_min": accepted_duration_min,
+        }
+        self._post(f"/v1/internal/training/{self.job_id}/preprocess-cache", payload)
 
 
 class LogBuffer:
@@ -337,6 +365,10 @@ def parse_job_config(raw: dict[str, Any]) -> JobConfig:
         worker_api_url=(str(raw.get("worker_api_url", "")).strip() or None),
         job_token=(str(raw.get("job_token", "")).strip() or None),
         whisper_language=(str(raw.get("whisper_language", "")).strip() or None),
+        dataset_signature=(str(raw.get("dataset_signature", "")).strip() or None),
+        preprocess_cache_r2_prefix=(
+            str(raw.get("preprocess_cache_r2_prefix", "")).strip() or None
+        ),
     )
     # Normalize whisper_language: "auto" or empty → None (auto-detect)
     if cfg.whisper_language and cfg.whisper_language.lower() == "auto":
@@ -1153,6 +1185,123 @@ def preprocess_raw_audio(
     return dataset_report
 
 
+def restore_preprocess_cache(
+    *,
+    r2: R2Storage,
+    cache_prefix: str,
+    dataset_dir: Path,
+    status: StatusWriter,
+) -> bool:
+    cache_prefix = cache_prefix.strip().rstrip("/")
+    if not cache_prefix:
+        return False
+
+    objects = r2.list_prefix(f"{cache_prefix}/")
+    if not objects:
+        LOGGER.info("No preprocess cache objects found under %s", cache_prefix)
+        return False
+
+    status.write(
+        {
+            "status": "preprocessing",
+            "message": "Restoring cached transcripts and segments...",
+            "progress": {"step": 0, "total": 1},
+        }
+    )
+    r2.download_prefix(cache_prefix, dataset_dir)
+    restored = (dataset_dir / "train_raw.jsonl").exists()
+    status.write(
+        {
+            "status": "preprocessing",
+            "message": (
+                "Restored cached transcripts and segments"
+                if restored
+                else "Cached preprocess artifacts incomplete; rebuilding transcripts"
+            ),
+            "progress": {"step": 1, "total": 1},
+        }
+    )
+    return restored
+
+
+def upload_preprocess_cache(
+    *,
+    r2: R2Storage,
+    cfg: JobConfig,
+    dataset_dir: Path,
+    preprocess_report: dict[str, Any] | None,
+    reporter: WorkerReporter | None,
+) -> str | None:
+    dataset_signature = (cfg.dataset_signature or "").strip()
+    if not dataset_signature:
+      return None
+
+    cache_prefix = f"{PREFIX_PREPROCESS_CACHE}/{cfg.voice_id}/{dataset_signature}"
+    train_raw_jsonl = dataset_dir / "train_raw.jsonl"
+    if not train_raw_jsonl.exists():
+        return None
+
+    r2.upload_file(train_raw_jsonl, f"{cache_prefix}/train_raw.jsonl", content_type="application/jsonl")
+    ref_audio_path = dataset_dir / "ref_audio.wav"
+    ref_audio_key: str | None = None
+    if ref_audio_path.exists():
+        ref_audio_key = f"{cache_prefix}/ref_audio.wav"
+        r2.upload_file(ref_audio_path, ref_audio_key, content_type="audio/wav")
+
+    reference_profile_key: str | None = None
+    reference_profile_path = dataset_dir / "reference_profile.json"
+    if reference_profile_path.exists():
+        reference_profile_key = f"{cache_prefix}/reference_profile.json"
+        r2.upload_file(reference_profile_path, reference_profile_key, content_type="application/json")
+
+    preprocess_report_path = dataset_dir / "preprocess_report.json"
+    if preprocess_report_path.exists():
+        r2.upload_file(
+            preprocess_report_path,
+            f"{cache_prefix}/preprocess_report.json",
+            content_type="application/json",
+        )
+
+    segments_dir = dataset_dir / "segments"
+    if segments_dir.exists():
+        for seg_path in segments_dir.rglob("*"):
+            if seg_path.is_file():
+                relative = seg_path.relative_to(dataset_dir)
+                r2.upload_file(seg_path, f"{cache_prefix}/{relative}", content_type="audio/wav")
+
+    if reporter is not None:
+        reporter.report_preprocess_cache(
+            dataset_signature=dataset_signature,
+            cache_r2_prefix=cache_prefix,
+            train_raw_r2_key=f"{cache_prefix}/train_raw.jsonl",
+            ref_audio_r2_key=ref_audio_key,
+            reference_profile_r2_key=reference_profile_key,
+            source_file_count=(
+                int(preprocess_report.get("source_audio_files"))
+                if preprocess_report and preprocess_report.get("source_audio_files") is not None
+                else None
+            ),
+            segments_created=(
+                int(preprocess_report.get("segments_created"))
+                if preprocess_report and preprocess_report.get("segments_created") is not None
+                else None
+            ),
+            segments_accepted=(
+                int(preprocess_report.get("segments_accepted"))
+                if preprocess_report and preprocess_report.get("segments_accepted") is not None
+                else None
+            ),
+            accepted_duration_min=(
+                float(preprocess_report.get("accepted_duration_min"))
+                if preprocess_report and preprocess_report.get("accepted_duration_min") is not None
+                else None
+            ),
+        )
+
+    LOGGER.info("Uploaded preprocess cache to %s", cache_prefix)
+    return cache_prefix
+
+
 def run_prepare(
     *,
     finetune_dir: Path,
@@ -1524,36 +1673,58 @@ def main() -> int:
         generated_train_raw = False
         preprocess_report: dict[str, Any] | None = None
         if not train_raw_jsonl.exists():
+            cache_restored = False
+            if cfg.preprocess_cache_r2_prefix:
+                try:
+                    cache_restored = restore_preprocess_cache(
+                        r2=r2,
+                        cache_prefix=cfg.preprocess_cache_r2_prefix,
+                        dataset_dir=DATASET_DIR,
+                        status=status,
+                    )
+                except Exception as exc:
+                    LOGGER.warning("Failed to restore preprocess cache: %s", exc)
             status.write(
                 {
                     "status": "preprocessing",
                     "message": "Segmenting and transcribing audio...",
                 }
             )
-            try:
-                preprocess_report = preprocess_raw_audio(
-                    DATASET_DIR,
-                    train_raw_jsonl,
-                    status,
-                    whisper_language=cfg.whisper_language,
-                )
-            except (FileNotFoundError, RuntimeError) as exc:
-                raise UnrecoverableError(f"Preprocessing failed: {exc}") from exc
-            generated_train_raw = True
-            try:
-                ref_audio_local = DATASET_DIR / "ref_audio.wav"
-                if ref_audio_local.exists():
-                    r2.upload_file(
-                        ref_audio_local,
-                        f"{cfg.dataset_r2_prefix}/ref_audio.wav",
-                        content_type="audio/wav",
+            if not cache_restored or not train_raw_jsonl.exists():
+                try:
+                    preprocess_report = preprocess_raw_audio(
+                        DATASET_DIR,
+                        train_raw_jsonl,
+                        status,
+                        whisper_language=cfg.whisper_language,
                     )
-                if preprocess_report is not None:
-                    ref_meta = dict(preprocess_report)
-                    ref_meta["reference_audio_key"] = f"{cfg.dataset_r2_prefix}/ref_audio.wav"
-                    r2.upload_json(ref_meta, f"{cfg.dataset_r2_prefix}/reference_profile.json")
-            except Exception as exc:
-                LOGGER.warning("Failed to upload generated reference profile: %s", exc)
+                except (FileNotFoundError, RuntimeError) as exc:
+                    raise UnrecoverableError(f"Preprocessing failed: {exc}") from exc
+                generated_train_raw = True
+                try:
+                    ref_audio_local = DATASET_DIR / "ref_audio.wav"
+                    if ref_audio_local.exists():
+                        r2.upload_file(
+                            ref_audio_local,
+                            f"{cfg.dataset_r2_prefix}/ref_audio.wav",
+                            content_type="audio/wav",
+                        )
+                    if preprocess_report is not None:
+                        ref_meta = dict(preprocess_report)
+                        ref_meta["reference_audio_key"] = f"{cfg.dataset_r2_prefix}/ref_audio.wav"
+                        r2.upload_json(ref_meta, f"{cfg.dataset_r2_prefix}/reference_profile.json")
+                except Exception as exc:
+                    LOGGER.warning("Failed to upload generated reference profile: %s", exc)
+                try:
+                    upload_preprocess_cache(
+                        r2=r2,
+                        cfg=cfg,
+                        dataset_dir=DATASET_DIR,
+                        preprocess_report=preprocess_report,
+                        reporter=reporter,
+                    )
+                except Exception as exc:
+                    LOGGER.warning("Failed to upload preprocess cache: %s", exc)
 
         # Rewrite JSONL paths to match downloaded file locations
         if not generated_train_raw:

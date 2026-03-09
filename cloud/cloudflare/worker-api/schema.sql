@@ -65,6 +65,50 @@ CREATE INDEX IF NOT EXISTS idx_training_jobs_voice ON training_jobs(voice_id);
 CREATE INDEX IF NOT EXISTS idx_training_jobs_status ON training_jobs(status);
 
 
+-- ── Dataset Preprocess Cache ───────────────────────────────────────
+-- Tracks reusable long-form preprocessing artifacts (transcripts,
+-- segments, reference audio) so follow-up training runs can skip ASR.
+
+CREATE TABLE IF NOT EXISTS dataset_preprocess_caches (
+    cache_id           TEXT PRIMARY KEY,          -- UUID
+    voice_id           TEXT NOT NULL REFERENCES voices(voice_id),
+    dataset_r2_prefix  TEXT NOT NULL,            -- Raw dataset prefix being cached
+    dataset_signature  TEXT NOT NULL,            -- SHA-256 fingerprint of raw source objects
+    cache_r2_prefix    TEXT NOT NULL,            -- R2 prefix holding cached train_raw + segments
+    train_raw_r2_key   TEXT NOT NULL,
+    ref_audio_r2_key   TEXT,
+    reference_profile_r2_key TEXT,
+    source_file_count  INTEGER,
+    segments_created   INTEGER,
+    segments_accepted  INTEGER,
+    accepted_duration_min REAL,
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_preprocess_caches_lookup
+  ON dataset_preprocess_caches(voice_id, dataset_r2_prefix, dataset_signature);
+CREATE INDEX IF NOT EXISTS idx_dataset_preprocess_caches_voice
+  ON dataset_preprocess_caches(voice_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS dataset_preprocess_cache_entries (
+    entry_id           TEXT PRIMARY KEY,
+    cache_id           TEXT NOT NULL REFERENCES dataset_preprocess_caches(cache_id),
+    seq                INTEGER NOT NULL,
+    audio_path         TEXT NOT NULL,
+    audio_r2_key       TEXT NOT NULL,
+    text               TEXT NOT NULL,
+    included           INTEGER NOT NULL DEFAULT 1,
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_preprocess_cache_entries_seq
+  ON dataset_preprocess_cache_entries(cache_id, seq);
+CREATE INDEX IF NOT EXISTS idx_dataset_preprocess_cache_entries_cache
+  ON dataset_preprocess_cache_entries(cache_id, included, seq);
+
+
 -- ── Generations ─────────────────────────────────────────────────────
 -- History of TTS generation requests.
 -- Maps to ElevenLabs history items for API compatibility.

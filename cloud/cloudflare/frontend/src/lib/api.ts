@@ -120,6 +120,43 @@ export interface TrainingLogChunk {
   lines?: number | null
 }
 
+export interface DatasetPreprocessCache {
+  cache_id: string
+  voice_id: string
+  dataset_r2_prefix: string
+  dataset_signature: string
+  cache_r2_prefix: string
+  train_raw_r2_key: string
+  ref_audio_r2_key?: string | null
+  reference_profile_r2_key?: string | null
+  source_file_count?: number | null
+  segments_created?: number | null
+  segments_accepted?: number | null
+  accepted_duration_min?: number | null
+  created_at: number
+  updated_at: number
+}
+
+export interface DatasetPreprocessCacheEntry {
+  entry_id: string
+  cache_id: string
+  seq: number
+  audio_path: string
+  audio_r2_key: string
+  text: string
+  included: boolean
+  created_at: number
+  updated_at: number
+}
+
+export interface TrainingPreprocessCacheResponse {
+  job_id: string
+  cache: DatasetPreprocessCache | null
+  entries: DatasetPreprocessCacheEntry[]
+  reference_text: string | null
+  hydrated_from_r2: boolean
+}
+
 export interface DatasetInfo {
   name: string
   r2_prefix: string
@@ -535,6 +572,48 @@ export async function fetchTrainingLogChunkText(
   seq: number,
 ): Promise<string> {
   return requestText(`/v1/training/${jobId}/logs/${seq}`)
+}
+
+export async function fetchTrainingPreprocessCache(
+  jobId: string,
+): Promise<TrainingPreprocessCacheResponse> {
+  return request<TrainingPreprocessCacheResponse>(`/v1/training/${jobId}/preprocess-cache`)
+}
+
+export async function updateTrainingPreprocessCache(
+  jobId: string,
+  input: { reference_text: string },
+): Promise<{ status: string; reference_text: string; updated_at: number }> {
+  return request<{ status: string; reference_text: string; updated_at: number }>(
+    `/v1/training/${jobId}/preprocess-cache`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    },
+  )
+}
+
+export async function updateTrainingPreprocessEntry(
+  jobId: string,
+  entryId: string,
+  input: { text?: string; included?: boolean },
+): Promise<{
+  status: string
+  entry: DatasetPreprocessCacheEntry
+  included_entries: number
+  updated_at: number
+}> {
+  return request<{
+    status: string
+    entry: DatasetPreprocessCacheEntry
+    included_entries: number
+    updated_at: number
+  }>(`/v1/training/${jobId}/preprocess-cache/entries/${entryId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  })
 }
 
 export async function fetchVoiceDatasets(

@@ -43,6 +43,7 @@ PREFIX_CHECKPOINTS = "checkpoints"
 PREFIX_DATASETS = "datasets"
 PREFIX_AUDIO = "audio"
 PREFIX_JOBS = "jobs"
+PREFIX_PREPROCESS_CACHE = "preprocess-cache"
 
 
 class R2Storage:
@@ -374,6 +375,28 @@ class R2Storage:
             self.download_file(obj["key"], local_dir / relative)
 
         logger.info("Downloaded dataset (%d files) -> %s", len(objects), local_dir)
+        return local_dir
+
+    def download_prefix(self, prefix: str, local_dir: str | Path) -> Path:
+        """Download every object under a prefix into a local directory."""
+        normalized_prefix = prefix.rstrip("/") + "/"
+        local_dir = Path(local_dir)
+        local_dir.mkdir(parents=True, exist_ok=True)
+
+        objects = self.list_prefix(normalized_prefix)
+        for obj in objects:
+            relative = obj["key"][len(normalized_prefix) :]
+            if not relative:
+                continue
+            self.download_file(obj["key"], local_dir / relative)
+
+        logger.info(
+            "Downloaded prefix (%d files) r2://%s/%s -> %s",
+            len(objects),
+            self.bucket,
+            normalized_prefix,
+            local_dir,
+        )
         return local_dir
 
     # ── Audio operations ─────────────────────────────────────────────

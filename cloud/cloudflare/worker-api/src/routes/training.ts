@@ -3,13 +3,20 @@ import type { Context } from "hono";
 import {
   createTrainingJob,
   deleteTrainingLogChunks,
+  getDatasetPreprocessCache,
+  listDatasetPreprocessCacheEntries,
   getTrainingJob,
   getTrainingLogChunk,
   getVoice,
   listTrainingJobs,
   listTrainingLogChunks,
+  replaceDatasetPreprocessCacheEntries,
+  updateDatasetPreprocessCacheEntry,
   updateTrainingJob,
   updateVoice,
+  upsertDatasetPreprocessCache,
+  type DatasetPreprocessCache,
+  type DatasetPreprocessCacheEntry,
 } from "../lib/d1";
 import {
   createPod,
@@ -203,6 +210,278 @@ const DEFAULT_WORKER_PUBLIC_URL = "https://qwen-tts-api.brian-367.workers.dev";
 const TRAINING_SWEEP_LIMIT = 100;
 
 const REFERENCE_AUDIO_KEY_RE = /\/ref_audio\.[^/]+$/i;
+const RAW_DATASET_AUDIO_EXTENSIONS = new Set([
+  ".wav",
+  ".mp3",
+  ".mp4",
+  ".m4a",
+  ".flac",
+  ".aac",
+]);
+const GENERATED_DATASET_FILENAMES = new Set([
+  "train_raw.jsonl",
+  "train_with_codes.jsonl",
+  "ref_audio.wav",
+  "reference_profile.json",
+  "preprocess_report.json",
+]);
+
+const stripSlashes = (value: string): string => value.replace(/^\/+|\/+$/g, "");
+
+const toHex = (buffer: ArrayBuffer): string =>
+  [...new Uint8Array(buffer)].map((value) => value.toString(16).padStart(2, "0")).join("");
+
+const listAllR2Objects = async (bucket: R2Bucket, prefix: string): Promise<R2Object[]> => {
+  const objects: R2Object[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await bucket.list({ prefix, cursor, limit: 1000 });
+    objects.push(...page.objects);
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  return objects;
+};
+
+const isRawDatasetObject = (datasetPrefix: string, key: string): boolean => {
+  const normalizedPrefix = `${stripSlashes(datasetPrefix)}/`;
+  if (!key.startsWith(normalizedPrefix)) {
+    return false;
+  }
+  const relative = key.slice(normalizedPrefix.length).replace(/^\/+/, "");
+  if (!relative) {
+    return false;
+  }
+  if (
+    relative.startsWith("segments/") ||
+    relative.startsWith("converted/") ||
+    relative.startsWith(".preprocess_cache/")
+  ) {
+    return false;
+  }
+  const parts = relative.split("/");
+  const fileName = (parts[parts.length - 1] ?? "").toLowerCase();
+  if (GENERATED_DATASET_FILENAMES.has(fileName)) {
+    return false;
+  }
+  const dotIndex = fileName.lastIndexOf(".");
+  const ext = dotIndex >= 0 ? fileName.slice(dotIndex) : "";
+  return RAW_DATASET_AUDIO_EXTENSIONS.has(ext);
+};
+
+const computeDatasetSignature = async (
+  datasetPrefix: string,
+  objects: R2Object[]
+): Promise<{ signature: string; sourceCount: number } | null> => {
+  const normalizedPrefix = `${stripSlashes(datasetPrefix)}/`;
+  const rawObjects = objects
+    .filter((object) => isRawDatasetObject(datasetPrefix, object.key))
+    .map((object) => {
+      const anyObject = object as unknown as { etag?: string };
+      return {
+        relative: object.key.slice(normalizedPrefix.length),
+        size: object.size,
+        etag: typeof anyObject.etag === "string" ? anyObject.etag : "",
+      };
+    })
+    .sort((a, b) => a.relative.localeCompare(b.relative));
+
+  if (rawObjects.length === 0) {
+    return null;
+  }
+
+  const payload = rawObjects
+    .map((object) => `${object.relative}\t${object.size}\t${object.etag}`)
+    .join("\n");
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(payload)
+  );
+  return {
+    signature: toHex(digest),
+    sourceCount: rawObjects.length,
+  };
+};
+
+const TMP_DATASET_PREFIX = "/tmp/dataset/";
+
+const getSummaryString = (summary: Record<string, unknown>, key: string): string | null => {
+  const value = summary[key];
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+};
+
+const toDatasetRelativePath = (value: string): string => {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed) {
+    return "";
+  }
+  if (trimmed.startsWith(TMP_DATASET_PREFIX)) {
+    return trimmed.slice(TMP_DATASET_PREFIX.length).replace(/^\/+/, "");
+  }
+  return trimmed.replace(/^\/+/, "");
+};
+
+const buildPreprocessCacheEntryId = (cacheId: string, seq: number): string =>
+  `${cacheId}:${String(seq).padStart(6, "0")}`;
+
+const readR2Text = async (bucket: R2Bucket, key: string): Promise<string | null> => {
+  const obj = await bucket.get(key);
+  if (!obj) {
+    return null;
+  }
+  return obj.text();
+};
+
+const readReferenceText = async (
+  bucket: R2Bucket,
+  cache: DatasetPreprocessCache
+): Promise<string | null> => {
+  const profileKey =
+    (typeof cache.reference_profile_r2_key === "string" && cache.reference_profile_r2_key.trim()) ||
+    `${cache.cache_r2_prefix}/reference_profile.json`;
+  const raw = await readR2Text(bucket, profileKey);
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const value = parsed.reference_text;
+    return typeof value === "string" ? value.trim() : null;
+  } catch {
+    return null;
+  }
+};
+
+const parseTrainRawCacheEntries = (
+  raw: string,
+  cache: DatasetPreprocessCache,
+  now: number
+): DatasetPreprocessCacheEntry[] =>
+  raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .flatMap((line, index) => {
+      try {
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        const audioPath = toDatasetRelativePath(String(parsed.audio ?? ""));
+        const text = String(parsed.text ?? "").trim();
+        if (!audioPath || !text) {
+          return [];
+        }
+        return [
+          {
+            entry_id: buildPreprocessCacheEntryId(cache.cache_id, index + 1),
+            cache_id: cache.cache_id,
+            seq: index + 1,
+            audio_path: audioPath,
+            audio_r2_key: `${cache.cache_r2_prefix}/${audioPath}`,
+            text,
+            included: true,
+            created_at: now,
+            updated_at: now,
+          },
+        ];
+      } catch {
+        return [];
+      }
+    });
+
+const buildTrainRawJsonl = (entries: DatasetPreprocessCacheEntry[]): string => {
+  const includedEntries = [...entries]
+    .filter((entry) => entry.included)
+    .sort((a, b) => a.seq - b.seq);
+  if (includedEntries.length === 0) {
+    throw new Error("At least one transcript entry must remain included.");
+  }
+
+  const lines = includedEntries.map((entry) => {
+    const text = entry.text.trim();
+    if (!text) {
+      throw new Error(`Transcript entry ${entry.seq} is empty.`);
+    }
+    return JSON.stringify({
+      audio: `${TMP_DATASET_PREFIX}${entry.audio_path}`,
+      text,
+      ref_audio: `${TMP_DATASET_PREFIX}ref_audio.wav`,
+    });
+  });
+  return `${lines.join("\n")}\n`;
+};
+
+const resolveJobPreprocessCache = async (
+  c: Context<AppContext>,
+  job: TrainingJob
+): Promise<DatasetPreprocessCache | null> => {
+  const summary = (job.summary ?? {}) as Record<string, unknown>;
+  const summarySignature = getSummaryString(summary, "preprocess_cache_dataset_signature");
+  if (summarySignature) {
+    const matched = await getDatasetPreprocessCache(
+      c.env.DB,
+      job.voice_id,
+      job.dataset_r2_prefix,
+      summarySignature
+    );
+    if (matched) {
+      return matched;
+    }
+  }
+
+  const objects = await listAllR2Objects(c.env.R2, `${stripSlashes(job.dataset_r2_prefix)}/`);
+  if (objects.length === 0) {
+    return null;
+  }
+  const signatureInfo = await computeDatasetSignature(job.dataset_r2_prefix, objects);
+  if (!signatureInfo) {
+    return null;
+  }
+  return getDatasetPreprocessCache(
+    c.env.DB,
+    job.voice_id,
+    job.dataset_r2_prefix,
+    signatureInfo.signature
+  );
+};
+
+const ensureJobPreprocessCacheState = async (
+  c: Context<AppContext>,
+  job: TrainingJob
+): Promise<{
+  cache: DatasetPreprocessCache;
+  entries: DatasetPreprocessCacheEntry[];
+  referenceText: string | null;
+  hydratedFromR2: boolean;
+} | null> => {
+  const cache = await resolveJobPreprocessCache(c, job);
+  if (!cache) {
+    return null;
+  }
+
+  let entries = await listDatasetPreprocessCacheEntries(c.env.DB, cache.cache_id);
+  let hydratedFromR2 = false;
+  const latestEntryUpdatedAt = entries.reduce(
+    (max, entry) => Math.max(max, entry.updated_at),
+    0
+  );
+  if (entries.length === 0 || latestEntryUpdatedAt < cache.updated_at) {
+    const rawJsonl = await readR2Text(c.env.R2, cache.train_raw_r2_key);
+    if (!rawJsonl) {
+      throw new Error(`Cached train_raw.jsonl not found: ${cache.train_raw_r2_key}`);
+    }
+    const now = Date.now();
+    entries = parseTrainRawCacheEntries(rawJsonl, cache, now);
+    await replaceDatasetPreprocessCacheEntries(c.env.DB, cache.cache_id, entries);
+    hydratedFromR2 = true;
+  }
+
+  const referenceText = await readReferenceText(c.env.R2, cache);
+  return {
+    cache,
+    entries,
+    referenceText,
+    hydratedFromR2,
+  };
+};
 
 const needsCompletedValidation = (job: TrainingJob): boolean => {
   if (job.status !== "completed") {
@@ -3526,6 +3805,31 @@ app.post("/start", async (c) => {
     return c.json({ detail: { message: "max_steps must be between 0 and 100000" } }, 400);
   }
 
+  const datasetObjects = await listAllR2Objects(c.env.R2, `${stripSlashes(datasetPrefix)}/`);
+  if (datasetObjects.length === 0) {
+    return c.json(
+      { detail: { message: `Dataset not found at R2 prefix: ${datasetPrefix}/. Upload audio files first.` } },
+      400
+    );
+  }
+
+  const datasetSignatureInfo = await computeDatasetSignature(datasetPrefix, datasetObjects);
+  const preprocessCache =
+    datasetSignatureInfo !== null
+      ? await getDatasetPreprocessCache(
+          c.env.DB,
+          body.voice_id,
+          datasetPrefix,
+          datasetSignatureInfo.signature
+        )
+      : null;
+  const initialSummary: Record<string, unknown> = {
+    preprocess_cache_lookup: preprocessCache ? "hit" : "miss",
+    preprocess_cache_dataset_signature: datasetSignatureInfo?.signature ?? null,
+    preprocess_cache_source_file_count: datasetSignatureInfo?.sourceCount ?? null,
+    preprocess_cache_r2_prefix: preprocessCache?.cache_r2_prefix ?? null,
+  };
+
   const job: TrainingJob = {
     job_id: jobId,
     voice_id: body.voice_id,
@@ -3534,7 +3838,7 @@ app.post("/start", async (c) => {
     status: "pending",
     config: effectiveConfig,
     progress: {},
-    summary: {},
+    summary: initialSummary,
     metrics: {},
     dataset_r2_prefix: datasetPrefix,
     log_r2_prefix: null,
@@ -3571,6 +3875,8 @@ app.post("/start", async (c) => {
     job_token: jobToken,
     worker_api_url: workerUrl,
     whisper_language: typeof effectiveConfig.whisper_language === "string" ? effectiveConfig.whisper_language : undefined,
+    dataset_signature: datasetSignatureInfo?.signature ?? undefined,
+    preprocess_cache_r2_prefix: preprocessCache?.cache_r2_prefix ?? undefined,
   };
   await c.env.R2.put(`jobs/${jobId}/config.json`, JSON.stringify(jobConfig), {
     httpMetadata: { contentType: "application/json" },
@@ -3578,19 +3884,6 @@ app.post("/start", async (c) => {
 
   // Default GPU based on model size: 1.7B needs ≥40GB VRAM, 0.6B fits on 24GB
   const gpuTypeId = getTrainingGpuType(job);
-
-  const datasetListing = await c.env.R2.list({ prefix: `${datasetPrefix}/`, limit: 1 });
-  if (!datasetListing.objects || datasetListing.objects.length === 0) {
-    await updateTrainingJob(c.env.DB, jobId, {
-      status: "failed",
-      error_message: `Dataset not found at R2 prefix: ${datasetPrefix}/`,
-      completed_at: Date.now(),
-    });
-    return c.json(
-      { detail: { message: `Dataset not found at R2 prefix: ${datasetPrefix}/. Upload audio files first.` } },
-      400
-    );
-  }
 
   let launchResult: Awaited<ReturnType<typeof createTrainingPodForJob>>;
   try {
@@ -3715,6 +4008,164 @@ app.get("/:job_id/logs/:seq", async (c) => {
       "content-type": contentType,
       "cache-control": "no-store",
     },
+  });
+});
+
+app.get("/:job_id/preprocess-cache", async (c) => {
+  const jobId = c.req.param("job_id");
+  const job = await getTrainingJob(c.env.DB, jobId);
+  if (!job) {
+    return c.json({ detail: { message: "Training job not found" } }, 404);
+  }
+
+  const resolved = await ensureJobPreprocessCacheState(c, job);
+  if (!resolved) {
+    return c.json({
+      job_id: jobId,
+      cache: null,
+      entries: [],
+      reference_text: null,
+      hydrated_from_r2: false,
+    });
+  }
+
+  return c.json({
+    job_id: jobId,
+    cache: resolved.cache,
+    entries: resolved.entries,
+    reference_text: resolved.referenceText,
+    hydrated_from_r2: resolved.hydratedFromR2,
+  });
+});
+
+app.patch("/:job_id/preprocess-cache", async (c) => {
+  const jobId = c.req.param("job_id");
+  const job = await getTrainingJob(c.env.DB, jobId);
+  if (!job) {
+    return c.json({ detail: { message: "Training job not found" } }, 404);
+  }
+
+  const body = (await c.req.json()) as { reference_text?: string };
+  if (typeof body.reference_text !== "string") {
+    return c.json({ detail: { message: "reference_text is required" } }, 400);
+  }
+
+  const resolved = await ensureJobPreprocessCacheState(c, job);
+  if (!resolved) {
+    return c.json({ detail: { message: "No preprocess cache found for this training job" } }, 404);
+  }
+
+  const now = Date.now();
+  const profileKey =
+    (typeof resolved.cache.reference_profile_r2_key === "string" &&
+      resolved.cache.reference_profile_r2_key.trim()) ||
+    `${resolved.cache.cache_r2_prefix}/reference_profile.json`;
+  const existingRaw = await readR2Text(c.env.R2, profileKey);
+  let profile: Record<string, unknown> = {};
+  if (existingRaw) {
+    try {
+      profile = JSON.parse(existingRaw) as Record<string, unknown>;
+    } catch {
+      profile = {};
+    }
+  }
+  profile.reference_audio_key =
+    resolved.cache.ref_audio_r2_key ?? profile.reference_audio_key ?? null;
+  profile.reference_text = body.reference_text.trim();
+  await c.env.R2.put(profileKey, JSON.stringify(profile, null, 2), {
+    httpMetadata: { contentType: "application/json" },
+  });
+
+  await upsertDatasetPreprocessCache(c.env.DB, {
+    ...resolved.cache,
+    reference_profile_r2_key: profileKey,
+    updated_at: now,
+  });
+
+  return c.json({
+    status: "ok",
+    reference_text: profile.reference_text,
+    updated_at: now,
+  });
+});
+
+app.patch("/:job_id/preprocess-cache/entries/:entry_id", async (c) => {
+  const jobId = c.req.param("job_id");
+  const entryId = c.req.param("entry_id");
+  const job = await getTrainingJob(c.env.DB, jobId);
+  if (!job) {
+    return c.json({ detail: { message: "Training job not found" } }, 404);
+  }
+
+  const body = (await c.req.json()) as {
+    text?: string;
+    included?: boolean;
+  };
+  if (body.text === undefined && body.included === undefined) {
+    return c.json({ detail: { message: "text or included must be provided" } }, 400);
+  }
+
+  const resolved = await ensureJobPreprocessCacheState(c, job);
+  if (!resolved) {
+    return c.json({ detail: { message: "No preprocess cache found for this training job" } }, 404);
+  }
+
+  const currentEntry = resolved.entries.find((entry) => entry.entry_id === entryId);
+  if (!currentEntry) {
+    return c.json({ detail: { message: "Preprocess cache entry not found" } }, 404);
+  }
+
+  const nextText = typeof body.text === "string" ? body.text.trim() : currentEntry.text;
+  const nextIncluded =
+    typeof body.included === "boolean" ? body.included : currentEntry.included;
+  if (nextIncluded && !nextText) {
+    return c.json(
+      { detail: { message: "Included transcript entries must have non-empty text" } },
+      400
+    );
+  }
+
+  const nextEntries = resolved.entries.map((entry) =>
+    entry.entry_id === entryId
+      ? {
+          ...entry,
+          text: nextText,
+          included: nextIncluded,
+        }
+      : entry
+  );
+  let nextJsonl: string;
+  try {
+    nextJsonl = buildTrainRawJsonl(nextEntries);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Invalid preprocess cache update";
+    return c.json({ detail: { message } }, 400);
+  }
+
+  const now = Date.now();
+  await updateDatasetPreprocessCacheEntry(c.env.DB, entryId, {
+    text: nextText,
+    included: nextIncluded,
+    updated_at: now,
+  });
+  await c.env.R2.put(resolved.cache.train_raw_r2_key, nextJsonl, {
+    httpMetadata: { contentType: "application/jsonl" },
+  });
+  await upsertDatasetPreprocessCache(c.env.DB, {
+    ...resolved.cache,
+    updated_at: now,
+  });
+
+  return c.json({
+    status: "ok",
+    entry: {
+      ...currentEntry,
+      text: nextText,
+      included: nextIncluded,
+      updated_at: now,
+    },
+    included_entries: nextEntries.filter((entry) => entry.included).length,
+    updated_at: now,
   });
 });
 

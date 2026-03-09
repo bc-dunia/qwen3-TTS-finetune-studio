@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import {
   createTrainingLogChunk,
+  upsertDatasetPreprocessCache,
   getTrainingJobByToken,
   updateTrainingJob,
   updateVoice,
@@ -171,6 +172,121 @@ app.post("/:job_id/log", async (c) => {
   await updateTrainingJob(c.env.DB, auth.job.job_id, {
     log_r2_prefix: `jobs/${auth.job.job_id}/logs`,
     last_heartbeat_at: Date.now(),
+  });
+
+  return c.json({ status: "ok" });
+});
+
+app.post("/:job_id/preprocess-cache", async (c) => {
+  const auth = await loadAuthedJob(c);
+  if ("error" in auth) {
+    return auth.error;
+  }
+
+  const body = (await c.req.json()) as {
+    dataset_signature?: string;
+    cache_r2_prefix?: string;
+    train_raw_r2_key?: string;
+    ref_audio_r2_key?: string | null;
+    reference_profile_r2_key?: string | null;
+    source_file_count?: number;
+    segments_created?: number;
+    segments_accepted?: number;
+    accepted_duration_min?: number;
+  };
+
+  const datasetSignature =
+    typeof body.dataset_signature === "string" ? body.dataset_signature.trim() : "";
+  const cacheR2Prefix =
+    typeof body.cache_r2_prefix === "string" ? body.cache_r2_prefix.trim() : "";
+  const trainRawR2Key =
+    typeof body.train_raw_r2_key === "string" ? body.train_raw_r2_key.trim() : "";
+  if (!datasetSignature || !cacheR2Prefix || !trainRawR2Key) {
+    return c.json(
+      {
+        detail: {
+          message:
+            "dataset_signature, cache_r2_prefix, and train_raw_r2_key are required",
+        },
+      },
+      400
+    );
+  }
+
+  const now = Date.now();
+  await upsertDatasetPreprocessCache(c.env.DB, {
+    cache_id: crypto.randomUUID(),
+    voice_id: auth.job.voice_id,
+    dataset_r2_prefix: auth.job.dataset_r2_prefix,
+    dataset_signature: datasetSignature,
+    cache_r2_prefix: cacheR2Prefix,
+    train_raw_r2_key: trainRawR2Key,
+    ref_audio_r2_key:
+      typeof body.ref_audio_r2_key === "string" && body.ref_audio_r2_key.trim()
+        ? body.ref_audio_r2_key.trim()
+        : null,
+    reference_profile_r2_key:
+      typeof body.reference_profile_r2_key === "string" &&
+      body.reference_profile_r2_key.trim()
+        ? body.reference_profile_r2_key.trim()
+        : null,
+    source_file_count:
+      typeof body.source_file_count === "number" &&
+      Number.isFinite(body.source_file_count)
+        ? Math.trunc(body.source_file_count)
+        : null,
+    segments_created:
+      typeof body.segments_created === "number" &&
+      Number.isFinite(body.segments_created)
+        ? Math.trunc(body.segments_created)
+        : null,
+    segments_accepted:
+      typeof body.segments_accepted === "number" &&
+      Number.isFinite(body.segments_accepted)
+        ? Math.trunc(body.segments_accepted)
+        : null,
+    accepted_duration_min:
+      typeof body.accepted_duration_min === "number" &&
+      Number.isFinite(body.accepted_duration_min)
+        ? body.accepted_duration_min
+        : null,
+    created_at: now,
+    updated_at: now,
+  });
+
+  if (
+    typeof body.ref_audio_r2_key === "string" &&
+    body.ref_audio_r2_key.trim().length > 0
+  ) {
+    await updateVoice(c.env.DB, auth.job.voice_id, {
+      ref_audio_r2_key: body.ref_audio_r2_key.trim(),
+    });
+  }
+
+  await updateTrainingJob(c.env.DB, auth.job.job_id, {
+    summary: {
+      ...auth.job.summary,
+      preprocess_cache_lookup: "stored",
+      preprocess_cache_dataset_signature: datasetSignature,
+      preprocess_cache_r2_prefix: cacheR2Prefix,
+      preprocess_cache_train_raw_r2_key: trainRawR2Key,
+      preprocess_cache_ref_audio_r2_key:
+        typeof body.ref_audio_r2_key === "string" ? body.ref_audio_r2_key.trim() : null,
+      preprocess_cache_reference_profile_r2_key:
+        typeof body.reference_profile_r2_key === "string"
+          ? body.reference_profile_r2_key.trim()
+          : null,
+      preprocess_cache_source_file_count:
+        typeof body.source_file_count === "number" ? Math.trunc(body.source_file_count) : null,
+      preprocess_cache_segments_created:
+        typeof body.segments_created === "number" ? Math.trunc(body.segments_created) : null,
+      preprocess_cache_segments_accepted:
+        typeof body.segments_accepted === "number" ? Math.trunc(body.segments_accepted) : null,
+      preprocess_cache_accepted_duration_min:
+        typeof body.accepted_duration_min === "number" ? body.accepted_duration_min : null,
+      preprocess_cache_saved_at: now,
+    },
+    last_heartbeat_at: now,
   });
 
   return c.json({ status: "ok" });
