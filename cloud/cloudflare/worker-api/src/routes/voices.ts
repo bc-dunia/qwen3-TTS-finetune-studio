@@ -45,7 +45,12 @@ const MODEL_BY_SIZE: Record<string, { model_size: "1.7B" | "0.6B"; model_id: "qw
 };
 
 const toSpeakerName = (name: string): string => {
-  const normalized = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_");
+  const normalized = name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .replace(/_+/g, "_");
   return normalized || `speaker_${crypto.randomUUID().slice(0, 8)}`;
 };
 
