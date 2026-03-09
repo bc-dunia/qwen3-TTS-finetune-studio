@@ -1,7 +1,7 @@
 # RunPod Training Pod — Qwen3-TTS Fine-Tuning
 #
-# Base image provides: torch, numpy, CUDA libs
-# qwen-tts installed with full deps (onnxruntime, sox, etc. are eagerly imported)
+# Base image provides CUDA/userland only. We install the exact Python stack
+# required by training, then install qwen-tts without optional UI extras.
 #
 #
 #   docker build -f cloud/runpod/Dockerfile.training -t qwen3-tts-training .
@@ -18,7 +18,7 @@ RUN apt-get update && \
 # Python dependencies
 COPY cloud/runpod/requirements-training.txt /app/requirements.txt
 RUN python3 -m pip install --no-cache-dir -r requirements.txt && \
-    python3 -m pip install --no-cache-dir qwen-tts==0.1.1 && \
+    python3 -m pip install --no-cache-dir --no-deps qwen-tts==0.1.1 && \
     rm -rf /root/.cache/pip /tmp/*
 
 # Copy official training scripts
