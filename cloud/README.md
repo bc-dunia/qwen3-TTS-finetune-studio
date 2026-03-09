@@ -80,10 +80,16 @@ npx wrangler deploy
 
 #### Build Docker Images
 
+Production path:
+- Do not rely on a developer laptop to build/push the RunPod images.
+- Pushing to `main` automatically runs `.github/workflows/docker-inference.yml`, which builds and pushes both the inference and training images to GHCR on an ephemeral GitHub runner.
+- That workflow already frees runner disk before the training image build, so local Docker/Colima cache cleanup is only for emergency debugging, not the normal product path.
+
 ```bash
 # From project root
 cd /path/to/qwen3-tts-finetune-studio
 
+# Local builds are for debugging only.
 # Build training image
 docker build -f cloud/runpod/Dockerfile.training -t qwen3-tts-training .
 
@@ -96,6 +102,11 @@ docker tag qwen3-tts-inference YOUR_REGISTRY/qwen3-tts-inference:latest
 docker push YOUR_REGISTRY/qwen3-tts-training:latest
 docker push YOUR_REGISTRY/qwen3-tts-inference:latest
 ```
+
+Automatic GHCR build triggers:
+- `cloud/runpod/**`
+- `third_party/Qwen3-TTS/finetuning/**`
+- `.github/workflows/docker-inference.yml`
 
 #### Create RunPod Training Template
 

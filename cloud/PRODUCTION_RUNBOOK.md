@@ -30,6 +30,14 @@ This runbook describes the product path that is now expected to work end-to-end 
 8. When validation passes, jump straight into `Voice Detail` or `Playground` from the `Training` page.
 9. Generate speech from the `Playground` page, the `Voice Detail` page, or `/v1/text-to-speech/:voice_id`.
 
+## Image Build Path
+
+- The normal product path builds RunPod images in GitHub Actions, not on a local laptop.
+- Workflow: `.github/workflows/docker-inference.yml`
+- Trigger: push to `main` touching `cloud/runpod/**` or `third_party/Qwen3-TTS/finetuning/**`
+- Result: GHCR `latest` and commit-SHA tags are pushed automatically for both inference and training images.
+- Local Docker cache cleanup is therefore an operator-debug concern only, not part of the expected production loop.
+
 ## Model Defaults
 
 These defaults are now applied by the backend even if the frontend omits them.
