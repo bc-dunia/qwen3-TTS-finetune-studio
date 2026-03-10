@@ -2025,6 +2025,41 @@ const getValidationPlan = (
   };
 };
 
+const selectValidationCandidateCheckpoints = (
+  checkpoints: Array<{ epoch?: number; r2_prefix?: string }>,
+  plan: ValidationPlan
+): CheckpointCandidate[] => {
+  const uniqueAsc = checkpoints
+    .filter(
+      (cp): cp is { epoch: number; r2_prefix: string } =>
+        typeof cp.epoch === "number" && typeof cp.r2_prefix === "string"
+    )
+    .sort((a, b) => a.epoch - b.epoch)
+    .filter((cp, index, array) => index === 0 || array[index - 1]?.epoch !== cp.epoch);
+
+  if (uniqueAsc.length === 0) {
+    return [];
+  }
+
+  // For small runs, evaluate every checkpoint. This voice's best checkpoint has
+  // already appeared early in training, so a latest-only slice misses the real winner.
+  const targetCount = Math.min(uniqueAsc.length, Math.max(plan.maxCheckpointsToEval, 10));
+  if (uniqueAsc.length <= targetCount) {
+    return uniqueAsc;
+  }
+
+  const selectedIndexes = new Set<number>();
+  for (let i = 0; i < targetCount; i += 1) {
+    const idx = Math.round((i * (uniqueAsc.length - 1)) / Math.max(1, targetCount - 1));
+    selectedIndexes.add(idx);
+  }
+
+  return [...selectedIndexes]
+    .sort((a, b) => a - b)
+    .map((index) => uniqueAsc[index])
+    .filter((value): value is CheckpointCandidate => Boolean(value));
+};
+
 const buildValidationScoreParts = ({
   is06b,
   overall,
@@ -4001,13 +4036,10 @@ const reconcileJobStatus = async (
     }
 
     const validationPlan = getValidationPlan(voice, job);
-    const candidateCheckpoints = parsedStatus.checkpoints
-      .filter(
-        (cp): cp is { epoch: number; r2_prefix: string } =>
-          typeof cp.epoch === "number" && typeof cp.r2_prefix === "string"
-      )
-      .sort((a, b) => b.epoch - a.epoch)
-      .slice(0, validationPlan.maxCheckpointsToEval);
+    const candidateCheckpoints = selectValidationCandidateCheckpoints(
+      parsedStatus.checkpoints,
+      validationPlan
+    );
 
     if (candidateCheckpoints.length === 0) {
       const message = "Training completed but checkpoint metadata is invalid";
@@ -4030,7 +4062,17 @@ const reconcileJobStatus = async (
       return { status: "failed", progress };
     }
 
-    return advanceAsyncCheckpointValidation(c, voice, currentJob, progress, currentSummary, candidateCheckpoints);
+    const nextSummary = {
+      ...currentSummary,
+      validation_candidate_epochs: candidateCheckpoints.map((checkpoint) => checkpoint.epoch),
+    };
+    await updateTrainingJob(c.env.DB, job.job_id, {
+      summary: {
+        ...nextSummary,
+      },
+    });
+
+    return advanceAsyncCheckpointValidation(c, voice, currentJob, progress, nextSummary, candidateCheckpoints);
   }
 
   return { status: currentJob.status, progress: currentJob.progress };

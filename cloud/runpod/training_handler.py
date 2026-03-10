@@ -58,7 +58,9 @@ MIN_ACCEPTED_AUDIO_MIN = 6.0
 MIN_TRANSCRIPT_CHARS = 6
 MIN_CONFIDENCE = 0.55
 MAX_DUPLICATES_PER_TEXT = 2
-MAX_UPLOADED_CHECKPOINTS = 4
+# Small runs often peak early, so keep a wider checkpoint history available for
+# validation and manual compare instead of only the latest few epochs.
+MAX_UPLOADED_CHECKPOINTS = 10
 HEARTBEAT_INTERVAL_SEC = 30.0
 
 
@@ -1485,11 +1487,22 @@ def upload_checkpoints(
     checkpoints = find_checkpoints(output_dir)
     if not checkpoints:
         raise RuntimeError(f"No checkpoint-epoch-* directories found in {output_dir}")
-    selected_checkpoints = checkpoints[-MAX_UPLOADED_CHECKPOINTS:]
-    skipped_epochs = [epoch for epoch, _ in checkpoints[:-MAX_UPLOADED_CHECKPOINTS]]
+
+    if len(checkpoints) <= MAX_UPLOADED_CHECKPOINTS:
+        selected_checkpoints = checkpoints
+    else:
+        selected_indexes: set[int] = set()
+        for idx in range(MAX_UPLOADED_CHECKPOINTS):
+            selected_indexes.add(
+                round((idx * (len(checkpoints) - 1)) / max(1, MAX_UPLOADED_CHECKPOINTS - 1))
+            )
+        selected_checkpoints = [checkpoints[index] for index in sorted(selected_indexes)]
+
+    selected_epochs = {epoch for epoch, _ in selected_checkpoints}
+    skipped_epochs = [epoch for epoch, _ in checkpoints if epoch not in selected_epochs]
     if skipped_epochs:
         LOGGER.info(
-            "Skipping upload of %d earlier checkpoint(s): %s",
+            "Skipping upload of %d checkpoint(s) after spread selection: %s",
             len(skipped_epochs),
             skipped_epochs,
         )
