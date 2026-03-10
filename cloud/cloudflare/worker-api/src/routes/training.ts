@@ -227,6 +227,9 @@ const ACTIVE_STAGE_STALE_MS: Record<string, number> = {
 const MAX_STALL_RECOVERY_ATTEMPTS = 3;
 const DEFAULT_WORKER_PUBLIC_URL = "https://qwen-tts-api.brian-367.workers.dev";
 const TRAINING_SWEEP_LIMIT = 100;
+const DEFAULT_TRAINING_IMAGE_FALLBACKS = [
+  "ghcr.io/bc-dunia/qwen3-tts-training@sha256:fd32cc16f8febc7ce23a08eea38b9b62beaa7819139895e241a8bdddb6bf2357",
+];
 
 const REFERENCE_AUDIO_KEY_RE = /\/ref_audio\.[^/]+$/i;
 const RAW_DATASET_AUDIO_EXTENSIONS = new Set([
@@ -246,6 +249,21 @@ const GENERATED_DATASET_FILENAMES = new Set([
 ]);
 
 const stripSlashes = (value: string): string => value.replace(/^\/+|\/+$/g, "");
+
+const uniqueNonEmpty = (values: Array<string | null | undefined>): string[] => {
+  const deduped = new Set<string>();
+  for (const value of values) {
+    if (typeof value !== "string") {
+      continue;
+    }
+    const trimmed = value.trim();
+    if (!trimmed) {
+      continue;
+    }
+    deduped.add(trimmed);
+  }
+  return [...deduped];
+};
 
 const toHex = (buffer: ArrayBuffer): string =>
   [...new Uint8Array(buffer)].map((value) => value.toString(16).padStart(2, "0")).join("");
@@ -1320,6 +1338,74 @@ const getConfiguredTrainingImageName = (c: Context<AppContext>): string | null =
   return imageName ? imageName : null;
 };
 
+const getConfiguredTrainingImageFallbackNames = (c: Context<AppContext>): string[] =>
+  uniqueNonEmpty([
+    ...(c.env.RUNPOD_TRAINING_FALLBACK_IMAGE_NAMES ?? "")
+      .split(",")
+      .map((value) => value.trim()),
+    ...DEFAULT_TRAINING_IMAGE_FALLBACKS,
+  ]);
+
+const getConfiguredTrainingImageCandidates = (c: Context<AppContext>): string[] =>
+  uniqueNonEmpty([
+    getConfiguredTrainingImageName(c),
+    ...getConfiguredTrainingImageFallbackNames(c),
+  ]);
+
+const getStoredTrainingImageCandidates = (job: TrainingJob): string[] => {
+  const summary = (job.summary ?? {}) as Record<string, unknown>;
+  const storedCandidates = Array.isArray(summary.training_image_candidates)
+    ? summary.training_image_candidates.filter((value): value is string => typeof value === "string")
+    : [];
+  return uniqueNonEmpty([
+    ...storedCandidates,
+    typeof summary.training_resolved_image_name === "string"
+      ? summary.training_resolved_image_name
+      : null,
+    typeof summary.training_image_name === "string" ? summary.training_image_name : null,
+  ]);
+};
+
+const getTrainingImageCandidatesForJob = (
+  c: Context<AppContext>,
+  job: TrainingJob
+): string[] =>
+  uniqueNonEmpty([
+    ...getStoredTrainingImageCandidates(job),
+    ...getConfiguredTrainingImageCandidates(c),
+  ]);
+
+const getTrainingImageAttemptIndex = (
+  c: Context<AppContext>,
+  job: TrainingJob,
+  candidates?: string[]
+): number => {
+  const summary = (job.summary ?? {}) as Record<string, unknown>;
+  const resolvedCandidates = candidates ?? getTrainingImageCandidatesForJob(c, job);
+  const storedIndex = readNumber(summary.training_image_attempt_index);
+  if (
+    storedIndex !== null &&
+    storedIndex >= 0 &&
+    storedIndex < resolvedCandidates.length
+  ) {
+    return storedIndex;
+  }
+
+  const currentImage = uniqueNonEmpty([
+    typeof summary.training_resolved_image_name === "string"
+      ? summary.training_resolved_image_name
+      : null,
+    typeof summary.training_image_name === "string" ? summary.training_image_name : null,
+  ])[0];
+  if (currentImage) {
+    const matchedIndex = resolvedCandidates.findIndex((value) => value === currentImage);
+    if (matchedIndex >= 0) {
+      return matchedIndex;
+    }
+  }
+  return 0;
+};
+
 const getConfiguredTrainingDockerArgs = (c: Context<AppContext>): string | null => {
   const dockerArgs = c.env.RUNPOD_TRAINING_DOCKER_ARGS?.trim();
   return dockerArgs ? dockerArgs : null;
@@ -1337,12 +1423,18 @@ const getConfiguredTrainingTemplateId = (c: Context<AppContext>): string | null 
 
 const createTrainingPodForJob = async (
   c: Context<AppContext>,
-  job: TrainingJob
+  job: TrainingJob,
+  options?: { imageAttemptIndex?: number }
 ): Promise<{
   pod: { podId: string; desiredStatus: string };
   summary: Record<string, unknown>;
 }> => {
-  const imageName = getConfiguredTrainingImageName(c);
+  const imageCandidates = getTrainingImageCandidatesForJob(c, job);
+  const imageAttemptIndex =
+    typeof options?.imageAttemptIndex === "number"
+      ? Math.max(0, Math.min(options.imageAttemptIndex, Math.max(imageCandidates.length - 1, 0)))
+      : getTrainingImageAttemptIndex(c, job, imageCandidates);
+  const imageName = imageCandidates[imageAttemptIndex] ?? getConfiguredTrainingImageName(c);
   if (imageName) {
     const resolvedImageName = await resolveGhcrAmd64Image(imageName).catch(() => imageName);
     const dockerArgs = getConfiguredTrainingDockerArgs(c);
@@ -1362,6 +1454,8 @@ const createTrainingPodForJob = async (
         training_launch_mode: "direct_image",
         training_image_name: imageName,
         training_resolved_image_name: resolvedImageName,
+        training_image_candidates: imageCandidates,
+        training_image_attempt_index: imageAttemptIndex,
         training_docker_args: dockerArgs,
         training_volume_mount_path: volumeMountPath,
       },
@@ -1676,6 +1770,157 @@ const clearRecoveredJobArtifacts = async (c: Context<AppContext>, jobId: string)
   await c.env.R2.delete(`jobs/${jobId}/status.json`);
   await deleteR2Prefix(c.env.R2, `jobs/${jobId}/logs/`);
   await deleteTrainingLogChunks(c.env.DB, jobId);
+};
+
+const isDependencyImageFailureMessage = (message: string | null | undefined): boolean => {
+  const normalized = typeof message === "string" ? message.trim().toLowerCase() : "";
+  if (!normalized) {
+    return false;
+  }
+  return (
+    normalized.includes("faster-whisper is not installed") ||
+    normalized.includes("preprocessing requires faster-whisper") ||
+    normalized.includes("whisper is not installed in this image")
+  );
+};
+
+const shouldRecoverFailedDependencyJob = (
+  c: Context<AppContext>,
+  job: TrainingJob
+): boolean => {
+  if (job.status !== "failed") {
+    return false;
+  }
+  if (!isDependencyImageFailureMessage(job.error_message)) {
+    return false;
+  }
+  const summary = (job.summary ?? {}) as Record<string, unknown>;
+  if (summary.training_image_recovery_exhausted === true) {
+    return false;
+  }
+  const candidates = getTrainingImageCandidatesForJob(c, job);
+  if (candidates.length <= 1) {
+    return false;
+  }
+  const attemptIndex = getTrainingImageAttemptIndex(c, job, candidates);
+  return attemptIndex + 1 < candidates.length;
+};
+
+const recoverFailedDependencyJob = async (
+  c: Context<AppContext>,
+  job: TrainingJob
+): Promise<TrainingJob> => {
+  if (!shouldRecoverFailedDependencyJob(c, job)) {
+    return job;
+  }
+
+  const summary = (job.summary ?? {}) as Record<string, unknown>;
+  const candidates = getTrainingImageCandidatesForJob(c, job);
+  const currentAttemptIndex = getTrainingImageAttemptIndex(c, job, candidates);
+  const nextAttemptIndex = currentAttemptIndex + 1;
+  const nextImage = candidates[nextAttemptIndex];
+  if (!nextImage) {
+    await updateTrainingJob(c.env.DB, job.job_id, {
+      summary: {
+        ...summary,
+        training_image_recovery_exhausted: true,
+      },
+    });
+    return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
+  }
+
+  const siblingJobs = await listTrainingJobs(c.env.DB, {
+    voice_id: job.voice_id,
+    limit: 20,
+  });
+  const hasDifferentActiveJob = siblingJobs.some(
+    (candidate) => candidate.job_id !== job.job_id && ACTIVE_JOB_STATUSES.has(candidate.status)
+  );
+  if (hasDifferentActiveJob) {
+    await updateTrainingJob(c.env.DB, job.job_id, {
+      summary: {
+        ...summary,
+        training_image_recovery_deferred: true,
+        training_image_recovery_deferred_reason: "another_active_job_exists",
+      },
+    });
+    return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
+  }
+
+  if (job.runpod_pod_id) {
+    await terminatePod(c.env, job.runpod_pod_id).catch(() => false);
+  }
+  await clearRecoveredJobArtifacts(c, job.job_id);
+
+  const previousPodIds = Array.isArray(summary.previous_runpod_pod_ids)
+    ? summary.previous_runpod_pod_ids.filter((value): value is string => typeof value === "string")
+    : [];
+  const baseSummary = {
+    ...summary,
+    training_image_recovery_attempts:
+      (readNumber(summary.training_image_recovery_attempts) ?? 0) + 1,
+    training_image_recovery_reason: "dependency_missing",
+    training_image_recovered_from: candidates[currentAttemptIndex] ?? null,
+    training_image_recovered_to: nextImage,
+    training_image_candidates: candidates,
+    last_recovery_at: Date.now(),
+    previous_runpod_pod_ids: Array.from(
+      new Set([...previousPodIds, ...(job.runpod_pod_id ? [job.runpod_pod_id] : [])])
+    ),
+  };
+
+  try {
+    const launchResult = await createTrainingPodForJob(c, job, {
+      imageAttemptIndex: nextAttemptIndex,
+    });
+    await updateTrainingJob(c.env.DB, job.job_id, {
+      runpod_pod_id: launchResult.pod.podId,
+      status: "provisioning",
+      progress: {},
+      error_message: null,
+      last_heartbeat_at: null,
+      started_at: Date.now(),
+      completed_at: null,
+      summary: {
+        ...baseSummary,
+        ...launchResult.summary,
+        last_recovery_mode: "dependency_image_fallback",
+      },
+      supervisor: {
+        ...(job.supervisor ?? {}),
+        phase: "provisioning",
+        last_transition_at: Date.now(),
+        last_pod_id: launchResult.pod.podId,
+      },
+    });
+    if (job.round_id) {
+      await updateTrainingRound(c.env.DB, job.round_id, {
+        status: "running",
+        completed_at: null,
+        summary: {
+          ...(await getTrainingRound(c.env.DB, job.round_id))?.summary,
+          dependency_image_recovery: true,
+          recovered_job_id: job.job_id,
+          next_training_image: nextImage,
+        },
+      });
+    }
+    return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
+  } catch (error) {
+    await updateTrainingJob(c.env.DB, job.job_id, {
+      status: "failed",
+      error_message:
+        error instanceof Error
+          ? error.message
+          : "Failed to launch dependency recovery pod",
+      completed_at: Date.now(),
+      summary: {
+        ...baseSummary,
+        training_image_recovery_failed: true,
+      },
+    });
+    return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
+  }
 };
 
 const recoverStalledActiveJob = async (
@@ -3898,6 +4143,11 @@ const reconcileJobStatus = async (
   c: Context<AppContext>,
   job: TrainingJob
 ): Promise<{ status: string; progress: TrainingProgress }> => {
+  if (shouldRecoverFailedDependencyJob(c, job)) {
+    const recovered = await recoverFailedDependencyJob(c, job);
+    return { status: recovered.status, progress: recovered.progress };
+  }
+
   let currentJob = job;
   let status = job.status;
   let progress: TrainingProgress = job.progress;
@@ -4119,8 +4369,13 @@ export const runTrainingSupervisorSweep = async (
   env: Env
 ): Promise<{ checked: number; reconciled: number; timed_out: number; failed: number }> => {
   const jobs = await listTrainingJobs(env.DB, { limit: TRAINING_SWEEP_LIMIT });
-  const candidates = jobs.filter((job) => ACTIVE_JOB_STATUSES.has(job.status) || needsCompletedValidation(job));
   const syntheticContext = createSyntheticContext(env, resolveWorkerPublicUrl(env));
+  const candidates = jobs.filter(
+    (job) =>
+      ACTIVE_JOB_STATUSES.has(job.status) ||
+      needsCompletedValidation(job) ||
+      shouldRecoverFailedDependencyJob(syntheticContext, job)
+  );
   let reconciled = 0;
   let timedOut = 0;
   let failed = 0;
@@ -4417,10 +4672,12 @@ app.get("/jobs", async (c) => {
   const hydratedJobs = await Promise.all(
     jobs.map(async (job) => {
       try {
-        if (!ACTIVE_JOB_STATUSES.has(job.status)) {
-          if (!needsCompletedValidation(job)) {
-            return job;
-          }
+        if (
+          !ACTIVE_JOB_STATUSES.has(job.status) &&
+          !needsCompletedValidation(job) &&
+          !shouldRecoverFailedDependencyJob(c, job)
+        ) {
+          return job;
         }
         await reconcileJobStatusWithTimeout(c, job);
         return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
@@ -4736,7 +4993,12 @@ app.get("/:job_id", async (c) => {
     return c.json({ detail: { message: "Training job not found" } }, 404);
   }
 
-  if (ACTIVE_JOB_STATUSES.has(job.status) || needsCompletedValidation(job)) {
+  const shouldRecoverDependencyFailure = shouldRecoverFailedDependencyJob(c, job);
+  if (
+    ACTIVE_JOB_STATUSES.has(job.status) ||
+    needsCompletedValidation(job) ||
+    shouldRecoverDependencyFailure
+  ) {
     const timeoutMs = needsCompletedValidation(job)
       ? COMPLETED_VALIDATION_TIMEOUT_MS
       : RECONCILE_TIMEOUT_MS;

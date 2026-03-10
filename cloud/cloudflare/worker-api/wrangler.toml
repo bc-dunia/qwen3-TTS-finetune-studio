@@ -45,6 +45,7 @@ id = "5215a0e24f6c46ff8c8fdcbdb439263e"
 RUNPOD_ENDPOINT_ID = "6cp5ohsawnqk6f"           # RunPod serverless endpoint ID (for inference)
 RUNPOD_TRAINING_TEMPLATE_ID = "vnaafxatc5"  # RunPod pod template ID (for training)
 RUNPOD_TRAINING_IMAGE_NAME = "ghcr.io/bc-dunia/qwen3-tts-training:latest"
+RUNPOD_TRAINING_FALLBACK_IMAGE_NAMES = "ghcr.io/bc-dunia/qwen3-tts-training@sha256:fd32cc16f8febc7ce23a08eea38b9b62beaa7819139895e241a8bdddb6bf2357"
 RUNPOD_TRAINING_DOCKER_ARGS = "/app/entrypoint.sh"
 RUNPOD_TRAINING_VOLUME_MOUNT_PATH = "/workspace"
 R2_ENDPOINT_URL = "https://3672c083409da5ca133c50e0d06fd0e0.r2.cloudflarestorage.com"
