@@ -18,6 +18,12 @@ CREATE TABLE IF NOT EXISTS voices (
     checkpoint_r2_prefix TEXT,                    -- R2 prefix: checkpoints/{voice_id}/{run_name}/checkpoint-epoch-N
     run_name          TEXT,                       -- Training run name
     epoch             INTEGER,                    -- Best checkpoint epoch number
+    candidate_checkpoint_r2_prefix TEXT,         -- Validated candidate checkpoint pending promotion
+    candidate_run_name TEXT,
+    candidate_epoch   INTEGER,
+    candidate_score   REAL,
+    candidate_job_id  TEXT,
+    active_round_id   TEXT,
     sample_audio_r2_key TEXT,                     -- R2 key for preview audio
     ref_audio_r2_key  TEXT,                       -- R2 key for reference audio (used in training)
     labels_json       TEXT DEFAULT '{}',          -- JSON: {"accent": "...", "gender": "...", ...}
@@ -28,6 +34,7 @@ CREATE TABLE IF NOT EXISTS voices (
 
 CREATE INDEX IF NOT EXISTS idx_voices_status ON voices(status);
 CREATE INDEX IF NOT EXISTS idx_voices_name ON voices(name);
+CREATE INDEX IF NOT EXISTS idx_voices_active_round ON voices(active_round_id);
 
 
 -- ── Training Jobs ───────────────────────────────────────────────────
@@ -38,10 +45,13 @@ CREATE INDEX IF NOT EXISTS idx_voices_name ON voices(name);
 CREATE TABLE IF NOT EXISTS training_jobs (
     job_id            TEXT PRIMARY KEY,           -- UUID
     voice_id          TEXT NOT NULL REFERENCES voices(voice_id),
+    round_id          TEXT,                       -- Training round grouping ID
+    dataset_snapshot_id TEXT,                     -- Frozen dataset snapshot ID
     runpod_pod_id     TEXT,                       -- RunPod pod ID (set after pod creation)
     status            TEXT DEFAULT 'pending',     -- See status enum below
     config_json       TEXT NOT NULL,              -- Full training config (JSON)
     progress_json     TEXT DEFAULT '{}',          -- Current progress: {epoch, step, loss, eta}
+    supervisor_json   TEXT DEFAULT '{}',          -- Supervisor state: retries, phase, recovery bookkeeping
     dataset_r2_prefix TEXT NOT NULL,              -- R2 prefix for training dataset
     error_message     TEXT,
     started_at        INTEGER,                    -- Unix timestamp (ms)
@@ -63,6 +73,71 @@ CREATE TABLE IF NOT EXISTS training_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_training_jobs_voice ON training_jobs(voice_id);
 CREATE INDEX IF NOT EXISTS idx_training_jobs_status ON training_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_training_jobs_round ON training_jobs(round_id);
+CREATE INDEX IF NOT EXISTS idx_training_jobs_snapshot ON training_jobs(dataset_snapshot_id);
+
+
+-- ── Dataset Snapshots ───────────────────────────────────────────────
+-- Frozen dataset manifests reused across multiple training jobs.
+
+CREATE TABLE IF NOT EXISTS dataset_snapshots (
+    snapshot_id        TEXT PRIMARY KEY,
+    voice_id           TEXT NOT NULL REFERENCES voices(voice_id),
+    dataset_name       TEXT,
+    dataset_r2_prefix  TEXT NOT NULL,
+    dataset_signature  TEXT NOT NULL,
+    status             TEXT NOT NULL DEFAULT 'draft', -- 'draft' | 'frozen'
+    source_cache_id    TEXT,
+    cache_r2_prefix    TEXT,
+    train_raw_r2_key   TEXT,
+    ref_audio_r2_key   TEXT,
+    reference_profile_r2_key TEXT,
+    reference_text     TEXT,
+    source_file_count  INTEGER,
+    segments_created   INTEGER,
+    segments_accepted  INTEGER,
+    accepted_duration_min REAL,
+    created_from_job_id TEXT,
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_snapshots_lookup
+  ON dataset_snapshots(voice_id, dataset_r2_prefix, dataset_signature);
+CREATE INDEX IF NOT EXISTS idx_dataset_snapshots_voice
+  ON dataset_snapshots(voice_id, updated_at DESC);
+
+
+-- ── Training Rounds ────────────────────────────────────────────────
+-- Product-level grouping for one dataset snapshot and its jobs/checkpoints.
+
+CREATE TABLE IF NOT EXISTS training_rounds (
+    round_id                     TEXT PRIMARY KEY,
+    voice_id                     TEXT NOT NULL REFERENCES voices(voice_id),
+    dataset_snapshot_id          TEXT REFERENCES dataset_snapshots(snapshot_id),
+    round_index                  INTEGER NOT NULL,
+    status                       TEXT NOT NULL DEFAULT 'draft', -- 'draft' | 'running' | 'validating' | 'candidate_ready' | 'promoted' | 'superseded' | 'failed'
+    production_checkpoint_r2_prefix TEXT,
+    production_run_name          TEXT,
+    production_epoch             INTEGER,
+    candidate_checkpoint_r2_prefix TEXT,
+    candidate_run_name           TEXT,
+    candidate_epoch              INTEGER,
+    candidate_score              REAL,
+    candidate_job_id             TEXT,
+    summary_json                 TEXT DEFAULT '{}',
+    created_at                   INTEGER NOT NULL,
+    updated_at                   INTEGER NOT NULL,
+    started_at                   INTEGER,
+    completed_at                 INTEGER
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_training_rounds_voice_round
+  ON training_rounds(voice_id, round_index);
+CREATE INDEX IF NOT EXISTS idx_training_rounds_voice
+  ON training_rounds(voice_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_training_rounds_snapshot
+  ON training_rounds(dataset_snapshot_id);
 
 
 -- ── Dataset Preprocess Cache ───────────────────────────────────────

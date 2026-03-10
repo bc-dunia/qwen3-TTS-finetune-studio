@@ -1,8 +1,10 @@
 import type {
+  DatasetSnapshot,
   Generation,
   TrainingConfig,
   TrainingJob,
   TrainingProgress,
+  TrainingRound,
   Voice,
   VoiceSettings,
 } from "../types";
@@ -19,6 +21,12 @@ type DbVoiceRow = {
   checkpoint_r2_prefix: string | null;
   run_name: string | null;
   epoch: number | null;
+  candidate_checkpoint_r2_prefix: string | null;
+  candidate_run_name: string | null;
+  candidate_epoch: number | null;
+  candidate_score: number | null;
+  candidate_job_id: string | null;
+  active_round_id: string | null;
   sample_audio_r2_key: string | null;
   ref_audio_r2_key: string | null;
   labels_json: string;
@@ -30,6 +38,8 @@ type DbVoiceRow = {
 type DbTrainingRow = {
   job_id: string;
   voice_id: string;
+  round_id: string | null;
+  dataset_snapshot_id: string | null;
   runpod_pod_id: string | null;
   job_token: string | null;
   status: string;
@@ -37,6 +47,7 @@ type DbTrainingRow = {
   progress_json: string;
   summary_json: string | null;
   metrics_json: string | null;
+  supervisor_json: string | null;
   dataset_r2_prefix: string;
   log_r2_prefix: string | null;
   error_message: string | null;
@@ -85,6 +96,49 @@ type DbDatasetPreprocessCacheEntryRow = {
   updated_at: number;
 };
 
+type DbDatasetSnapshotRow = {
+  snapshot_id: string;
+  voice_id: string;
+  dataset_name: string | null;
+  dataset_r2_prefix: string;
+  dataset_signature: string;
+  status: string;
+  source_cache_id: string | null;
+  cache_r2_prefix: string | null;
+  train_raw_r2_key: string | null;
+  ref_audio_r2_key: string | null;
+  reference_profile_r2_key: string | null;
+  reference_text: string | null;
+  source_file_count: number | null;
+  segments_created: number | null;
+  segments_accepted: number | null;
+  accepted_duration_min: number | null;
+  created_from_job_id: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+type DbTrainingRoundRow = {
+  round_id: string;
+  voice_id: string;
+  dataset_snapshot_id: string | null;
+  round_index: number;
+  status: string;
+  production_checkpoint_r2_prefix: string | null;
+  production_run_name: string | null;
+  production_epoch: number | null;
+  candidate_checkpoint_r2_prefix: string | null;
+  candidate_run_name: string | null;
+  candidate_epoch: number | null;
+  candidate_score: number | null;
+  candidate_job_id: string | null;
+  summary_json: string | null;
+  created_at: number;
+  updated_at: number;
+  started_at: number | null;
+  completed_at: number | null;
+};
+
 const parseJson = <T>(value: string | null | undefined, fallback: T): T => {
   if (!value) {
     return fallback;
@@ -108,6 +162,12 @@ const mapVoice = (row: DbVoiceRow): Voice => ({
   checkpoint_r2_prefix: row.checkpoint_r2_prefix,
   run_name: row.run_name,
   epoch: row.epoch,
+  candidate_checkpoint_r2_prefix: row.candidate_checkpoint_r2_prefix,
+  candidate_run_name: row.candidate_run_name,
+  candidate_epoch: row.candidate_epoch,
+  candidate_score: row.candidate_score,
+  candidate_job_id: row.candidate_job_id,
+  active_round_id: row.active_round_id,
   sample_audio_r2_key: row.sample_audio_r2_key,
   ref_audio_r2_key: row.ref_audio_r2_key,
   labels: parseJson<Record<string, string>>(row.labels_json, {}),
@@ -122,6 +182,8 @@ const mapVoice = (row: DbVoiceRow): Voice => ({
 const mapTrainingJob = (row: DbTrainingRow): TrainingJob => ({
   job_id: row.job_id,
   voice_id: row.voice_id,
+  round_id: row.round_id,
+  dataset_snapshot_id: row.dataset_snapshot_id,
   runpod_pod_id: row.runpod_pod_id,
   job_token: row.job_token,
   status: row.status,
@@ -129,6 +191,7 @@ const mapTrainingJob = (row: DbTrainingRow): TrainingJob => ({
   progress: parseJson<TrainingProgress>(row.progress_json, {}),
   summary: parseJson<Record<string, unknown>>(row.summary_json, {}),
   metrics: parseJson<Record<string, unknown>>(row.metrics_json, {}),
+  supervisor: parseJson<Record<string, unknown>>(row.supervisor_json, {}),
   dataset_r2_prefix: row.dataset_r2_prefix,
   log_r2_prefix: row.log_r2_prefix,
   error_message: row.error_message,
@@ -219,6 +282,49 @@ const mapDatasetPreprocessCacheEntry = (
   updated_at: row.updated_at,
 });
 
+const mapDatasetSnapshot = (row: DbDatasetSnapshotRow): DatasetSnapshot => ({
+  snapshot_id: row.snapshot_id,
+  voice_id: row.voice_id,
+  dataset_name: row.dataset_name,
+  dataset_r2_prefix: row.dataset_r2_prefix,
+  dataset_signature: row.dataset_signature,
+  status: row.status,
+  source_cache_id: row.source_cache_id,
+  cache_r2_prefix: row.cache_r2_prefix,
+  train_raw_r2_key: row.train_raw_r2_key,
+  ref_audio_r2_key: row.ref_audio_r2_key,
+  reference_profile_r2_key: row.reference_profile_r2_key,
+  reference_text: row.reference_text,
+  source_file_count: row.source_file_count,
+  segments_created: row.segments_created,
+  segments_accepted: row.segments_accepted,
+  accepted_duration_min: row.accepted_duration_min,
+  created_from_job_id: row.created_from_job_id,
+  created_at: row.created_at,
+  updated_at: row.updated_at,
+});
+
+const mapTrainingRound = (row: DbTrainingRoundRow): TrainingRound => ({
+  round_id: row.round_id,
+  voice_id: row.voice_id,
+  dataset_snapshot_id: row.dataset_snapshot_id,
+  round_index: row.round_index,
+  status: row.status,
+  production_checkpoint_r2_prefix: row.production_checkpoint_r2_prefix,
+  production_run_name: row.production_run_name,
+  production_epoch: row.production_epoch,
+  candidate_checkpoint_r2_prefix: row.candidate_checkpoint_r2_prefix,
+  candidate_run_name: row.candidate_run_name,
+  candidate_epoch: row.candidate_epoch,
+  candidate_score: row.candidate_score,
+  candidate_job_id: row.candidate_job_id,
+  summary: parseJson<Record<string, unknown>>(row.summary_json, {}),
+  created_at: row.created_at,
+  updated_at: row.updated_at,
+  started_at: row.started_at,
+  completed_at: row.completed_at,
+});
+
 export const getVoice = async (db: D1Database, voiceId: string): Promise<Voice | null> => {
   const row = await db
     .prepare("SELECT * FROM voices WHERE voice_id = ? LIMIT 1")
@@ -264,9 +370,10 @@ export const createVoice = async (db: D1Database, voice: Voice): Promise<void> =
     .prepare(
       `INSERT INTO voices (
         voice_id, name, description, speaker_name, model_size, model_id, category, status,
-        checkpoint_r2_prefix, run_name, epoch, sample_audio_r2_key, ref_audio_r2_key, labels_json, settings_json,
-        created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        checkpoint_r2_prefix, run_name, epoch,
+        candidate_checkpoint_r2_prefix, candidate_run_name, candidate_epoch, candidate_score, candidate_job_id, active_round_id,
+        sample_audio_r2_key, ref_audio_r2_key, labels_json, settings_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       voice.voice_id,
@@ -280,6 +387,12 @@ export const createVoice = async (db: D1Database, voice: Voice): Promise<void> =
       voice.checkpoint_r2_prefix,
       voice.run_name,
       voice.epoch,
+      voice.candidate_checkpoint_r2_prefix,
+      voice.candidate_run_name,
+      voice.candidate_epoch,
+      voice.candidate_score,
+      voice.candidate_job_id,
+      voice.active_round_id,
       voice.sample_audio_r2_key,
       voice.ref_audio_r2_key,
       JSON.stringify(voice.labels),
@@ -298,6 +411,12 @@ export const updateVoice = async (
     checkpoint_r2_prefix?: string | null;
     run_name?: string | null;
     epoch?: number | null;
+    candidate_checkpoint_r2_prefix?: string | null;
+    candidate_run_name?: string | null;
+    candidate_epoch?: number | null;
+    candidate_score?: number | null;
+    candidate_job_id?: string | null;
+    active_round_id?: string | null;
     sample_audio_r2_key?: string | null;
     ref_audio_r2_key?: string | null;
     settings?: VoiceSettings;
@@ -322,6 +441,30 @@ export const updateVoice = async (
   if (updates.epoch !== undefined) {
     fields.push("epoch = ?");
     bindings.push(updates.epoch);
+  }
+  if (updates.candidate_checkpoint_r2_prefix !== undefined) {
+    fields.push("candidate_checkpoint_r2_prefix = ?");
+    bindings.push(updates.candidate_checkpoint_r2_prefix);
+  }
+  if (updates.candidate_run_name !== undefined) {
+    fields.push("candidate_run_name = ?");
+    bindings.push(updates.candidate_run_name);
+  }
+  if (updates.candidate_epoch !== undefined) {
+    fields.push("candidate_epoch = ?");
+    bindings.push(updates.candidate_epoch);
+  }
+  if (updates.candidate_score !== undefined) {
+    fields.push("candidate_score = ?");
+    bindings.push(updates.candidate_score);
+  }
+  if (updates.candidate_job_id !== undefined) {
+    fields.push("candidate_job_id = ?");
+    bindings.push(updates.candidate_job_id);
+  }
+  if (updates.active_round_id !== undefined) {
+    fields.push("active_round_id = ?");
+    bindings.push(updates.active_round_id);
   }
   if (updates.sample_audio_r2_key !== undefined) {
     fields.push("sample_audio_r2_key = ?");
@@ -435,14 +578,16 @@ export const createTrainingJob = async (db: D1Database, job: TrainingJob): Promi
   await db
     .prepare(
       `INSERT INTO training_jobs (
-        job_id, voice_id, runpod_pod_id, job_token, status, config_json, progress_json,
-        summary_json, metrics_json, dataset_r2_prefix, log_r2_prefix, error_message,
+        job_id, voice_id, round_id, dataset_snapshot_id, runpod_pod_id, job_token, status, config_json, progress_json,
+        summary_json, metrics_json, supervisor_json, dataset_r2_prefix, log_r2_prefix, error_message,
         last_heartbeat_at, started_at, completed_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       job.job_id,
       job.voice_id,
+      job.round_id,
+      job.dataset_snapshot_id,
       job.runpod_pod_id,
       job.job_token ?? null,
       job.status,
@@ -450,6 +595,7 @@ export const createTrainingJob = async (db: D1Database, job: TrainingJob): Promi
       JSON.stringify(job.progress),
       JSON.stringify(job.summary),
       JSON.stringify(job.metrics),
+      JSON.stringify(job.supervisor ?? {}),
       job.dataset_r2_prefix,
       job.log_r2_prefix,
       job.error_message,
@@ -466,6 +612,8 @@ export const updateTrainingJob = async (
   db: D1Database,
   jobId: string,
   updates: {
+    round_id?: string | null;
+    dataset_snapshot_id?: string | null;
     runpod_pod_id?: string | null;
     job_token?: string | null;
     status?: string;
@@ -473,6 +621,7 @@ export const updateTrainingJob = async (
     progress?: TrainingProgress;
     summary?: Record<string, unknown>;
     metrics?: Record<string, unknown>;
+    supervisor?: Record<string, unknown>;
     log_r2_prefix?: string | null;
     error_message?: string | null;
     last_heartbeat_at?: number | null;
@@ -484,6 +633,14 @@ export const updateTrainingJob = async (
   const fields: string[] = [];
   const bindings: Array<string | number | null> = [];
 
+  if (updates.round_id !== undefined) {
+    fields.push("round_id = ?");
+    bindings.push(updates.round_id);
+  }
+  if (updates.dataset_snapshot_id !== undefined) {
+    fields.push("dataset_snapshot_id = ?");
+    bindings.push(updates.dataset_snapshot_id);
+  }
   if (updates.runpod_pod_id !== undefined) {
     fields.push("runpod_pod_id = ?");
     bindings.push(updates.runpod_pod_id);
@@ -511,6 +668,10 @@ export const updateTrainingJob = async (
   if (updates.metrics !== undefined) {
     fields.push("metrics_json = ?");
     bindings.push(JSON.stringify(updates.metrics));
+  }
+  if (updates.supervisor !== undefined) {
+    fields.push("supervisor_json = ?");
+    bindings.push(JSON.stringify(updates.supervisor));
   }
   if (updates.log_r2_prefix !== undefined) {
     fields.push("log_r2_prefix = ?");
@@ -783,6 +944,284 @@ export const updateDatasetPreprocessCacheEntry = async (
   bindings.push(entryId);
   await db
     .prepare(`UPDATE dataset_preprocess_cache_entries SET ${fields.join(", ")} WHERE entry_id = ?`)
+    .bind(...bindings)
+    .run();
+};
+
+export const getDatasetSnapshot = async (
+  db: D1Database,
+  voiceId: string,
+  datasetR2Prefix: string,
+  datasetSignature: string
+): Promise<DatasetSnapshot | null> => {
+  const row = await db
+    .prepare(
+      `SELECT * FROM dataset_snapshots
+       WHERE voice_id = ? AND dataset_r2_prefix = ? AND dataset_signature = ?
+       LIMIT 1`
+    )
+    .bind(voiceId, datasetR2Prefix, datasetSignature)
+    .first<DbDatasetSnapshotRow>();
+
+  return row ? mapDatasetSnapshot(row) : null;
+};
+
+export const getDatasetSnapshotById = async (
+  db: D1Database,
+  snapshotId: string
+): Promise<DatasetSnapshot | null> => {
+  const row = await db
+    .prepare("SELECT * FROM dataset_snapshots WHERE snapshot_id = ? LIMIT 1")
+    .bind(snapshotId)
+    .first<DbDatasetSnapshotRow>();
+
+  return row ? mapDatasetSnapshot(row) : null;
+};
+
+export const listDatasetSnapshots = async (
+  db: D1Database,
+  filters: { voice_id?: string; limit?: number } = {}
+): Promise<DatasetSnapshot[]> => {
+  const conditions: string[] = [];
+  const bindings: Array<string | number> = [];
+
+  if (filters.voice_id) {
+    conditions.push("voice_id = ?");
+    bindings.push(filters.voice_id);
+  }
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const limit = Math.max(1, Math.min(filters.limit ?? 20, 100));
+  const result = await db
+    .prepare(`SELECT * FROM dataset_snapshots ${whereClause} ORDER BY updated_at DESC, created_at DESC LIMIT ?`)
+    .bind(...bindings, limit)
+    .all<DbDatasetSnapshotRow>();
+
+  return (result.results ?? []).map(mapDatasetSnapshot);
+};
+
+export const upsertDatasetSnapshot = async (
+  db: D1Database,
+  snapshot: DatasetSnapshot
+): Promise<void> => {
+  await db
+    .prepare(
+      `INSERT INTO dataset_snapshots (
+        snapshot_id, voice_id, dataset_name, dataset_r2_prefix, dataset_signature, status,
+        source_cache_id, cache_r2_prefix, train_raw_r2_key, ref_audio_r2_key, reference_profile_r2_key,
+        reference_text, source_file_count, segments_created, segments_accepted, accepted_duration_min,
+        created_from_job_id, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(voice_id, dataset_r2_prefix, dataset_signature) DO UPDATE SET
+        dataset_name = excluded.dataset_name,
+        status = excluded.status,
+        source_cache_id = excluded.source_cache_id,
+        cache_r2_prefix = excluded.cache_r2_prefix,
+        train_raw_r2_key = excluded.train_raw_r2_key,
+        ref_audio_r2_key = excluded.ref_audio_r2_key,
+        reference_profile_r2_key = excluded.reference_profile_r2_key,
+        reference_text = excluded.reference_text,
+        source_file_count = excluded.source_file_count,
+        segments_created = excluded.segments_created,
+        segments_accepted = excluded.segments_accepted,
+        accepted_duration_min = excluded.accepted_duration_min,
+        created_from_job_id = excluded.created_from_job_id,
+        updated_at = excluded.updated_at`
+    )
+    .bind(
+      snapshot.snapshot_id,
+      snapshot.voice_id,
+      snapshot.dataset_name,
+      snapshot.dataset_r2_prefix,
+      snapshot.dataset_signature,
+      snapshot.status,
+      snapshot.source_cache_id,
+      snapshot.cache_r2_prefix,
+      snapshot.train_raw_r2_key,
+      snapshot.ref_audio_r2_key,
+      snapshot.reference_profile_r2_key,
+      snapshot.reference_text,
+      snapshot.source_file_count,
+      snapshot.segments_created,
+      snapshot.segments_accepted,
+      snapshot.accepted_duration_min,
+      snapshot.created_from_job_id,
+      snapshot.created_at,
+      snapshot.updated_at
+    )
+    .run();
+};
+
+export const getTrainingRound = async (
+  db: D1Database,
+  roundId: string
+): Promise<TrainingRound | null> => {
+  const row = await db
+    .prepare("SELECT * FROM training_rounds WHERE round_id = ? LIMIT 1")
+    .bind(roundId)
+    .first<DbTrainingRoundRow>();
+
+  return row ? mapTrainingRound(row) : null;
+};
+
+export const listTrainingRounds = async (
+  db: D1Database,
+  filters: { voice_id?: string; limit?: number } = {}
+): Promise<TrainingRound[]> => {
+  const conditions: string[] = [];
+  const bindings: Array<string | number> = [];
+
+  if (filters.voice_id) {
+    conditions.push("voice_id = ?");
+    bindings.push(filters.voice_id);
+  }
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const limit = Math.max(1, Math.min(filters.limit ?? 20, 100));
+  const result = await db
+    .prepare(`SELECT * FROM training_rounds ${whereClause} ORDER BY round_index DESC, created_at DESC LIMIT ?`)
+    .bind(...bindings, limit)
+    .all<DbTrainingRoundRow>();
+
+  return (result.results ?? []).map(mapTrainingRound);
+};
+
+export const getLatestTrainingRoundForVoice = async (
+  db: D1Database,
+  voiceId: string
+): Promise<TrainingRound | null> => {
+  const row = await db
+    .prepare(
+      `SELECT * FROM training_rounds
+       WHERE voice_id = ?
+       ORDER BY round_index DESC, created_at DESC
+       LIMIT 1`
+    )
+    .bind(voiceId)
+    .first<DbTrainingRoundRow>();
+
+  return row ? mapTrainingRound(row) : null;
+};
+
+export const createTrainingRound = async (
+  db: D1Database,
+  round: TrainingRound
+): Promise<void> => {
+  await db
+    .prepare(
+      `INSERT INTO training_rounds (
+        round_id, voice_id, dataset_snapshot_id, round_index, status,
+        production_checkpoint_r2_prefix, production_run_name, production_epoch,
+        candidate_checkpoint_r2_prefix, candidate_run_name, candidate_epoch,
+        candidate_score, candidate_job_id, summary_json, created_at, updated_at,
+        started_at, completed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      round.round_id,
+      round.voice_id,
+      round.dataset_snapshot_id,
+      round.round_index,
+      round.status,
+      round.production_checkpoint_r2_prefix,
+      round.production_run_name,
+      round.production_epoch,
+      round.candidate_checkpoint_r2_prefix,
+      round.candidate_run_name,
+      round.candidate_epoch,
+      round.candidate_score,
+      round.candidate_job_id,
+      JSON.stringify(round.summary),
+      round.created_at,
+      round.updated_at,
+      round.started_at,
+      round.completed_at
+    )
+    .run();
+};
+
+export const updateTrainingRound = async (
+  db: D1Database,
+  roundId: string,
+  updates: {
+    dataset_snapshot_id?: string | null;
+    status?: string;
+    production_checkpoint_r2_prefix?: string | null;
+    production_run_name?: string | null;
+    production_epoch?: number | null;
+    candidate_checkpoint_r2_prefix?: string | null;
+    candidate_run_name?: string | null;
+    candidate_epoch?: number | null;
+    candidate_score?: number | null;
+    candidate_job_id?: string | null;
+    summary?: Record<string, unknown>;
+    started_at?: number | null;
+    completed_at?: number | null;
+    updated_at?: number;
+  }
+): Promise<void> => {
+  const fields: string[] = [];
+  const bindings: Array<string | number | null> = [];
+
+  if (updates.dataset_snapshot_id !== undefined) {
+    fields.push("dataset_snapshot_id = ?");
+    bindings.push(updates.dataset_snapshot_id);
+  }
+  if (updates.status !== undefined) {
+    fields.push("status = ?");
+    bindings.push(updates.status);
+  }
+  if (updates.production_checkpoint_r2_prefix !== undefined) {
+    fields.push("production_checkpoint_r2_prefix = ?");
+    bindings.push(updates.production_checkpoint_r2_prefix);
+  }
+  if (updates.production_run_name !== undefined) {
+    fields.push("production_run_name = ?");
+    bindings.push(updates.production_run_name);
+  }
+  if (updates.production_epoch !== undefined) {
+    fields.push("production_epoch = ?");
+    bindings.push(updates.production_epoch);
+  }
+  if (updates.candidate_checkpoint_r2_prefix !== undefined) {
+    fields.push("candidate_checkpoint_r2_prefix = ?");
+    bindings.push(updates.candidate_checkpoint_r2_prefix);
+  }
+  if (updates.candidate_run_name !== undefined) {
+    fields.push("candidate_run_name = ?");
+    bindings.push(updates.candidate_run_name);
+  }
+  if (updates.candidate_epoch !== undefined) {
+    fields.push("candidate_epoch = ?");
+    bindings.push(updates.candidate_epoch);
+  }
+  if (updates.candidate_score !== undefined) {
+    fields.push("candidate_score = ?");
+    bindings.push(updates.candidate_score);
+  }
+  if (updates.candidate_job_id !== undefined) {
+    fields.push("candidate_job_id = ?");
+    bindings.push(updates.candidate_job_id);
+  }
+  if (updates.summary !== undefined) {
+    fields.push("summary_json = ?");
+    bindings.push(JSON.stringify(updates.summary));
+  }
+  if (updates.started_at !== undefined) {
+    fields.push("started_at = ?");
+    bindings.push(updates.started_at);
+  }
+  if (updates.completed_at !== undefined) {
+    fields.push("completed_at = ?");
+    bindings.push(updates.completed_at);
+  }
+
+  fields.push("updated_at = ?");
+  bindings.push(updates.updated_at ?? Date.now());
+
+  bindings.push(roundId);
+  await db
+    .prepare(`UPDATE training_rounds SET ${fields.join(", ")} WHERE round_id = ?`)
     .bind(...bindings)
     .run();
 };

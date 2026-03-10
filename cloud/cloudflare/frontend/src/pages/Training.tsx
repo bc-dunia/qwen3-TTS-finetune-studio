@@ -4,6 +4,8 @@ import {
   fetchVoices,
   fetchVoiceDatasets,
   fetchTrainingJobs,
+  fetchTrainingRounds,
+  fetchDatasetSnapshots,
   startTraining,
   fetchTrainingJob,
   cancelTrainingJob,
@@ -13,7 +15,9 @@ import {
   fetchTrainingLogChunkText,
   fetchTrainingPreprocessCache,
   type DatasetInfo,
+  type DatasetSnapshot,
   type DatasetPreprocessCacheEntry,
+  type TrainingRound,
   type TrainingLogChunk,
   type TrainingPreprocessCacheResponse,
   type Voice,
@@ -278,6 +282,8 @@ export function Training() {
 
   // Jobs
   const [jobs, setJobs] = useState<TrainingJob[]>([])
+  const [rounds, setRounds] = useState<TrainingRound[]>([])
+  const [snapshots, setSnapshots] = useState<DatasetSnapshot[]>([])
   const [loadingJobs, setLoadingJobs] = useState(false)
   const jobsRef = useRef<TrainingJob[]>([])
   const requestedVoiceId = searchParams.get('voiceId') ?? ''
@@ -352,6 +358,11 @@ export function Training() {
   const selectedVoiceJobs = jobs
     .filter((job) => job.voice_id === selectedVoiceId)
     .filter((job) => selectedVoiceResetAt === null || job.created_at >= selectedVoiceResetAt)
+  const selectedVoiceRounds = rounds.filter((round) => round.voice_id === selectedVoiceId)
+  const selectedVoiceSnapshots = snapshots.filter((snapshot) => snapshot.voice_id === selectedVoiceId)
+  const activeRound = selectedVoiceRounds.find((round) => round.round_id === selectedVoice?.active_round_id) ?? selectedVoiceRounds[0] ?? null
+  const selectedDatasetSnapshot =
+    selectedVoiceSnapshots.find((snapshot) => snapshot.dataset_name === effectiveDatasetName) ?? null
   const trainingAdvice = buildTrainingAdvice(selectedVoice ?? null, selectedVoiceJobs)
 
   useEffect(() => {
@@ -371,6 +382,8 @@ export function Training() {
     if (!selectedVoice) {
       setAvailableDatasets([])
       setSelectedDatasetName('')
+      setRounds([])
+      setSnapshots([])
       return
     }
 
@@ -406,6 +419,33 @@ export function Training() {
       cancelled = true
     }
   }, [selectedVoice, requestedDatasetName])
+
+  useEffect(() => {
+    if (!selectedVoiceId) return
+    let cancelled = false
+
+    async function loadWorkflow() {
+      try {
+        const [roundsData, snapshotsData] = await Promise.all([
+          fetchTrainingRounds(selectedVoiceId, 20),
+          fetchDatasetSnapshots(selectedVoiceId, 20),
+        ])
+        if (cancelled) return
+        setRounds(roundsData.rounds)
+        setSnapshots(snapshotsData.snapshots)
+      } catch {
+        if (!cancelled) {
+          setRounds([])
+          setSnapshots([])
+        }
+      }
+    }
+
+    void loadWorkflow()
+    return () => {
+      cancelled = true
+    }
+  }, [selectedVoiceId])
 
   useEffect(() => {
     if (!hasActiveJobs) return
@@ -467,10 +507,13 @@ export function Training() {
         job_id: result.job_id,
         status: result.status as TrainingJob['status'],
         voice_id: selectedVoiceId,
+        round_id: result.round_id,
+        dataset_snapshot_id: result.dataset_snapshot_id,
         created_at: Date.now(),
         last_heartbeat_at: null,
         summary: {},
         metrics: {},
+        supervisor: { phase: 'pending' },
         config,
         progress: {
           epoch: 0,
@@ -481,6 +524,12 @@ export function Training() {
         },
       }
       setJobs((prev) => [newJob, ...prev])
+      const [roundsData, snapshotsData] = await Promise.all([
+        fetchTrainingRounds(selectedVoiceId, 20),
+        fetchDatasetSnapshots(selectedVoiceId, 20),
+      ])
+      setRounds(roundsData.rounds)
+      setSnapshots(snapshotsData.snapshots)
     } catch (err) {
       setFormError(err instanceof Error ? err.message : 'Failed to start training')
     } finally {
@@ -514,6 +563,14 @@ export function Training() {
   async function handleRefreshAllJobs() {
     const data = await fetchTrainingJobs(undefined, 100)
     setJobs(data.jobs)
+    if (selectedVoiceId) {
+      const [roundsData, snapshotsData] = await Promise.all([
+        fetchTrainingRounds(selectedVoiceId, 20),
+        fetchDatasetSnapshots(selectedVoiceId, 20),
+      ])
+      setRounds(roundsData.rounds)
+      setSnapshots(snapshotsData.snapshots)
+    }
   }
 
   async function handleRefreshJob(jobId: string) {
@@ -600,6 +657,42 @@ export function Training() {
               Go to Voices upload
             </Link>
           </div>
+
+          {selectedVoice && (
+            <div className="mb-4 rounded-lg border border-edge bg-surface px-3 py-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-heading text-xs font-semibold">Workflow State</div>
+                  <p className="text-subtle text-[11px] mt-1">
+                    Production and candidate are now tracked separately. New runs attach to a round and a frozen dataset snapshot.
+                  </p>
+                </div>
+                {activeRound && (
+                  <span className="rounded-full bg-raised px-2 py-1 text-[10px] font-mono text-muted">
+                    round #{activeRound.round_index}
+                  </span>
+                )}
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2 text-[10px] font-mono text-muted">
+                <span>production={selectedVoice.run_name ?? 'none'}</span>
+                <span>epoch={selectedVoice.epoch ?? 'n/a'}</span>
+                <span>candidate={selectedVoice.candidate_run_name ?? 'none'}</span>
+                <span>candidate_epoch={selectedVoice.candidate_epoch ?? 'n/a'}</span>
+                <span>active_round={selectedVoice.active_round_id?.slice(0, 8) ?? 'none'}</span>
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2 text-[10px] font-mono text-muted">
+                <span>snapshot={selectedDatasetSnapshot?.status ?? 'not_frozen'}</span>
+                <span>dataset={selectedDatasetSnapshot?.dataset_name ?? (effectiveDatasetName || 'none')}</span>
+                <span>signature={selectedDatasetSnapshot?.dataset_signature?.slice(0, 10) ?? 'pending'}</span>
+                <span>segments={selectedDatasetSnapshot?.segments_accepted ?? 'n/a'}</span>
+              </div>
+              {selectedVoice.candidate_checkpoint_r2_prefix && (
+                <p className="mt-3 text-[11px] text-warning">
+                  A validated candidate is waiting. It will not replace production until you promote it from Compare.
+                </p>
+              )}
+            </div>
+          )}
 
           {selectedVoice && (
             <div className="mb-4">
@@ -1036,6 +1129,15 @@ function JobCard({
         <Metric label="Epoch" value={`${epoch}/${totalEpochs || '—'}`} />
         <Metric label="Step" value={String(step)} />
         <Metric label="Loss" value={loss !== null && loss > 0 ? loss.toFixed(4) : '—'} />
+      </div>
+
+      <div className="mt-3 flex flex-wrap gap-2 text-[10px] font-mono text-muted">
+        <span className="rounded-full bg-raised px-2 py-1">round={job.round_id?.slice(0, 8) ?? 'n/a'}</span>
+        <span className="rounded-full bg-raised px-2 py-1">snapshot={job.dataset_snapshot_id?.slice(0, 8) ?? 'n/a'}</span>
+        <span className="rounded-full bg-raised px-2 py-1">phase={String(job.supervisor?.phase ?? job.status)}</span>
+        {typeof job.summary?.candidate_promotion_mode === 'string' && (
+          <span className="rounded-full bg-raised px-2 py-1">adoption={job.summary.candidate_promotion_mode}</span>
+        )}
       </div>
 
       {job.status === 'completed' && (durationMs !== null || finalLoss !== null || finalEpoch !== null) && (

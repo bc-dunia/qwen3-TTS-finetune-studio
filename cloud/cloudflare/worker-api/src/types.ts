@@ -42,6 +42,12 @@ export interface Voice {
   checkpoint_r2_prefix: string | null;
   run_name: string | null;
   epoch: number | null;
+  candidate_checkpoint_r2_prefix: string | null;
+  candidate_run_name: string | null;
+  candidate_epoch: number | null;
+  candidate_score: number | null;
+  candidate_job_id: string | null;
+  active_round_id: string | null;
   sample_audio_r2_key: string | null;
   ref_audio_r2_key: string | null;
   labels: Record<string, string>;
@@ -106,6 +112,8 @@ export interface TrainingProgress {
 export interface TrainingJob {
   job_id: string;
   voice_id: string;
+  round_id: string | null;
+  dataset_snapshot_id: string | null;
   runpod_pod_id: string | null;
   job_token?: string | null;
   status: string;
@@ -113,6 +121,7 @@ export interface TrainingJob {
   progress: TrainingProgress;
   summary: Record<string, unknown>;
   metrics: Record<string, unknown>;
+  supervisor: Record<string, unknown>;
   dataset_r2_prefix: string;
   log_r2_prefix: string | null;
   error_message: string | null;
@@ -162,4 +171,47 @@ export interface DatasetInfo {
   name: string;
   r2_prefix: string;
   file_count: number;
+}
+
+export interface DatasetSnapshot {
+  snapshot_id: string;
+  voice_id: string;
+  dataset_name: string | null;
+  dataset_r2_prefix: string;
+  dataset_signature: string;
+  status: string;
+  source_cache_id: string | null;
+  cache_r2_prefix: string | null;
+  train_raw_r2_key: string | null;
+  ref_audio_r2_key: string | null;
+  reference_profile_r2_key: string | null;
+  reference_text: string | null;
+  source_file_count: number | null;
+  segments_created: number | null;
+  segments_accepted: number | null;
+  accepted_duration_min: number | null;
+  created_from_job_id: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface TrainingRound {
+  round_id: string;
+  voice_id: string;
+  dataset_snapshot_id: string | null;
+  round_index: number;
+  status: string;
+  production_checkpoint_r2_prefix: string | null;
+  production_run_name: string | null;
+  production_epoch: number | null;
+  candidate_checkpoint_r2_prefix: string | null;
+  candidate_run_name: string | null;
+  candidate_epoch: number | null;
+  candidate_score: number | null;
+  candidate_job_id: string | null;
+  summary: Record<string, unknown>;
+  created_at: number;
+  updated_at: number;
+  started_at: number | null;
+  completed_at: number | null;
 }

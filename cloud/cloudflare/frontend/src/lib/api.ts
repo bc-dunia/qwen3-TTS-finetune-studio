@@ -16,6 +16,12 @@ export interface Voice {
   run_name?: string | null
   epoch?: number | null
   checkpoint_r2_prefix?: string | null
+  candidate_checkpoint_r2_prefix?: string | null
+  candidate_run_name?: string | null
+  candidate_epoch?: number | null
+  candidate_score?: number | null
+  candidate_job_id?: string | null
+  active_round_id?: string | null
   ref_audio_r2_key?: string | null
   settings: VoiceSettings
   labels: Record<string, string>
@@ -86,6 +92,8 @@ export interface TrainingConfig {
 
 export interface TrainingJob {
   job_id: string
+  round_id?: string | null
+  dataset_snapshot_id?: string | null
   status:
     | 'pending'
     | 'running'
@@ -109,6 +117,50 @@ export interface TrainingJob {
   config: TrainingConfig
   summary?: Record<string, unknown>
   metrics?: Record<string, unknown>
+  supervisor?: Record<string, unknown>
+}
+
+export interface DatasetSnapshot {
+  snapshot_id: string
+  voice_id: string
+  dataset_name?: string | null
+  dataset_r2_prefix: string
+  dataset_signature: string
+  status: string
+  source_cache_id?: string | null
+  cache_r2_prefix?: string | null
+  train_raw_r2_key?: string | null
+  ref_audio_r2_key?: string | null
+  reference_profile_r2_key?: string | null
+  reference_text?: string | null
+  source_file_count?: number | null
+  segments_created?: number | null
+  segments_accepted?: number | null
+  accepted_duration_min?: number | null
+  created_from_job_id?: string | null
+  created_at: number
+  updated_at: number
+}
+
+export interface TrainingRound {
+  round_id: string
+  voice_id: string
+  dataset_snapshot_id?: string | null
+  round_index: number
+  status: string
+  production_checkpoint_r2_prefix?: string | null
+  production_run_name?: string | null
+  production_epoch?: number | null
+  candidate_checkpoint_r2_prefix?: string | null
+  candidate_run_name?: string | null
+  candidate_epoch?: number | null
+  candidate_score?: number | null
+  candidate_job_id?: string | null
+  summary?: Record<string, unknown>
+  created_at: number
+  updated_at: number
+  started_at?: number | null
+  completed_at?: number | null
 }
 
 export interface TrainingLogChunk {
@@ -491,8 +543,8 @@ export async function startTraining(
   voiceId: string,
   config: TrainingConfig,
   options?: TrainingStartOptions,
-): Promise<{ job_id: string; status: string }> {
-  return request<{ job_id: string; status: string }>('/v1/training/start', {
+): Promise<{ job_id: string; round_id: string; dataset_snapshot_id: string; status: string }> {
+  return request<{ job_id: string; round_id: string; dataset_snapshot_id: string; status: string }>('/v1/training/start', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -517,6 +569,26 @@ export async function fetchTrainingJobs(
   const query = params.toString()
   const path = query ? `/v1/training/jobs?${query}` : '/v1/training/jobs'
   return request<{ jobs: TrainingJob[] }>(path)
+}
+
+export async function fetchTrainingRounds(
+  voiceId?: string,
+  limit = 20,
+): Promise<{ rounds: TrainingRound[] }> {
+  const params = new URLSearchParams()
+  params.set('limit', String(limit))
+  if (voiceId) params.set('voice_id', voiceId)
+  return request<{ rounds: TrainingRound[] }>(`/v1/training/rounds?${params.toString()}`)
+}
+
+export async function fetchDatasetSnapshots(
+  voiceId?: string,
+  limit = 20,
+): Promise<{ snapshots: DatasetSnapshot[] }> {
+  const params = new URLSearchParams()
+  params.set('limit', String(limit))
+  if (voiceId) params.set('voice_id', voiceId)
+  return request<{ snapshots: DatasetSnapshot[] }>(`/v1/training/snapshots?${params.toString()}`)
 }
 
 export async function cancelTrainingJob(

@@ -45,6 +45,7 @@ type CheckpointCandidate = {
   attemptNumber: number | null
   runName: string | null
   isCurrentProduction: boolean
+  isStoredCandidate: boolean
   isJobRecommendation: boolean
   validationPassed: boolean
 }
@@ -213,6 +214,7 @@ function getRunOutcomeLabel(run: RunSummary): string {
 function getCandidateTitle(candidate: CheckpointCandidate): string {
   if (candidate.isCurrentProduction && candidate.validationPassed) return 'Trusted Current'
   if (candidate.isCurrentProduction) return 'Current Production (Invalidated)'
+  if (candidate.isStoredCandidate) return 'Stored Candidate'
   if (candidate.validationPassed) return 'Recommended Candidate'
   if (!candidate.validationPassed) return 'Rejected Candidate'
   return candidate.runName ?? 'Checkpoint'
@@ -225,6 +227,7 @@ function buildCheckpointCandidates(
 ): CheckpointCandidate[] {
   const byPrefix = new Map<string, CheckpointCandidate>()
   const currentPrefix = voice?.checkpoint_r2_prefix ?? null
+  const storedCandidatePrefix = voice?.candidate_checkpoint_r2_prefix ?? null
 
   for (const job of jobs) {
     const summary = job.summary ?? {}
@@ -259,6 +262,7 @@ function buildCheckpointCandidates(
         attemptNumber: attemptNumbers.get(job.job_id) ?? null,
         runName: parseRunNameFromPrefix(input.prefix),
         isCurrentProduction: currentPrefix === input.prefix,
+        isStoredCandidate: storedCandidatePrefix === input.prefix,
         isJobRecommendation: input.isJobRecommendation,
         validationPassed: input.validationPassed,
       }
@@ -275,6 +279,7 @@ function buildCheckpointCandidates(
         preset: next.preset ?? existing.preset,
         message: next.message ?? existing.message,
         isCurrentProduction: existing.isCurrentProduction || next.isCurrentProduction,
+        isStoredCandidate: existing.isStoredCandidate || next.isStoredCandidate,
         isJobRecommendation: existing.isJobRecommendation || next.isJobRecommendation,
         validationPassed: existing.validationPassed || next.validationPassed,
         createdAt: Math.max(existing.createdAt, next.createdAt),
@@ -327,8 +332,29 @@ function buildCheckpointCandidates(
       attemptNumber: null,
       runName: voice.run_name ?? parseRunNameFromPrefix(voice.checkpoint_r2_prefix),
       isCurrentProduction: true,
+      isStoredCandidate: false,
       isJobRecommendation: false,
       validationPassed: false,
+    })
+  }
+
+  if (voice?.candidate_checkpoint_r2_prefix && !byPrefix.has(voice.candidate_checkpoint_r2_prefix)) {
+    byPrefix.set(voice.candidate_checkpoint_r2_prefix, {
+      id: voice.candidate_checkpoint_r2_prefix,
+      prefix: voice.candidate_checkpoint_r2_prefix,
+      epoch: typeof voice.candidate_epoch === 'number' ? voice.candidate_epoch : null,
+      score: typeof voice.candidate_score === 'number' ? voice.candidate_score : null,
+      preset: null,
+      message: 'Validated candidate currently staged for manual promotion.',
+      jobId: voice.candidate_job_id ?? null,
+      createdAt: Number(new Date(voice.updated_at ?? voice.created_at).getTime()),
+      completedAt: readTimestamp(voice.updated_at ?? voice.created_at),
+      attemptNumber: null,
+      runName: voice.candidate_run_name ?? parseRunNameFromPrefix(voice.candidate_checkpoint_r2_prefix),
+      isCurrentProduction: false,
+      isStoredCandidate: true,
+      isJobRecommendation: true,
+      validationPassed: true,
     })
   }
 
@@ -454,8 +480,10 @@ export function VoiceCompare() {
   const selectedCandidates = candidates.filter((candidate) => selectedCandidateIds.has(candidate.id))
   const supportsPromptControls = Boolean(voice?.model_size?.includes('1.7'))
   const trustedCurrent = candidates.find((candidate) => candidate.isCurrentProduction && candidate.validationPassed) ?? null
+  const storedCandidate = candidates.find((candidate) => candidate.isStoredCandidate) ?? null
   const currentProductionCandidate = candidates.find((candidate) => candidate.isCurrentProduction) ?? null
   const recommendedCandidate =
+    storedCandidate ??
     candidates.find((candidate) => candidate.validationPassed && !candidate.isCurrentProduction) ??
     candidates.find((candidate) => candidate.isJobRecommendation && !candidate.isCurrentProduction) ??
     candidates.find((candidate) => !candidate.isCurrentProduction) ??
@@ -747,10 +775,10 @@ export function VoiceCompare() {
           actionLabel={trustedCurrent ? 'Listen' : undefined}
         />
         <SummaryCard
-          title="Recommended"
+          title={storedCandidate ? 'Candidate Slot' : 'Recommended'}
           subtitle={recommendedCandidate ? `${recommendedCandidate.runName ?? 'candidate'} · run ${recommendedCandidate.attemptNumber ?? 'n/a'} · epoch ${recommendedCandidate.epoch ?? 'n/a'}` : 'No recommendation yet'}
           detail={recommendedCandidate?.message ?? 'A recommendation appears here once the current cycle produces candidates.'}
-          badge={recommendedCandidate?.validationPassed ? 'validated' : recommendedCandidate ? 'candidate' : 'waiting'}
+          badge={storedCandidate ? 'candidate' : recommendedCandidate?.validationPassed ? 'validated' : recommendedCandidate ? 'candidate' : 'waiting'}
           onSelect={recommendedCandidate ? () => setSelectedCandidateIds(new Set([recommendedCandidate.id])) : undefined}
           actionLabel={recommendedCandidate ? 'Listen' : undefined}
         />
@@ -984,6 +1012,9 @@ export function VoiceCompare() {
                       )}
                       {candidate.isJobRecommendation && (
                         <span className="rounded-full bg-warning-dim px-2 py-0.5 text-warning">recommended</span>
+                      )}
+                      {candidate.isStoredCandidate && (
+                        <span className="rounded-full bg-accent-dim px-2 py-0.5 text-accent">candidate</span>
                       )}
                       {candidate.validationPassed && (
                         <span className="rounded-full bg-accent-dim px-2 py-0.5 text-accent">passed</span>

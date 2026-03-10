@@ -2,8 +2,12 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import {
   createTrainingLogChunk,
+  getDatasetPreprocessCache,
+  getDatasetSnapshot,
   upsertDatasetPreprocessCache,
+  upsertDatasetSnapshot,
   getTrainingJobByToken,
+  updateTrainingRound,
   updateTrainingJob,
   updateVoice,
 } from "../lib/d1";
@@ -30,6 +34,17 @@ const parseRunNameFromCheckpointPrefix = (prefix: string): string | null => {
     return null;
   }
   return parts[2] || null;
+};
+
+const stripSlashes = (value: string): string => value.replace(/^\/+|\/+$/g, "");
+
+const extractDatasetNameFromPrefix = (datasetPrefix: string): string | null => {
+  const parts = stripSlashes(datasetPrefix).split("/");
+  if (parts.length < 3 || parts[0] !== "datasets") {
+    return null;
+  }
+  const name = parts.slice(2).join("/").trim();
+  return name || null;
 };
 
 const loadAuthedJob = async (c: Context<AppContext>) => {
@@ -68,6 +83,12 @@ app.post("/:job_id/heartbeat", async (c) => {
     progress: body.progress,
     summary,
     last_heartbeat_at: Date.now(),
+    supervisor: {
+      ...(auth.job.supervisor ?? {}),
+      phase: auth.job.status,
+      last_message: typeof body.message === "string" ? body.message : auth.job.supervisor?.last_message,
+      last_heartbeat_at: Date.now(),
+    },
   });
 
   return c.json({ status: "ok" });
@@ -121,10 +142,34 @@ app.post("/:job_id/report", async (c) => {
     progress: body.progress,
     metrics: body.metrics,
     summary,
+    supervisor: {
+      ...(auth.job.supervisor ?? {}),
+      phase: body.status,
+      last_message: typeof body.message === "string" ? body.message : auth.job.supervisor?.last_message,
+      last_reported_status: body.status,
+      last_transition_at: now,
+    },
     error_message: body.error ?? (body.status === "failed" ? "Training failed" : auth.job.error_message),
     completed_at: body.status === "completed" ? now : auth.job.completed_at,
     last_heartbeat_at: now,
   });
+
+  if (auth.job.round_id) {
+    await updateTrainingRound(c.env.DB, auth.job.round_id, {
+      status:
+        body.status === "completed"
+          ? "validating"
+          : body.status === "failed"
+            ? "failed"
+            : "running",
+      completed_at: body.status === "failed" ? now : null,
+      summary: {
+        last_job_id: auth.job.job_id,
+        last_job_status: body.status,
+        last_message: typeof body.message === "string" ? body.message : null,
+      },
+    });
+  }
 
   if (body.status === "completed" && Array.isArray(body.checkpoints) && body.checkpoints.length > 0) {
     const lastCheckpoint = body.checkpoints[body.checkpoints.length - 1];
@@ -254,6 +299,58 @@ app.post("/:job_id/preprocess-cache", async (c) => {
     updated_at: now,
   });
 
+  const persistedCache = await getDatasetPreprocessCache(
+    c.env.DB,
+    auth.job.voice_id,
+    auth.job.dataset_r2_prefix,
+    datasetSignature
+  );
+  const existingSnapshot = await getDatasetSnapshot(
+    c.env.DB,
+    auth.job.voice_id,
+    auth.job.dataset_r2_prefix,
+    datasetSignature
+  );
+  await upsertDatasetSnapshot(c.env.DB, {
+    snapshot_id: auth.job.dataset_snapshot_id ?? existingSnapshot?.snapshot_id ?? crypto.randomUUID(),
+    voice_id: auth.job.voice_id,
+    dataset_name: extractDatasetNameFromPrefix(auth.job.dataset_r2_prefix),
+    dataset_r2_prefix: auth.job.dataset_r2_prefix,
+    dataset_signature: datasetSignature,
+    status: "frozen",
+    source_cache_id: persistedCache?.cache_id ?? existingSnapshot?.source_cache_id ?? null,
+    cache_r2_prefix: cacheR2Prefix,
+    train_raw_r2_key: trainRawR2Key,
+    ref_audio_r2_key:
+      typeof body.ref_audio_r2_key === "string" && body.ref_audio_r2_key.trim()
+        ? body.ref_audio_r2_key.trim()
+        : null,
+    reference_profile_r2_key:
+      typeof body.reference_profile_r2_key === "string" && body.reference_profile_r2_key.trim()
+        ? body.reference_profile_r2_key.trim()
+        : null,
+    reference_text: existingSnapshot?.reference_text ?? null,
+    source_file_count:
+      typeof body.source_file_count === "number" && Number.isFinite(body.source_file_count)
+        ? Math.trunc(body.source_file_count)
+        : null,
+    segments_created:
+      typeof body.segments_created === "number" && Number.isFinite(body.segments_created)
+        ? Math.trunc(body.segments_created)
+        : null,
+    segments_accepted:
+      typeof body.segments_accepted === "number" && Number.isFinite(body.segments_accepted)
+        ? Math.trunc(body.segments_accepted)
+        : null,
+    accepted_duration_min:
+      typeof body.accepted_duration_min === "number" && Number.isFinite(body.accepted_duration_min)
+        ? body.accepted_duration_min
+        : null,
+    created_from_job_id: auth.job.job_id,
+    created_at: now,
+    updated_at: now,
+  });
+
   if (
     typeof body.ref_audio_r2_key === "string" &&
     body.ref_audio_r2_key.trim().length > 0
@@ -286,8 +383,23 @@ app.post("/:job_id/preprocess-cache", async (c) => {
         typeof body.accepted_duration_min === "number" ? body.accepted_duration_min : null,
       preprocess_cache_saved_at: now,
     },
+    supervisor: {
+      ...(auth.job.supervisor ?? {}),
+      phase: "preprocessing",
+      preprocess_cache_saved_at: now,
+    },
     last_heartbeat_at: now,
   });
+
+  if (auth.job.round_id) {
+    await updateTrainingRound(c.env.DB, auth.job.round_id, {
+      dataset_snapshot_id: auth.job.dataset_snapshot_id ?? null,
+      summary: {
+        preprocess_cache_saved_at: now,
+        last_job_id: auth.job.job_id,
+      },
+    });
+  }
 
   return c.json({ status: "ok" });
 });

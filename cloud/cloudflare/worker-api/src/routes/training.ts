@@ -1,17 +1,27 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import {
+  createTrainingRound,
   createTrainingJob,
   deleteTrainingLogChunks,
   getDatasetPreprocessCache,
+  getDatasetPreprocessCacheById,
+  getDatasetSnapshot,
+  getDatasetSnapshotById,
+  getLatestTrainingRoundForVoice,
   listDatasetPreprocessCacheEntries,
+  listDatasetSnapshots,
+  listTrainingRounds,
   getTrainingJob,
   getTrainingLogChunk,
+  getTrainingRound,
   getVoice,
   listTrainingJobs,
   listTrainingLogChunks,
   replaceDatasetPreprocessCacheEntries,
+  updateTrainingRound,
   updateDatasetPreprocessCacheEntry,
+  upsertDatasetSnapshot,
   updateTrainingJob,
   updateVoice,
   upsertDatasetPreprocessCache,
@@ -30,7 +40,15 @@ import {
 } from "../lib/runpod";
 import { enrichOutputWithReviewAsr } from "../lib/review-asr";
 import { authMiddleware } from "../middleware/auth";
-import type { AppContext, Env, TrainingConfig, TrainingJob, TrainingProgress } from "../types";
+import type {
+  AppContext,
+  DatasetSnapshot,
+  Env,
+  TrainingConfig,
+  TrainingJob,
+  TrainingProgress,
+  TrainingRound,
+} from "../types";
 
 const app = new Hono<AppContext>();
 app.use("*", authMiddleware);
@@ -413,6 +431,16 @@ const resolveJobPreprocessCache = async (
   c: Context<AppContext>,
   job: TrainingJob
 ): Promise<DatasetPreprocessCache | null> => {
+  if (job.dataset_snapshot_id) {
+    const snapshot = await getDatasetSnapshotById(c.env.DB, job.dataset_snapshot_id);
+    if (snapshot?.source_cache_id) {
+      const fromSnapshot = await getDatasetPreprocessCacheById(c.env.DB, snapshot.source_cache_id);
+      if (fromSnapshot) {
+        return fromSnapshot;
+      }
+    }
+  }
+
   const summary = (job.summary ?? {}) as Record<string, unknown>;
   const summarySignature = getSummaryString(summary, "preprocess_cache_dataset_signature");
   if (summarySignature) {
@@ -520,6 +548,156 @@ const resolveTrainingDatasetPrefix = (
   return extractDatasetPrefixFromRefAudioKey(voice) ?? `datasets/${voice.voice_id}`;
 };
 
+const extractDatasetNameFromPrefix = (datasetPrefix: string): string | null => {
+  const parts = stripSlashes(datasetPrefix).split("/");
+  if (parts.length < 3 || parts[0] !== "datasets") {
+    return null;
+  }
+  const name = parts.slice(2).join("/").trim();
+  return name || null;
+};
+
+const buildSyntheticDatasetSignature = (datasetPrefix: string): string =>
+  `synthetic:${stripSlashes(datasetPrefix)}`;
+
+const buildDatasetSnapshot = async ({
+  voice,
+  datasetPrefix,
+  datasetSignature,
+  preprocessCache,
+  referenceText,
+  sourceFileCount,
+  createdFromJobId,
+  now,
+}: {
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>;
+  datasetPrefix: string;
+  datasetSignature: string;
+  preprocessCache: DatasetPreprocessCache | null;
+  referenceText: string | null;
+  sourceFileCount: number | null;
+  createdFromJobId: string | null;
+  now: number;
+}): Promise<DatasetSnapshot> => ({
+  snapshot_id: crypto.randomUUID(),
+  voice_id: voice.voice_id,
+  dataset_name: extractDatasetNameFromPrefix(datasetPrefix),
+  dataset_r2_prefix: datasetPrefix,
+  dataset_signature: datasetSignature,
+  status: preprocessCache ? "frozen" : "draft",
+  source_cache_id: preprocessCache?.cache_id ?? null,
+  cache_r2_prefix: preprocessCache?.cache_r2_prefix ?? null,
+  train_raw_r2_key: preprocessCache?.train_raw_r2_key ?? null,
+  ref_audio_r2_key: preprocessCache?.ref_audio_r2_key ?? voice.ref_audio_r2_key ?? null,
+  reference_profile_r2_key: preprocessCache?.reference_profile_r2_key ?? null,
+  reference_text: referenceText,
+  source_file_count: preprocessCache?.source_file_count ?? sourceFileCount,
+  segments_created: preprocessCache?.segments_created ?? null,
+  segments_accepted: preprocessCache?.segments_accepted ?? null,
+  accepted_duration_min: preprocessCache?.accepted_duration_min ?? null,
+  created_from_job_id: createdFromJobId,
+  created_at: now,
+  updated_at: now,
+});
+
+const ensureDatasetSnapshot = async ({
+  c,
+  voice,
+  datasetPrefix,
+  datasetSignature,
+  preprocessCache,
+  sourceFileCount,
+  createdFromJobId,
+}: {
+  c: Context<AppContext>;
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>;
+  datasetPrefix: string;
+  datasetSignature: string;
+  preprocessCache: DatasetPreprocessCache | null;
+  sourceFileCount: number | null;
+  createdFromJobId: string | null;
+}): Promise<DatasetSnapshot> => {
+  const existing = await getDatasetSnapshot(
+    c.env.DB,
+    voice.voice_id,
+    datasetPrefix,
+    datasetSignature
+  );
+  const referenceText = preprocessCache ? await readReferenceText(c.env.R2, preprocessCache) : existing?.reference_text ?? null;
+  const now = Date.now();
+  const nextSnapshot =
+    existing ??
+    (await buildDatasetSnapshot({
+      voice,
+      datasetPrefix,
+      datasetSignature,
+      preprocessCache,
+      referenceText,
+      sourceFileCount,
+      createdFromJobId,
+      now,
+    }));
+
+  await upsertDatasetSnapshot(c.env.DB, {
+    ...nextSnapshot,
+    status: preprocessCache ? "frozen" : nextSnapshot.status,
+    source_cache_id: preprocessCache?.cache_id ?? nextSnapshot.source_cache_id,
+    cache_r2_prefix: preprocessCache?.cache_r2_prefix ?? nextSnapshot.cache_r2_prefix,
+    train_raw_r2_key: preprocessCache?.train_raw_r2_key ?? nextSnapshot.train_raw_r2_key,
+    ref_audio_r2_key: preprocessCache?.ref_audio_r2_key ?? nextSnapshot.ref_audio_r2_key,
+    reference_profile_r2_key:
+      preprocessCache?.reference_profile_r2_key ?? nextSnapshot.reference_profile_r2_key,
+    reference_text: referenceText ?? nextSnapshot.reference_text,
+    source_file_count: preprocessCache?.source_file_count ?? sourceFileCount ?? nextSnapshot.source_file_count,
+    segments_created: preprocessCache?.segments_created ?? nextSnapshot.segments_created,
+    segments_accepted: preprocessCache?.segments_accepted ?? nextSnapshot.segments_accepted,
+    accepted_duration_min: preprocessCache?.accepted_duration_min ?? nextSnapshot.accepted_duration_min,
+    created_from_job_id: createdFromJobId ?? nextSnapshot.created_from_job_id,
+    updated_at: now,
+  });
+
+  return (
+    (await getDatasetSnapshot(c.env.DB, voice.voice_id, datasetPrefix, datasetSignature)) ??
+    nextSnapshot
+  );
+};
+
+const ensureTrainingRound = async ({
+  c,
+  voice,
+  datasetSnapshotId,
+  now,
+}: {
+  c: Context<AppContext>;
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>;
+  datasetSnapshotId: string | null;
+  now: number;
+}): Promise<TrainingRound> => {
+  const previousRound = await getLatestTrainingRoundForVoice(c.env.DB, voice.voice_id);
+  const round: TrainingRound = {
+    round_id: crypto.randomUUID(),
+    voice_id: voice.voice_id,
+    dataset_snapshot_id: datasetSnapshotId,
+    round_index: (previousRound?.round_index ?? 0) + 1,
+    status: "running",
+    production_checkpoint_r2_prefix: voice.checkpoint_r2_prefix,
+    production_run_name: voice.run_name,
+    production_epoch: voice.epoch,
+    candidate_checkpoint_r2_prefix: null,
+    candidate_run_name: null,
+    candidate_epoch: null,
+    candidate_score: null,
+    candidate_job_id: null,
+    summary: {},
+    created_at: now,
+    updated_at: now,
+    started_at: now,
+    completed_at: null,
+  };
+  await createTrainingRound(c.env.DB, round);
+  return round;
+};
+
 const getCurrentReadyVoiceScore = async (
   c: Context<AppContext>,
   voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>
@@ -556,7 +734,7 @@ const getCurrentReadyVoiceScore = async (
   return null;
 };
 
-const chooseCheckpointPromotion = async ({
+const chooseCheckpointAdoption = async ({
   c,
   voice,
   candidatePrefix,
@@ -567,7 +745,7 @@ const chooseCheckpointPromotion = async ({
   candidatePrefix: string;
   candidateScore: number;
 }): Promise<{
-  promote: boolean;
+  mode: "promote" | "candidate" | "keep_current";
   preservedPrefix: string | null;
   preservedEpoch: number | null;
   preservedScore: number | null;
@@ -575,7 +753,7 @@ const chooseCheckpointPromotion = async ({
   const currentPrefix = typeof voice.checkpoint_r2_prefix === "string" ? voice.checkpoint_r2_prefix.trim() : "";
   if (voice.status !== "ready" || !currentPrefix || currentPrefix === candidatePrefix) {
     return {
-      promote: true,
+      mode: "promote",
       preservedPrefix: currentPrefix || null,
       preservedEpoch: voice.epoch,
       preservedScore: await getCurrentReadyVoiceScore(c, voice),
@@ -585,7 +763,7 @@ const chooseCheckpointPromotion = async ({
   const currentScore = await getCurrentReadyVoiceScore(c, voice);
   if (currentScore !== null && candidateScore <= currentScore) {
     return {
-      promote: false,
+      mode: "keep_current",
       preservedPrefix: currentPrefix,
       preservedEpoch: voice.epoch,
       preservedScore: currentScore,
@@ -593,7 +771,7 @@ const chooseCheckpointPromotion = async ({
   }
 
   return {
-    promote: true,
+    mode: "candidate",
     preservedPrefix: currentPrefix,
     preservedEpoch: voice.epoch,
     preservedScore: currentScore,
@@ -683,6 +861,128 @@ const resolvePromotionSettings = (
   );
   const preset = presets.find((value) => value.name === normalizedPreset);
   return preset?.settings ?? voice.settings ?? {};
+};
+
+const applyValidatedCheckpointOutcome = async ({
+  c,
+  voice,
+  job,
+  candidatePrefix,
+  candidateEpoch,
+  candidatePreset,
+  candidateScore,
+}: {
+  c: Context<AppContext>;
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>;
+  job: TrainingJob;
+  candidatePrefix: string;
+  candidateEpoch: number | null;
+  candidatePreset: string | null;
+  candidateScore: number;
+}): Promise<{
+  mode: "promote" | "candidate" | "keep_current";
+  selectedPrefix: string | null;
+  selectedEpoch: number | null;
+  selectedPreset: string | null;
+  selectedScore: number | null;
+  preservedScore: number | null;
+}> => {
+  const decision = await chooseCheckpointAdoption({
+    c,
+    voice,
+    candidatePrefix,
+    candidateScore,
+  });
+  const promotedSettings = resolvePromotionSettings(voice, candidatePreset);
+  const candidateRunName = parseRunNameFromCheckpointPrefix(candidatePrefix);
+
+  if (decision.mode === "promote") {
+    await updateVoice(c.env.DB, job.voice_id, {
+      status: "ready",
+      checkpoint_r2_prefix: candidatePrefix,
+      run_name: candidateRunName,
+      epoch: candidateEpoch,
+      candidate_checkpoint_r2_prefix: null,
+      candidate_run_name: null,
+      candidate_epoch: null,
+      candidate_score: null,
+      candidate_job_id: null,
+      settings: promotedSettings,
+      active_round_id: job.round_id ?? voice.active_round_id ?? null,
+    });
+    if (job.round_id) {
+      await updateTrainingRound(c.env.DB, job.round_id, {
+        status: "promoted",
+        production_checkpoint_r2_prefix: candidatePrefix,
+        production_run_name: candidateRunName,
+        production_epoch: candidateEpoch,
+        candidate_checkpoint_r2_prefix: null,
+        candidate_run_name: null,
+        candidate_epoch: null,
+        candidate_score: null,
+        candidate_job_id: null,
+        completed_at: Date.now(),
+      });
+    }
+    return {
+      mode: decision.mode,
+      selectedPrefix: candidatePrefix,
+      selectedEpoch: candidateEpoch,
+      selectedPreset: candidatePreset,
+      selectedScore: candidateScore,
+      preservedScore: decision.preservedScore,
+    };
+  }
+
+  if (decision.mode === "candidate") {
+    await updateVoice(c.env.DB, job.voice_id, {
+      candidate_checkpoint_r2_prefix: candidatePrefix,
+      candidate_run_name: candidateRunName,
+      candidate_epoch: candidateEpoch,
+      candidate_score: candidateScore,
+      candidate_job_id: job.job_id,
+      active_round_id: job.round_id ?? voice.active_round_id ?? null,
+    });
+    if (job.round_id) {
+      await updateTrainingRound(c.env.DB, job.round_id, {
+        status: "candidate_ready",
+        candidate_checkpoint_r2_prefix: candidatePrefix,
+        candidate_run_name: candidateRunName,
+        candidate_epoch: candidateEpoch,
+        candidate_score: candidateScore,
+        candidate_job_id: job.job_id,
+        completed_at: Date.now(),
+      });
+    }
+    return {
+      mode: decision.mode,
+      selectedPrefix: candidatePrefix,
+      selectedEpoch: candidateEpoch,
+      selectedPreset: candidatePreset,
+      selectedScore: candidateScore,
+      preservedScore: decision.preservedScore,
+    };
+  }
+
+  if (job.round_id) {
+    await updateTrainingRound(c.env.DB, job.round_id, {
+      status: "superseded",
+      candidate_checkpoint_r2_prefix: candidatePrefix,
+      candidate_run_name: candidateRunName,
+      candidate_epoch: candidateEpoch,
+      candidate_score: candidateScore,
+      candidate_job_id: job.job_id,
+      completed_at: Date.now(),
+    });
+  }
+  return {
+    mode: decision.mode,
+    selectedPrefix: decision.preservedPrefix,
+    selectedEpoch: decision.preservedEpoch,
+    selectedPreset: "kept_existing_best",
+    selectedScore: decision.preservedScore,
+    preservedScore: decision.preservedScore,
+  };
 };
 
 const isMissingRunpodRequestError = (error: unknown): error is Error => {
@@ -1776,6 +2076,10 @@ const serializeTrainingJob = (job: TrainingJob): Omit<TrainingJob, "job_token"> 
   return safeJob;
 };
 
+const serializeTrainingRound = (round: TrainingRound): TrainingRound => round;
+
+const serializeDatasetSnapshot = (snapshot: DatasetSnapshot): DatasetSnapshot => snapshot;
+
 const normalizeCheckpointEvaluation = (value: unknown): CheckpointEvaluation | null => {
   if (!value || typeof value !== "object") {
     return null;
@@ -2438,26 +2742,22 @@ const advanceAsyncCheckpointValidation = async (
     champion: AsyncValidationChampion,
     evaluations: CheckpointEvaluation[]
   ): Promise<{ status: string; progress: TrainingProgress }> => {
-    const promotion = await chooseCheckpointPromotion({
+    const adoption = await applyValidatedCheckpointOutcome({
       c,
       voice,
+      job,
       candidatePrefix: champion.prefix,
+      candidateEpoch: champion.epoch,
+      candidatePreset: champion.preset_name,
       candidateScore: champion.score,
     });
 
-    if (promotion.promote) {
-      await updateVoice(c.env.DB, job.voice_id, {
-        status: "ready",
-        checkpoint_r2_prefix: champion.prefix,
-        run_name: parseRunNameFromCheckpointPrefix(champion.prefix),
-        epoch: champion.epoch,
-        settings: champion.preset_settings,
-      });
-    }
-
-    const validationMessage = promotion.promote
-      ? champion.message
-      : `${champion.message} | kept current ready checkpoint score=${(promotion.preservedScore ?? 0).toFixed(3)} >= candidate_score=${champion.score.toFixed(3)}`;
+    const validationMessage =
+      adoption.mode === "keep_current"
+        ? `${champion.message} | kept current ready checkpoint score=${(adoption.preservedScore ?? 0).toFixed(3)} >= candidate_score=${champion.score.toFixed(3)}`
+        : adoption.mode === "candidate"
+          ? `${champion.message} | stored as candidate; production remains unchanged until promotion`
+          : champion.message;
     await updateTrainingJob(c.env.DB, job.job_id, {
       status: "completed",
       completed_at: job.completed_at ?? Date.now(),
@@ -2468,16 +2768,23 @@ const advanceAsyncCheckpointValidation = async (
         validation_checked: true,
         validation_passed: true,
         validation_message: validationMessage,
-        selected_checkpoint_prefix: promotion.promote ? champion.prefix : promotion.preservedPrefix,
-        selected_checkpoint_epoch: promotion.promote ? champion.epoch : promotion.preservedEpoch,
-        selected_preset: promotion.promote ? champion.preset_name : "kept_existing_best",
-        selected_score: promotion.promote ? champion.score : promotion.preservedScore,
+        selected_checkpoint_prefix: adoption.selectedPrefix,
+        selected_checkpoint_epoch: adoption.selectedEpoch,
+        selected_preset: adoption.selectedPreset,
+        selected_score: adoption.selectedScore,
         candidate_checkpoint_prefix: champion.prefix,
         candidate_checkpoint_epoch: champion.epoch,
         candidate_preset: champion.preset_name,
         candidate_score: champion.score,
+        candidate_promotion_mode: adoption.mode,
         evaluated_checkpoints: evaluations,
         async_validation: null,
+      },
+      supervisor: {
+        ...(job.supervisor ?? {}),
+        phase: "validation_completed",
+        outcome: adoption.mode,
+        last_validation_checkpoint_epoch: champion.epoch,
       },
     });
     return { status: "completed", progress };
@@ -2499,6 +2806,23 @@ const advanceAsyncCheckpointValidation = async (
         checkpoint_r2_prefix: null,
         run_name: null,
         epoch: null,
+        candidate_checkpoint_r2_prefix: null,
+        candidate_run_name: null,
+        candidate_epoch: null,
+        candidate_score: null,
+        candidate_job_id: null,
+      });
+    }
+
+    if (job.round_id) {
+      await updateTrainingRound(c.env.DB, job.round_id, {
+        status: "failed",
+        completed_at: Date.now(),
+        summary: {
+          ...(await getTrainingRound(c.env.DB, job.round_id))?.summary,
+          validation_message: message,
+          evaluated_checkpoints: evaluations,
+        },
       });
     }
 
@@ -2522,6 +2846,10 @@ const advanceAsyncCheckpointValidation = async (
         selected_score: null,
         evaluated_checkpoints: evaluations,
         async_validation: null,
+      },
+      supervisor: {
+        ...(job.supervisor ?? {}),
+        phase: "validation_failed",
       },
     });
     return { status: "completed", progress };
@@ -3103,26 +3431,22 @@ const advanceAsync06bCheckpointValidation = async (
       typeof currentPrefix === "string" ? currentPrefix : candidateCheckpoints[currentIndex].r2_prefix;
     const promotedEpoch =
       typeof currentEpoch === "number" ? currentEpoch : candidateCheckpoints[currentIndex].epoch;
-    const promotion = await chooseCheckpointPromotion({
+    const adoption = await applyValidatedCheckpointOutcome({
       c,
       voice,
+      job,
       candidatePrefix: promotedPrefix,
+      candidateEpoch: promotedEpoch,
+      candidatePreset: result.presetName,
       candidateScore: result.aggregateScore,
     });
 
-    if (promotion.promote) {
-      await updateVoice(c.env.DB, job.voice_id, {
-        status: "ready",
-        checkpoint_r2_prefix: promotedPrefix,
-        run_name: parseRunNameFromCheckpointPrefix(promotedPrefix),
-        epoch: promotedEpoch,
-        settings: result.presetSettings,
-      });
-    }
-
-    const validationMessage = promotion.promote
-      ? result.message
-      : `${result.message} | kept current ready checkpoint score=${(promotion.preservedScore ?? 0).toFixed(3)} >= candidate_score=${result.aggregateScore.toFixed(3)}`;
+    const validationMessage =
+      adoption.mode === "keep_current"
+        ? `${result.message} | kept current ready checkpoint score=${(adoption.preservedScore ?? 0).toFixed(3)} >= candidate_score=${result.aggregateScore.toFixed(3)}`
+        : adoption.mode === "candidate"
+          ? `${result.message} | stored as candidate; production remains unchanged until promotion`
+          : result.message;
     await updateTrainingJob(c.env.DB, job.job_id, {
       status: "completed",
       completed_at: job.completed_at ?? Date.now(),
@@ -3133,17 +3457,24 @@ const advanceAsync06bCheckpointValidation = async (
           validation_in_progress: false,
           validation_checked: true,
           validation_passed: true,
-        validation_message: validationMessage,
-        selected_checkpoint_prefix: promotion.promote ? promotedPrefix : promotion.preservedPrefix,
-        selected_checkpoint_epoch: promotion.promote ? promotedEpoch : promotion.preservedEpoch,
-        selected_preset: promotion.promote ? result.presetName : "kept_existing_best",
-        selected_score: promotion.promote ? result.aggregateScore : promotion.preservedScore,
-        candidate_checkpoint_prefix: promotedPrefix,
-        candidate_checkpoint_epoch: promotedEpoch,
-        candidate_preset: result.presetName,
-        candidate_score: result.aggregateScore,
-        evaluated_checkpoints: nextEvaluations,
-        async_validation: null,
+          validation_message: validationMessage,
+          selected_checkpoint_prefix: adoption.selectedPrefix,
+          selected_checkpoint_epoch: adoption.selectedEpoch,
+          selected_preset: adoption.selectedPreset,
+          selected_score: adoption.selectedScore,
+          candidate_checkpoint_prefix: promotedPrefix,
+          candidate_checkpoint_epoch: promotedEpoch,
+          candidate_preset: result.presetName,
+          candidate_score: result.aggregateScore,
+          candidate_promotion_mode: adoption.mode,
+          evaluated_checkpoints: nextEvaluations,
+          async_validation: null,
+        },
+      supervisor: {
+        ...(job.supervisor ?? {}),
+        phase: "validation_completed",
+        outcome: adoption.mode,
+        last_validation_checkpoint_epoch: promotedEpoch,
       },
     });
     return { status: "completed", progress };
@@ -3175,6 +3506,23 @@ const advanceAsync06bCheckpointValidation = async (
       checkpoint_r2_prefix: null,
       run_name: null,
       epoch: null,
+      candidate_checkpoint_r2_prefix: null,
+      candidate_run_name: null,
+      candidate_epoch: null,
+      candidate_score: null,
+      candidate_job_id: null,
+    });
+  }
+
+  if (job.round_id) {
+    await updateTrainingRound(c.env.DB, job.round_id, {
+      status: "failed",
+      completed_at: Date.now(),
+      summary: {
+        ...(await getTrainingRound(c.env.DB, job.round_id))?.summary,
+        validation_message: result.message,
+        evaluated_checkpoints: nextEvaluations,
+      },
     });
   }
 
@@ -3198,6 +3546,10 @@ const advanceAsync06bCheckpointValidation = async (
       selected_score: null,
       evaluated_checkpoints: nextEvaluations,
       async_validation: null,
+    },
+    supervisor: {
+      ...(job.supervisor ?? {}),
+      phase: "validation_failed",
     },
   });
   return { status: "completed", progress };
@@ -3534,12 +3886,22 @@ const reconcileJobStatus = async (
       status,
       progress,
       completed_at: status === "completed" ? job.completed_at ?? Date.now() : job.completed_at,
+      supervisor: {
+        ...(job.supervisor ?? {}),
+        phase: status,
+        last_transition_at: Date.now(),
+      },
     });
     currentJob = {
       ...job,
       status,
       progress,
       completed_at: status === "completed" ? job.completed_at ?? Date.now() : job.completed_at,
+      supervisor: {
+        ...(job.supervisor ?? {}),
+        phase: status,
+        last_transition_at: Date.now(),
+      },
     };
   } else {
     currentJob = {
@@ -3555,6 +3917,16 @@ const reconcileJobStatus = async (
   }
 
   if (currentJob.status === "completed" && !currentJob.summary?.validation_checked) {
+    if (currentJob.round_id) {
+      await updateTrainingRound(c.env.DB, currentJob.round_id, {
+        status: "validating",
+        summary: {
+          ...(await getTrainingRound(c.env.DB, currentJob.round_id))?.summary,
+          validation_in_progress: true,
+          job_id: currentJob.job_id,
+        },
+      });
+    }
     const voice = await getVoice(c.env.DB, job.voice_id);
     if (!voice) {
       const message = "Voice record missing for validation";
@@ -3814,18 +4186,35 @@ app.post("/start", async (c) => {
   }
 
   const datasetSignatureInfo = await computeDatasetSignature(datasetPrefix, datasetObjects);
+  const datasetSignature = datasetSignatureInfo?.signature ?? buildSyntheticDatasetSignature(datasetPrefix);
   const preprocessCache =
     datasetSignatureInfo !== null
-      ? await getDatasetPreprocessCache(
-          c.env.DB,
-          body.voice_id,
-          datasetPrefix,
-          datasetSignatureInfo.signature
-        )
+      ? await getDatasetPreprocessCache(c.env.DB, body.voice_id, datasetPrefix, datasetSignature)
       : null;
+  const datasetSnapshot = await ensureDatasetSnapshot({
+    c,
+    voice,
+    datasetPrefix,
+    datasetSignature,
+    preprocessCache,
+    sourceFileCount: datasetSignatureInfo?.sourceCount ?? null,
+    createdFromJobId: jobId,
+  });
+  const round = await ensureTrainingRound({
+    c,
+    voice,
+    datasetSnapshotId: datasetSnapshot.snapshot_id,
+    now,
+  });
   const initialSummary: Record<string, unknown> = {
+    round_id: round.round_id,
+    round_index: round.round_index,
+    dataset_snapshot_id: datasetSnapshot.snapshot_id,
+    dataset_snapshot_status: datasetSnapshot.status,
+    dataset_snapshot_signature: datasetSnapshot.dataset_signature,
+    dataset_snapshot_name: datasetSnapshot.dataset_name,
     preprocess_cache_lookup: preprocessCache ? "hit" : "miss",
-    preprocess_cache_dataset_signature: datasetSignatureInfo?.signature ?? null,
+    preprocess_cache_dataset_signature: datasetSignature,
     preprocess_cache_source_file_count: datasetSignatureInfo?.sourceCount ?? null,
     preprocess_cache_r2_prefix: preprocessCache?.cache_r2_prefix ?? null,
   };
@@ -3833,6 +4222,8 @@ app.post("/start", async (c) => {
   const job: TrainingJob = {
     job_id: jobId,
     voice_id: body.voice_id,
+    round_id: round.round_id,
+    dataset_snapshot_id: datasetSnapshot.snapshot_id,
     runpod_pod_id: null,
     job_token: jobToken,
     status: "pending",
@@ -3840,6 +4231,12 @@ app.post("/start", async (c) => {
     progress: {},
     summary: initialSummary,
     metrics: {},
+    supervisor: {
+      phase: "pending",
+      checks: 0,
+      recovery_attempts: 0,
+      last_transition_at: now,
+    },
     dataset_r2_prefix: datasetPrefix,
     log_r2_prefix: null,
     error_message: null,
@@ -3850,6 +4247,14 @@ app.post("/start", async (c) => {
     updated_at: now,
   };
 
+  await updateVoice(c.env.DB, body.voice_id, {
+    active_round_id: round.round_id,
+    candidate_checkpoint_r2_prefix: null,
+    candidate_run_name: null,
+    candidate_epoch: null,
+    candidate_score: null,
+    candidate_job_id: null,
+  });
   await createTrainingJob(c.env.DB, job);
   const jobConfig = {
     voice_id: body.voice_id,
@@ -3875,8 +4280,11 @@ app.post("/start", async (c) => {
     job_token: jobToken,
     worker_api_url: workerUrl,
     whisper_language: typeof effectiveConfig.whisper_language === "string" ? effectiveConfig.whisper_language : undefined,
-    dataset_signature: datasetSignatureInfo?.signature ?? undefined,
-    preprocess_cache_r2_prefix: preprocessCache?.cache_r2_prefix ?? undefined,
+    dataset_signature: datasetSignature,
+    dataset_snapshot_id: datasetSnapshot.snapshot_id,
+    training_round_id: round.round_id,
+    preprocess_cache_r2_prefix:
+      datasetSnapshot.cache_r2_prefix ?? preprocessCache?.cache_r2_prefix ?? undefined,
   };
   await c.env.R2.put(`jobs/${jobId}/config.json`, JSON.stringify(jobConfig), {
     httpMetadata: { contentType: "application/json" },
@@ -3896,6 +4304,15 @@ app.post("/start", async (c) => {
       error_message: errMsg,
       completed_at: Date.now(),
     });
+    await updateTrainingRound(c.env.DB, round.round_id, {
+      status: "failed",
+      completed_at: Date.now(),
+      summary: {
+        dataset_snapshot_id: datasetSnapshot.snapshot_id,
+        failed_job_id: jobId,
+        error_message: errMsg,
+      },
+    });
     // Re-throw to let the global error handler return appropriate status
     throw podError;
   }
@@ -3908,6 +4325,23 @@ app.post("/start", async (c) => {
       ...(job.summary ?? {}),
       ...launchResult.summary,
     },
+    supervisor: {
+      ...(job.supervisor ?? {}),
+      phase: "provisioning",
+      last_transition_at: Date.now(),
+      last_pod_id: launchResult.pod.podId,
+    },
+  });
+
+  await updateTrainingRound(c.env.DB, round.round_id, {
+    status: "running",
+    started_at: Date.now(),
+    summary: {
+      dataset_snapshot_id: datasetSnapshot.snapshot_id,
+      initial_job_id: jobId,
+      training_image_name: launchResult.summary.training_image_name ?? null,
+      training_resolved_image_name: launchResult.summary.training_resolved_image_name ?? null,
+    },
   });
 
   const persistedJob = await getTrainingJob(c.env.DB, jobId);
@@ -3919,6 +4353,8 @@ app.post("/start", async (c) => {
 
   return c.json({
     job_id: jobId,
+    round_id: round.round_id,
+    dataset_snapshot_id: datasetSnapshot.snapshot_id,
     status: reconciled.status,
     progress: reconciled.progress,
   });
@@ -3953,6 +4389,39 @@ app.get("/jobs", async (c) => {
   );
 
   return c.json({ jobs: hydratedJobs.map(serializeTrainingJob) });
+});
+
+app.get("/rounds", async (c) => {
+  const voiceId = c.req.query("voice_id")?.trim();
+  const limitRaw = c.req.query("limit");
+  const parsedLimit = Number(limitRaw ?? "20");
+  const limit = Number.isFinite(parsedLimit) ? parsedLimit : 20;
+  const rounds = await listTrainingRounds(c.env.DB, {
+    voice_id: voiceId || undefined,
+    limit,
+  });
+  return c.json({ rounds: rounds.map(serializeTrainingRound) });
+});
+
+app.get("/rounds/:round_id", async (c) => {
+  const roundId = c.req.param("round_id");
+  const round = await getTrainingRound(c.env.DB, roundId);
+  if (!round) {
+    return c.json({ detail: { message: "Training round not found" } }, 404);
+  }
+  return c.json(serializeTrainingRound(round));
+});
+
+app.get("/snapshots", async (c) => {
+  const voiceId = c.req.query("voice_id")?.trim();
+  const limitRaw = c.req.query("limit");
+  const parsedLimit = Number(limitRaw ?? "20");
+  const limit = Number.isFinite(parsedLimit) ? parsedLimit : 20;
+  const snapshots = await listDatasetSnapshots(c.env.DB, {
+    voice_id: voiceId || undefined,
+    limit,
+  });
+  return c.json({ snapshots: snapshots.map(serializeDatasetSnapshot) });
 });
 
 app.get("/:job_id/logs", async (c) => {
@@ -4081,6 +4550,17 @@ app.patch("/:job_id/preprocess-cache", async (c) => {
     reference_profile_r2_key: profileKey,
     updated_at: now,
   });
+  if (job.dataset_snapshot_id) {
+    const snapshot = await getDatasetSnapshotById(c.env.DB, job.dataset_snapshot_id);
+    if (snapshot) {
+      await upsertDatasetSnapshot(c.env.DB, {
+        ...snapshot,
+        reference_profile_r2_key: profileKey,
+        reference_text: profile.reference_text as string,
+        updated_at: now,
+      });
+    }
+  }
 
   return c.json({
     status: "ok",
@@ -4155,6 +4635,16 @@ app.patch("/:job_id/preprocess-cache/entries/:entry_id", async (c) => {
     ...resolved.cache,
     updated_at: now,
   });
+  if (job.dataset_snapshot_id) {
+    const snapshot = await getDatasetSnapshotById(c.env.DB, job.dataset_snapshot_id);
+    if (snapshot) {
+      await upsertDatasetSnapshot(c.env.DB, {
+        ...snapshot,
+        train_raw_r2_key: resolved.cache.train_raw_r2_key,
+        updated_at: now,
+      });
+    }
+  }
 
   return c.json({
     status: "ok",
@@ -4372,6 +4862,12 @@ app.post("/:job_id/promote", async (c) => {
     checkpoint_r2_prefix: candidate.prefix,
     run_name: parseRunNameFromCheckpointPrefix(candidate.prefix),
     epoch: candidate.epoch,
+    candidate_checkpoint_r2_prefix: null,
+    candidate_run_name: null,
+    candidate_epoch: null,
+    candidate_score: null,
+    candidate_job_id: null,
+    active_round_id: job.round_id ?? voice.active_round_id ?? null,
     settings: resolvePromotionSettings(voice, candidate.preset),
   });
 
@@ -4388,7 +4884,33 @@ app.post("/:job_id/promote", async (c) => {
       manual_promoted_score: candidate.score,
       manual_promotion_at: Date.now(),
     },
+    supervisor: {
+      ...(job.supervisor ?? {}),
+      phase: "promoted",
+      last_transition_at: Date.now(),
+    },
   });
+
+  if (job.round_id) {
+    await updateTrainingRound(c.env.DB, job.round_id, {
+      status: "promoted",
+      production_checkpoint_r2_prefix: candidate.prefix,
+      production_run_name: parseRunNameFromCheckpointPrefix(candidate.prefix),
+      production_epoch: candidate.epoch,
+      candidate_checkpoint_r2_prefix: null,
+      candidate_run_name: null,
+      candidate_epoch: null,
+      candidate_score: null,
+      candidate_job_id: null,
+      completed_at: Date.now(),
+      summary: {
+        manual_promoted_checkpoint_prefix: candidate.prefix,
+        manual_promoted_checkpoint_epoch: candidate.epoch,
+        manual_promoted_score: candidate.score,
+        manual_promotion_at: Date.now(),
+      },
+    });
+  }
 
   const updatedVoice = await getVoice(c.env.DB, job.voice_id);
   const updatedJob = await getTrainingJob(c.env.DB, jobId);
