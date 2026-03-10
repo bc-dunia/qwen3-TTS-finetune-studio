@@ -38,6 +38,7 @@ import {
   invokeServerlessAsync,
   terminatePod,
 } from "../lib/runpod";
+import { buildTrainingAdvice } from "../lib/training-advisor";
 import { enrichOutputWithReviewAsr } from "../lib/review-asr";
 import { authMiddleware } from "../middleware/auth";
 import type {
@@ -4431,6 +4432,32 @@ app.get("/jobs", async (c) => {
   );
 
   return c.json({ jobs: hydratedJobs.map(serializeTrainingJob) });
+});
+
+app.get("/advice", async (c) => {
+  const voiceId = c.req.query("voice_id")?.trim();
+  if (!voiceId) {
+    return c.json({ detail: { message: "voice_id is required" } }, 400);
+  }
+
+  const voice = await getVoice(c.env.DB, voiceId);
+  if (!voice) {
+    return c.json({ detail: { message: "Voice not found" } }, 404);
+  }
+
+  const limitRaw = c.req.query("limit");
+  const parsedLimit = Number(limitRaw ?? "40");
+  const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(parsedLimit, 100)) : 40;
+  const jobs = await listTrainingJobs(c.env.DB, {
+    voice_id: voiceId,
+    limit,
+  });
+
+  return c.json({
+    advice: buildTrainingAdvice(voice, jobs),
+    voice_id: voiceId,
+    jobs_considered: jobs.length,
+  });
 });
 
 app.get("/rounds", async (c) => {

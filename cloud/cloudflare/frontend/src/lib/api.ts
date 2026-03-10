@@ -90,6 +90,26 @@ export interface TrainingConfig {
   gpu_type_id?: string
 }
 
+export type TrainingAdviceMode =
+  | 'compare-first'
+  | 'dataset-first'
+  | 'tone-explore'
+  | 'stability-reset'
+  | 'checkpoint-window'
+  | 'hold-current'
+
+export interface TrainingAdvice {
+  mode: TrainingAdviceMode
+  title: string
+  summary: string
+  confidence: 'high' | 'medium'
+  reasons: string[]
+  suggestedConfig: TrainingConfig | null
+  compareFirst: boolean
+  reviewDatasetFirst: boolean
+  primaryActionLabel?: string
+}
+
 export interface TrainingJob {
   job_id: string
   round_id?: string | null
@@ -589,6 +609,18 @@ export async function fetchDatasetSnapshots(
   params.set('limit', String(limit))
   if (voiceId) params.set('voice_id', voiceId)
   return request<{ snapshots: DatasetSnapshot[] }>(`/v1/training/snapshots?${params.toString()}`)
+}
+
+export async function fetchTrainingAdvice(
+  voiceId: string,
+  limit = 40,
+): Promise<{ advice: TrainingAdvice | null; voice_id: string; jobs_considered: number }> {
+  const params = new URLSearchParams()
+  params.set('voice_id', voiceId)
+  params.set('limit', String(limit))
+  return request<{ advice: TrainingAdvice | null; voice_id: string; jobs_considered: number }>(
+    `/v1/training/advice?${params.toString()}`,
+  )
 }
 
 export async function cancelTrainingJob(

@@ -101,6 +101,26 @@ export interface TrainingConfig {
   [key: string]: unknown;
 }
 
+export type TrainingAdviceMode =
+  | "compare-first"
+  | "dataset-first"
+  | "tone-explore"
+  | "stability-reset"
+  | "checkpoint-window"
+  | "hold-current";
+
+export interface TrainingAdvice {
+  mode: TrainingAdviceMode;
+  title: string;
+  summary: string;
+  confidence: "high" | "medium";
+  reasons: string[];
+  suggestedConfig: TrainingConfig | null;
+  compareFirst: boolean;
+  reviewDatasetFirst: boolean;
+  primaryActionLabel?: string;
+}
+
 export interface TrainingProgress {
   epoch?: number;
   step?: number;

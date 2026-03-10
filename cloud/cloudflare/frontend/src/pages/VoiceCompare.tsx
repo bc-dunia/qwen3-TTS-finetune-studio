@@ -4,6 +4,7 @@ import { AudioPlayer } from '../components/AudioPlayer'
 import { TrainingAdviceCard } from '../components/TrainingAdviceCard'
 import {
   DEFAULT_VOICE_SETTINGS,
+  fetchTrainingAdvice,
   fetchTrainingJobs,
   fetchVoice,
   formatDate,
@@ -14,6 +15,7 @@ import {
   promoteTrainingCheckpoint,
   startSpeechGenerationAsync,
   type SpeechGenerationOptions,
+  type TrainingAdvice,
   type TrainingJob,
   type Voice,
   type VoiceSettings,
@@ -467,12 +469,16 @@ export function VoiceCompare() {
   const [generating, setGenerating] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const [applyingCandidateId, setApplyingCandidateId] = useState('')
+  const [serverTrainingAdvice, setServerTrainingAdvice] = useState<TrainingAdvice | null>(null)
 
   const requestedJobId = searchParams.get('job') ?? ''
   const trainingResetAt = getTrainingResetAt(voice)
   const cycleJobs = trainingResetAt === null
     ? jobs
     : jobs.filter((job) => job.created_at >= trainingResetAt)
+  const cycleJobsAdviceSignature = cycleJobs
+    .map((job) => `${job.job_id}:${job.status}:${job.updated_at ?? job.created_at}:${job.summary?.validation_checked === true ? 1 : 0}`)
+    .join('|')
   const archivedJobsCount = Math.max(0, jobs.length - cycleJobs.length)
   const attemptNumbers = buildAttemptNumbers(cycleJobs)
   const runSummaries = buildRunSummaries(cycleJobs, attemptNumbers)
@@ -495,7 +501,8 @@ export function VoiceCompare() {
   const hasWatchableJobs = cycleJobs.some((job) =>
     ACTIVE_TRAINING_STATUSES.has(job.status) || job.summary?.validation_checked !== true,
   )
-  const trainingAdvice = buildTrainingAdvice(voice, cycleJobs)
+  const localTrainingAdvice = buildTrainingAdvice(voice, cycleJobs)
+  const trainingAdvice = serverTrainingAdvice ?? localTrainingAdvice
 
   async function loadData(options?: { silent?: boolean }) {
     if (!voiceId) return
@@ -536,6 +543,34 @@ export function VoiceCompare() {
 
     return () => clearInterval(interval)
   }, [voiceId, hasWatchableJobs])
+
+  useEffect(() => {
+    if (!voice) {
+      setServerTrainingAdvice(null)
+      return
+    }
+
+    const voiceId = voice.voice_id
+    let cancelled = false
+
+    async function loadTrainingAdvice() {
+      try {
+        const response = await fetchTrainingAdvice(voiceId, 100)
+        if (!cancelled) {
+          setServerTrainingAdvice(response.advice)
+        }
+      } catch {
+        if (!cancelled) {
+          setServerTrainingAdvice(null)
+        }
+      }
+    }
+
+    void loadTrainingAdvice()
+    return () => {
+      cancelled = true
+    }
+  }, [voice?.voice_id, cycleJobsAdviceSignature])
 
   useEffect(() => {
     if (candidates.length === 0) return

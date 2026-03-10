@@ -1,6 +1,5 @@
 import { Link } from 'react-router'
-import type { TrainingConfig } from '../lib/api'
-import type { TrainingAdvice } from '../lib/trainingAdvisor'
+import type { TrainingAdvice, TrainingConfig } from '../lib/api'
 
 function formatSuggestedConfig(config: TrainingConfig): string {
   return `batch=${config.batch_size} epochs=${config.num_epochs} lr=${config.learning_rate} grad_acc=${config.gradient_accumulation_steps ?? 4} subtalker=${config.subtalker_loss_weight ?? 0} seed=${config.seed ?? 0} gpu=${config.gpu_type_id ?? 'auto'}`
@@ -32,7 +31,12 @@ export function TrainingAdviceCard({
     <div className="rounded-xl border border-edge bg-raised p-5 space-y-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <div className="text-heading text-sm font-semibold">Training Advisor</div>
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="text-heading text-sm font-semibold">Training Advisor</div>
+            <span className="rounded-full border border-edge bg-surface px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider text-muted">
+              {advice.mode}
+            </span>
+          </div>
           <div className="mt-1 text-primary text-sm">{advice.title}</div>
         </div>
         <span className={`rounded-full px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider ${CONFIDENCE_STYLES[advice.confidence]}`}>
@@ -63,7 +67,7 @@ export function TrainingAdviceCard({
             className="inline-flex items-center rounded-lg bg-accent px-3 py-2 text-[11px] font-semibold text-void transition-colors hover:bg-accent-light"
             type="button"
           >
-            Apply Suggested Setup
+            {advice.primaryActionLabel ?? 'Apply Suggested Setup'}
           </button>
         )}
         {advice.compareFirst && showCompareLink && (

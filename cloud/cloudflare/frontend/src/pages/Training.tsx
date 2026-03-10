@@ -4,6 +4,7 @@ import {
   fetchVoices,
   fetchVoiceDatasets,
   fetchTrainingJobs,
+  fetchTrainingAdvice,
   fetchTrainingRounds,
   fetchDatasetSnapshots,
   startTraining,
@@ -23,6 +24,7 @@ import {
   type Voice,
   type TrainingJob,
   type TrainingConfig,
+  type TrainingAdvice,
   updateTrainingPreprocessCache,
   updateTrainingPreprocessEntry,
   formatDateTime,
@@ -284,6 +286,7 @@ export function Training() {
   const [jobs, setJobs] = useState<TrainingJob[]>([])
   const [rounds, setRounds] = useState<TrainingRound[]>([])
   const [snapshots, setSnapshots] = useState<DatasetSnapshot[]>([])
+  const [serverTrainingAdvice, setServerTrainingAdvice] = useState<TrainingAdvice | null>(null)
   const [loadingJobs, setLoadingJobs] = useState(false)
   const jobsRef = useRef<TrainingJob[]>([])
   const requestedVoiceId = searchParams.get('voiceId') ?? ''
@@ -358,12 +361,16 @@ export function Training() {
   const selectedVoiceJobs = jobs
     .filter((job) => job.voice_id === selectedVoiceId)
     .filter((job) => selectedVoiceResetAt === null || job.created_at >= selectedVoiceResetAt)
+  const selectedVoiceAdviceSignature = selectedVoiceJobs
+    .map((job) => `${job.job_id}:${job.status}:${job.updated_at ?? job.created_at}:${job.summary?.validation_checked === true ? 1 : 0}`)
+    .join('|')
   const selectedVoiceRounds = rounds.filter((round) => round.voice_id === selectedVoiceId)
   const selectedVoiceSnapshots = snapshots.filter((snapshot) => snapshot.voice_id === selectedVoiceId)
   const activeRound = selectedVoiceRounds.find((round) => round.round_id === selectedVoice?.active_round_id) ?? selectedVoiceRounds[0] ?? null
   const selectedDatasetSnapshot =
     selectedVoiceSnapshots.find((snapshot) => snapshot.dataset_name === effectiveDatasetName) ?? null
-  const trainingAdvice = buildTrainingAdvice(selectedVoice ?? null, selectedVoiceJobs)
+  const localTrainingAdvice = buildTrainingAdvice(selectedVoice ?? null, selectedVoiceJobs)
+  const trainingAdvice = serverTrainingAdvice ?? localTrainingAdvice
 
   useEffect(() => {
     if (!selectedVoice) return
@@ -377,6 +384,34 @@ export function Training() {
     setSaveEveryNEpochs(preset.saveEveryNEpochs)
     setGpuTypeId(preset.gpuTypeId)
   }, [selectedVoice?.voice_id, selectedVoice?.model_size])
+
+  useEffect(() => {
+    if (!selectedVoice) {
+      setServerTrainingAdvice(null)
+      return
+    }
+
+    const voiceId = selectedVoice.voice_id
+    let cancelled = false
+
+    async function loadTrainingAdvice() {
+      try {
+        const response = await fetchTrainingAdvice(voiceId, 100)
+        if (!cancelled) {
+          setServerTrainingAdvice(response.advice)
+        }
+      } catch {
+        if (!cancelled) {
+          setServerTrainingAdvice(null)
+        }
+      }
+    }
+
+    void loadTrainingAdvice()
+    return () => {
+      cancelled = true
+    }
+  }, [selectedVoice?.voice_id, selectedVoiceAdviceSignature])
 
   useEffect(() => {
     if (!selectedVoice) {
