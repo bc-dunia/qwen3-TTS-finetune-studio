@@ -1847,6 +1847,23 @@ const recoverFailedDependencyJob = async (
     return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
   }
 
+  const voice = await getVoice(c.env.DB, job.voice_id);
+  if (
+    voice?.active_round_id &&
+    job.round_id &&
+    voice.active_round_id !== job.round_id
+  ) {
+    await updateTrainingJob(c.env.DB, job.job_id, {
+      summary: {
+        ...summary,
+        training_image_recovery_deferred: true,
+        training_image_recovery_deferred_reason: "obsolete_round",
+        active_round_id: voice.active_round_id,
+      },
+    });
+    return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
+  }
+
   if (job.runpod_pod_id) {
     await terminatePod(c.env, job.runpod_pod_id).catch(() => false);
   }
