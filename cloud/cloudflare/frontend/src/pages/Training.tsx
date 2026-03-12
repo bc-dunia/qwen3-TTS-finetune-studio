@@ -7,7 +7,10 @@ import {
   fetchTrainingAdvice,
   fetchTrainingRounds,
   fetchDatasetSnapshots,
+  fetchTrainingCampaign,
   startTraining,
+  createTrainingCampaign,
+  cancelTrainingCampaign,
   fetchTrainingJob,
   cancelTrainingJob,
   reconcileTrainingJob,
@@ -27,6 +30,7 @@ import {
   type TrainingJob,
   type TrainingConfig,
   type TrainingAdvice,
+  type TrainingCampaign,
   updateTrainingPreprocessCache,
   updateTrainingPreprocessEntry,
   formatDateTime,
@@ -121,6 +125,30 @@ function readTimestamp(value: unknown): number | null {
   }
 
   return null
+}
+
+function getJobRecency(job: TrainingJob): number {
+  return (
+    readTimestamp(job.updated_at) ??
+    readTimestamp(job.last_heartbeat_at) ??
+    readTimestamp(job.completed_at) ??
+    readTimestamp(job.created_at) ??
+    0
+  )
+}
+
+function mergeJobsPreferFreshest(current: TrainingJob[], incoming: TrainingJob[]): TrainingJob[] {
+  const merged = new Map<string, TrainingJob>()
+  for (const job of current) {
+    merged.set(job.job_id, job)
+  }
+  for (const job of incoming) {
+    const existing = merged.get(job.job_id)
+    if (!existing || getJobRecency(job) >= getJobRecency(existing)) {
+      merged.set(job.job_id, job)
+    }
+  }
+  return [...merged.values()]
 }
 
 function average(values: number[]): number | null {
@@ -267,6 +295,11 @@ export function Training() {
   const [loadingDatasets, setLoadingDatasets] = useState(false)
   const [selectedDatasetName, setSelectedDatasetName] = useState('')
   const [starting, setStarting] = useState(false)
+  const [startingCampaign, setStartingCampaign] = useState(false)
+  const [campaignAttempts, setCampaignAttempts] = useState(3)
+  const [campaignParallelism, setCampaignParallelism] = useState(1)
+  const [activeCampaignId, setActiveCampaignId] = useState<string | null>(null)
+  const [activeCampaign, setActiveCampaign] = useState<TrainingCampaign | null>(null)
   const [formError, setFormError] = useState('')
 
   // Jobs
@@ -476,6 +509,11 @@ export function Training() {
   }, [selectedVoiceId])
 
   useEffect(() => {
+    setActiveCampaignId(null)
+    setActiveCampaign(null)
+  }, [selectedVoiceId])
+
+  useEffect(() => {
     if (!hasActiveJobs) return
 
     const interval = setInterval(async () => {
@@ -503,6 +541,45 @@ export function Training() {
 
     return () => clearInterval(interval)
   }, [hasActiveJobs])
+
+  useEffect(() => {
+    if (!activeCampaignId) return
+    const campaignId = activeCampaignId
+    let cancelled = false
+
+    async function pollCampaign() {
+      try {
+        const response = await fetchTrainingCampaign(campaignId)
+        if (cancelled) return
+        setActiveCampaign(response.campaign)
+        setJobs((prev) => mergeJobsPreferFreshest(prev, response.attempts))
+        if (
+          response.campaign.status === 'completed' ||
+          response.campaign.status === 'failed' ||
+          response.campaign.status === 'blocked_dataset' ||
+          response.campaign.status === 'blocked_budget' ||
+          response.campaign.status === 'cancelled'
+        ) {
+          setActiveCampaignId(null)
+          return
+        }
+      } catch {
+        if (!cancelled) {
+          setActiveCampaign(null)
+        }
+      }
+    }
+
+    void pollCampaign()
+    const interval = setInterval(() => {
+      void pollCampaign()
+    }, 5000)
+
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [activeCampaignId])
 
   async function handleStartTraining(e: { preventDefault: () => void }) {
     e.preventDefault()
@@ -562,6 +639,50 @@ export function Training() {
       setFormError(err instanceof Error ? err.message : 'Failed to start training')
     } finally {
       setStarting(false)
+    }
+  }
+
+  async function handleStartCampaign() {
+    if (!selectedVoiceId) return
+    setStartingCampaign(true)
+    setFormError('')
+    const baseConfigOverrides: TrainingConfig = {
+      batch_size: batchSize,
+      num_epochs: epochs,
+      learning_rate: learningRate,
+      model_size: selectedVoice?.model_size,
+      gradient_accumulation_steps: gradientAccumulationSteps,
+      subtalker_loss_weight: subtalkerLossWeight,
+      save_every_n_epochs: saveEveryNEpochs,
+      seed: trainingSeed,
+      whisper_language: trainingLanguage,
+      gpu_type_id: gpuTypeId,
+    }
+    try {
+      const response = await createTrainingCampaign(selectedVoiceId, {
+        datasetName: effectiveDatasetName || undefined,
+        attemptCount: Math.max(1, Math.min(Math.trunc(campaignAttempts), 12)),
+        parallelism: Math.max(1, Math.min(Math.trunc(campaignParallelism), 3)),
+        baseConfigOverrides,
+      })
+      setActiveCampaign(response.campaign)
+      setActiveCampaignId(response.campaign.campaign_id)
+      setJobs((prev) => mergeJobsPreferFreshest(prev, response.attempts))
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : 'Failed to start campaign')
+    } finally {
+      setStartingCampaign(false)
+    }
+  }
+
+  async function handleCancelCampaign() {
+    if (!activeCampaignId) return
+    try {
+      const response = await cancelTrainingCampaign(activeCampaignId)
+      setActiveCampaign(response.campaign)
+      setJobs((prev) => mergeJobsPreferFreshest(prev, response.attempts))
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : 'Failed to cancel campaign')
     }
   }
 
@@ -937,6 +1058,63 @@ export function Training() {
                 {formError}
               </div>
             )}
+
+            <div className="rounded-lg border border-edge bg-surface px-3 py-3 space-y-3">
+              <div className="flex items-center justify-between">
+                <span className="text-primary text-xs font-semibold">Autopilot Campaign</span>
+                {activeCampaign ? (
+                  <span className="text-[10px] font-mono text-muted">{activeCampaign.status}</span>
+                ) : null}
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <label className="text-subtle text-[10px] font-medium">
+                  Attempts
+                  <input
+                    type="number"
+                    min={1}
+                    max={12}
+                    value={campaignAttempts}
+                    onChange={(e) => setCampaignAttempts(parseInt(e.target.value, 10) || 1)}
+                    className="mt-1 w-full bg-raised border border-edge rounded-lg px-2 py-1.5 text-xs text-primary font-mono"
+                  />
+                </label>
+                <label className="text-subtle text-[10px] font-medium">
+                  Parallelism
+                  <input
+                    type="number"
+                    min={1}
+                    max={3}
+                    value={campaignParallelism}
+                    onChange={(e) => setCampaignParallelism(parseInt(e.target.value, 10) || 1)}
+                    className="mt-1 w-full bg-raised border border-edge rounded-lg px-2 py-1.5 text-xs text-primary font-mono"
+                  />
+                </label>
+              </div>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => void handleStartCampaign()}
+                  disabled={!selectedVoiceId || startingCampaign || voices.length === 0}
+                  className="flex-1 rounded-lg border border-edge px-3 py-2 text-[11px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent disabled:opacity-40"
+                >
+                  {startingCampaign ? 'Starting campaign...' : 'Start Autopilot'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleCancelCampaign()}
+                  disabled={!activeCampaignId || activeCampaign?.status === 'cancelled'}
+                  className="rounded-lg border border-edge px-3 py-2 text-[11px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent disabled:opacity-40"
+                >
+                  Cancel
+                </button>
+              </div>
+              {activeCampaign ? (
+                <div className="rounded-lg border border-edge px-3 py-2 text-[10px] font-mono text-subtle">
+                  campaign={activeCampaign.campaign_id.slice(0, 8)} attempts={Number(activeCampaign.summary.attempts_created ?? 0)}/
+                  {activeCampaign.attempt_count}
+                </div>
+              ) : null}
+            </div>
 
             {/* Submit */}
             <button

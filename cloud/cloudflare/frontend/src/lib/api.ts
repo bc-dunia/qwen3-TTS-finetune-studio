@@ -72,6 +72,48 @@ export interface TrainingStartOptions {
   datasetName?: string
 }
 
+export type TrainingCampaignStatus =
+  | 'planning'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'blocked_dataset'
+  | 'blocked_budget'
+  | 'cancelled'
+
+export interface TrainingCampaignStopRules {
+  max_infra_failures?: number
+  max_asr_failures?: number
+  min_score_improvement?: number
+  stagnation_window?: number
+}
+
+export interface TrainingCampaign {
+  campaign_id: string
+  voice_id: string
+  dataset_name: string | null
+  dataset_r2_prefix: string | null
+  dataset_snapshot_id: string | null
+  attempt_count: number
+  parallelism: number
+  status: TrainingCampaignStatus
+  base_config: TrainingConfig
+  stop_rules: TrainingCampaignStopRules
+  planner_state: Record<string, unknown>
+  summary: Record<string, unknown>
+  created_at: number
+  updated_at: number
+  completed_at: number | null
+}
+
+export interface CreateTrainingCampaignOptions {
+  datasetName?: string
+  attemptCount: number
+  parallelism?: number
+  baseConfigOverrides?: TrainingConfig
+  stopRules?: TrainingCampaignStopRules
+}
+
 export interface TrainingProgress {
   epoch?: number
   total_epochs?: number
@@ -188,6 +230,8 @@ export interface TrainingAdvice {
 
 export interface TrainingJob {
   job_id: string
+  campaign_id?: string | null
+  attempt_index?: number | null
   round_id?: string | null
   dataset_snapshot_id?: string | null
   status:
@@ -719,6 +763,38 @@ export async function fetchTrainingAdvice(
   return request<{ advice: TrainingAdvice | null; voice_id: string; jobs_considered: number }>(
     `/v1/training/advice?${params.toString()}`,
   )
+}
+
+export async function createTrainingCampaign(
+  voiceId: string,
+  options: CreateTrainingCampaignOptions,
+): Promise<{ campaign: TrainingCampaign; attempts: TrainingJob[] }> {
+  return request<{ campaign: TrainingCampaign; attempts: TrainingJob[] }>('/v1/training/campaigns', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      voice_id: voiceId,
+      dataset_name: options.datasetName,
+      attempt_count: options.attemptCount,
+      parallelism: options.parallelism,
+      base_config_overrides: options.baseConfigOverrides,
+      stop_rules: options.stopRules,
+    }),
+  })
+}
+
+export async function fetchTrainingCampaign(
+  campaignId: string,
+): Promise<{ campaign: TrainingCampaign; attempts: TrainingJob[] }> {
+  return request<{ campaign: TrainingCampaign; attempts: TrainingJob[] }>(`/v1/training/campaigns/${campaignId}`)
+}
+
+export async function cancelTrainingCampaign(
+  campaignId: string,
+): Promise<{ campaign: TrainingCampaign; attempts: TrainingJob[] }> {
+  return request<{ campaign: TrainingCampaign; attempts: TrainingJob[] }>(`/v1/training/campaigns/${campaignId}/cancel`, {
+    method: 'POST',
+  })
 }
 
 export async function cancelTrainingJob(
