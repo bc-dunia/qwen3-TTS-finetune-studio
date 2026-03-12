@@ -2,8 +2,8 @@ import type { Env, TrainingAdvice, TrainingAdviceMode, TrainingConfig, TrainingJ
 import { buildTrainingCheckoutSearch } from "./training-checkout";
 import { sanitizeConfig, diversifyAdviceForActiveRuns, isAdviceActiveJob } from "./training-advisor";
 
-const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
-const DEFAULT_ADVISOR_MODEL = "gpt-4.1";
+const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
+const DEFAULT_ADVISOR_MODEL = "gpt-5.4";
 
 const VALID_MODES: Set<string> = new Set([
   "compare-first",
@@ -316,7 +316,7 @@ export async function buildLLMTrainingAdvice(
 
   const userPrompt = buildUserPrompt(voice, jobs);
 
-  const response = await fetch(OPENAI_API_URL, {
+  const response = await fetch(OPENAI_RESPONSES_URL, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -326,12 +326,12 @@ export async function buildLLMTrainingAdvice(
       model:
         String(env.OPENAI_ADVISOR_MODEL ?? DEFAULT_ADVISOR_MODEL).trim() ||
         DEFAULT_ADVISOR_MODEL,
-      messages: [
+      input: [
         { role: "system", content: SYSTEM_PROMPT },
         { role: "user", content: userPrompt },
       ],
-      temperature: 0.4,
-      response_format: { type: "json_object" },
+      reasoning: { effort: "high" },
+      text: { format: { type: "json_object" } },
     }),
   });
 
@@ -342,15 +342,7 @@ export async function buildLLMTrainingAdvice(
   }
 
   const payload = (await response.json()) as Record<string, unknown>;
-  const choices = Array.isArray(payload.choices) ? payload.choices : [];
-  const message =
-    choices[0] && typeof choices[0] === "object"
-      ? (choices[0] as Record<string, unknown>).message
-      : null;
-  const content =
-    message && typeof message === "object" && typeof (message as Record<string, unknown>).content === "string"
-      ? ((message as Record<string, unknown>).content as string)
-      : "";
+  const content = typeof payload.output_text === "string" ? payload.output_text : "";
 
   if (!content) {
     console.warn("LLM advisor returned empty content");
