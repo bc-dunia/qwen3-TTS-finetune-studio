@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import {
   createTrainingRound,
+  createTrainingCampaign,
   createTrainingJob,
   deleteTrainingLogChunks,
   getDatasetPreprocessCache,
@@ -13,15 +14,18 @@ import {
   listDatasetSnapshots,
   listTrainingRounds,
   getTrainingJob,
+  getTrainingCampaign,
   getTrainingLogChunk,
   getTrainingRound,
   getVoice,
   listTrainingJobs,
+  listTrainingCampaigns,
   listTrainingLogChunks,
   listTrainingCheckoutLedger,
   replaceTrainingCheckoutLedgerForJob,
   replaceDatasetPreprocessCacheEntries,
   updateTrainingRound,
+  updateTrainingCampaign,
   updateDatasetPreprocessCacheEntry,
   upsertDatasetSnapshot,
   updateTrainingJob,
@@ -50,6 +54,9 @@ import type {
   AppContext,
   DatasetSnapshot,
   Env,
+  TrainingCampaign,
+  TrainingCampaignStatus,
+  TrainingCampaignStopRules,
   TrainingConfig,
   TrainingJob,
   TrainingProgress,
@@ -219,6 +226,21 @@ const ACTIVE_RUNTIME_RECOVERY_STATUSES = new Set([
   "training",
   "uploading",
 ]);
+
+const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "cancelled"]);
+const CAMPAIGN_ACTIVE_STATUSES = new Set<TrainingCampaignStatus>(["planning", "running"]);
+const DEFAULT_CAMPAIGN_ATTEMPT_COUNT = 3;
+const DEFAULT_CAMPAIGN_PARALLELISM = 1;
+const MAX_CAMPAIGN_ATTEMPTS = 12;
+
+type TrainingCampaignRequest = {
+  voice_id?: string;
+  dataset_name?: string;
+  attempt_count?: number;
+  parallelism?: number;
+  base_config_overrides?: TrainingConfig;
+  stop_rules?: TrainingCampaignStopRules;
+};
 const ACTIVE_STAGE_STALE_MS: Record<string, number> = {
   running: 12 * 60 * 1000,
   downloading: 10 * 60 * 1000,
@@ -1767,18 +1789,24 @@ const launchQueuedTrainingJobsForVoice = async (
     return 0;
   }
 
+  let latestJobs = [...jobs];
   let launched = 0;
-  for (const job of jobs) {
-    if (!(job.status === "queued" || job.status === "pending")) {
-      continue;
-    }
+  for (const seedJob of jobs) {
     if (activeCount >= activeLimit) {
       break;
     }
 
+    const job = latestJobs.find((candidate) => candidate.job_id === seedJob.job_id);
+    if (!job) {
+      continue;
+    }
+    if (!(job.status === "queued" || job.status === "pending")) {
+      continue;
+    }
+
     const preprocessReady = await hasReusablePreprocessArtifacts(c, job);
     if (!preprocessReady) {
-      const hasSiblingBuilder = jobs.some(
+      const hasSiblingBuilder = latestJobs.some(
         (candidate) =>
           candidate.job_id !== job.job_id &&
           ACTIVE_JOB_STATUSES.has(candidate.status) &&
@@ -1792,12 +1820,562 @@ const launchQueuedTrainingJobsForVoice = async (
 
     const updated = await launchTrainingJob(c, job);
     if (ACTIVE_JOB_STATUSES.has(updated.status)) {
-      activeCount += 1;
       launched += 1;
+      activeCount += 1;
     }
+
+    latestJobs = latestJobs.map((candidate) =>
+      candidate.job_id === updated.job_id ? updated : candidate
+    );
   }
 
   return launched;
+};
+
+const getCampaignStopRule = (value: unknown, fallback: number): number => {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  return Math.max(1, Math.min(Math.trunc(numeric), 10));
+};
+
+const getCampaignFloatStopRule = (value: unknown, fallback: number): number => {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  return Math.max(0, Math.min(numeric, 1));
+};
+
+const getCampaignAttemptScore = (job: TrainingJob): number | null => {
+  const summary = (job.summary ?? {}) as Record<string, unknown>;
+  const fromValidation = readNumber(summary.validation_score);
+  if (fromValidation !== null) {
+    return fromValidation;
+  }
+  const fromSelected = readNumber(summary.selected_score);
+  if (fromSelected !== null) {
+    return fromSelected;
+  }
+  const fromCandidate = readNumber(summary.candidate_score);
+  if (fromCandidate !== null) {
+    return fromCandidate;
+  }
+  const fromChampion = readNumber(summary.champion_score);
+  if (fromChampion !== null) {
+    return fromChampion;
+  }
+  return null;
+};
+
+const isCampaignAttemptUniquenessError = (error: unknown): boolean => {
+  const message = String(error instanceof Error ? error.message : error).toLowerCase();
+  return (
+    message.includes("unique") &&
+    message.includes("training_jobs") &&
+    message.includes("campaign_id") &&
+    message.includes("attempt_index")
+  );
+};
+
+const isCampaignStateConflictError = (error: unknown): boolean => {
+  const message = String(error instanceof Error ? error.message : error).toLowerCase();
+  return message.includes("training_campaign_conflict");
+};
+
+const getCampaignConfigKey = (config: TrainingConfig): string =>
+  JSON.stringify({
+    model_size: config.model_size ?? null,
+    batch_size: config.batch_size ?? null,
+    learning_rate: config.learning_rate ?? null,
+    num_epochs: config.num_epochs ?? null,
+    gradient_accumulation_steps: (config as Record<string, unknown>).gradient_accumulation_steps ?? null,
+    subtalker_loss_weight: (config as Record<string, unknown>).subtalker_loss_weight ?? null,
+    save_every_n_epochs: (config as Record<string, unknown>).save_every_n_epochs ?? null,
+    whisper_language: config.whisper_language ?? null,
+    gpu_type_id: config.gpu_type_id ?? null,
+    seed: config.seed ?? null,
+  });
+
+const summarizeCampaignFailures = (jobs: TrainingJob[]): { asr: number; infra: number } => {
+  let asr = 0;
+  let infra = 0;
+  for (const job of jobs) {
+    if (!(job.status === "failed" || job.status === "cancelled")) {
+      continue;
+    }
+    const summary = (job.summary ?? {}) as Record<string, unknown>;
+    const rawMessage = String(
+      summary.validation_message ?? summary.last_message ?? summary.error_message ?? job.error_message ?? ""
+    ).toLowerCase();
+    if (rawMessage.includes("asr_score") || rawMessage.includes("missing asr")) {
+      asr += 1;
+    }
+    if (
+      rawMessage.includes("no audio") ||
+      rawMessage.includes("stalled") ||
+      rawMessage.includes("recovery") ||
+      rawMessage.includes("supply_constraint")
+    ) {
+      infra += 1;
+    }
+  }
+  return { asr, infra };
+};
+
+const buildCampaignAttemptConfig = (
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>,
+  campaign: TrainingCampaign,
+  attemptIndex: number,
+  voiceJobs: TrainingJob[]
+): TrainingConfig => {
+  const merged: TrainingConfig = {
+    ...(campaign.base_config ?? {}),
+  };
+  const existingSeed = Number(merged.seed ?? 303);
+  merged.seed = Number.isFinite(existingSeed)
+    ? existingSeed + Math.max(0, attemptIndex - 1) * 101
+    : 303 + Math.max(0, attemptIndex - 1) * 101;
+  if (attemptIndex > 1) {
+    const advice = buildTrainingAdvice(voice, voiceJobs);
+    if (advice?.suggestedConfig) {
+      Object.assign(merged, advice.suggestedConfig);
+    }
+  }
+  return merged;
+};
+
+const enqueueCampaignAttempt = async (
+  c: Context<AppContext>,
+  campaign: TrainingCampaign,
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>,
+  attemptIndex: number,
+  voiceJobs: TrainingJob[]
+): Promise<TrainingJob> => {
+  const now = Date.now();
+  const jobId = crypto.randomUUID();
+  const jobToken = crypto.randomUUID();
+  const workerUrl = getWorkerOrigin(c);
+  const runName = `run_${jobId.slice(0, 8)}`;
+  const requestedConfig = buildCampaignAttemptConfig(voice, campaign, attemptIndex, voiceJobs);
+  const requestedCfg = requestedConfig as Record<string, unknown>;
+  const modelSize =
+    typeof requestedConfig.model_size === "string" && requestedConfig.model_size
+      ? requestedConfig.model_size
+      : (voice.model_size || "1.7B");
+  const recommendedDefaults = getRecommendedTrainingDefaults(modelSize);
+  const requestedBatchSize = readNumber(requestedConfig.batch_size);
+  const requestedLearningRate = readNumber(requestedConfig.learning_rate);
+  const requestedNumEpochs = readNumber(requestedConfig.num_epochs ?? requestedCfg.epochs);
+  const requestedGradAccum = readNumber(requestedCfg.gradient_accumulation_steps);
+  const requestedSubtalker = readNumber(requestedCfg.subtalker_loss_weight);
+  const requestedSaveEvery = readNumber(requestedCfg.save_every_n_epochs);
+  const requestedSeed = readNumber(requestedCfg.seed);
+  const effectiveConfig: TrainingConfig = {
+    ...requestedConfig,
+    model_size: modelSize,
+    batch_size: requestedBatchSize ?? recommendedDefaults.batch_size,
+    learning_rate: requestedLearningRate ?? recommendedDefaults.learning_rate,
+    num_epochs: requestedNumEpochs ?? recommendedDefaults.num_epochs,
+    gradient_accumulation_steps: requestedGradAccum ?? recommendedDefaults.gradient_accumulation_steps,
+    subtalker_loss_weight: requestedSubtalker ?? recommendedDefaults.subtalker_loss_weight,
+    save_every_n_epochs: requestedSaveEvery ?? recommendedDefaults.save_every_n_epochs,
+    seed: requestedSeed ?? recommendedDefaults.seed,
+    gpu_type_id:
+      typeof requestedCfg.gpu_type_id === "string" && requestedCfg.gpu_type_id
+        ? requestedCfg.gpu_type_id
+        : recommendedDefaults.gpu_type_id,
+  };
+  if (typeof requestedCfg.whisper_language === "string" && requestedCfg.whisper_language.trim()) {
+    effectiveConfig.whisper_language = requestedCfg.whisper_language.trim();
+  }
+
+  const {
+    datasetPrefix,
+    datasetSignature,
+    datasetSignatureInfo,
+    datasetTrainRawKey,
+    datasetHasPreparedTrainRaw,
+    preprocessCache,
+    datasetSnapshot,
+  } = await (async () => {
+    if (campaign.dataset_snapshot_id) {
+      const frozenSnapshot = await getDatasetSnapshotById(c.env.DB, campaign.dataset_snapshot_id);
+      if (frozenSnapshot) {
+        const frozenPrefix = frozenSnapshot.dataset_r2_prefix;
+        const frozenObjects = await listAllR2Objects(c.env.R2, `${stripSlashes(frozenPrefix)}/`);
+        if (frozenObjects.length === 0) {
+          throw new Error(`Dataset not found at R2 prefix: ${frozenPrefix}/. Upload audio files first.`);
+        }
+
+        const trainRawKey = frozenSnapshot.train_raw_r2_key ?? getDatasetTrainRawR2Key(frozenPrefix);
+        const hasPrepared = Boolean(frozenSnapshot.train_raw_r2_key ?? (await c.env.R2.head(trainRawKey)));
+
+        return {
+          datasetPrefix: frozenPrefix,
+          datasetSignature: frozenSnapshot.dataset_signature,
+          datasetSignatureInfo: null,
+          datasetTrainRawKey: trainRawKey,
+          datasetHasPreparedTrainRaw: hasPrepared,
+          preprocessCache: null,
+          datasetSnapshot: frozenSnapshot,
+        };
+      }
+    }
+
+    const dynamicPrefix = resolveTrainingDatasetPrefix(voice, campaign.dataset_name ?? undefined);
+    const datasetObjects = await listAllR2Objects(c.env.R2, `${stripSlashes(dynamicPrefix)}/`);
+    if (datasetObjects.length === 0) {
+      throw new Error(`Dataset not found at R2 prefix: ${dynamicPrefix}/. Upload audio files first.`);
+    }
+
+    const signatureInfo = await computeDatasetSignature(dynamicPrefix, datasetObjects);
+    const signature = signatureInfo?.signature ?? buildSyntheticDatasetSignature(dynamicPrefix);
+    const trainRawKey = getDatasetTrainRawR2Key(dynamicPrefix);
+    const hasPrepared = Boolean(await c.env.R2.head(trainRawKey));
+    const cache =
+      signatureInfo !== null
+        ? await getDatasetPreprocessCache(c.env.DB, voice.voice_id, dynamicPrefix, signature)
+        : null;
+    const snapshot = await ensureDatasetSnapshot({
+      c,
+      voice,
+      datasetPrefix: dynamicPrefix,
+      datasetSignature: signature,
+      preprocessCache: cache,
+      sourceFileCount: signatureInfo?.sourceCount ?? null,
+      createdFromJobId: jobId,
+    });
+
+    return {
+      datasetPrefix: dynamicPrefix,
+      datasetSignature: signature,
+      datasetSignatureInfo: signatureInfo,
+      datasetTrainRawKey: trainRawKey,
+      datasetHasPreparedTrainRaw: hasPrepared,
+      preprocessCache: cache,
+      datasetSnapshot: snapshot,
+    };
+  })();
+
+  const siblingJobs = voiceJobs.filter((job) => job.dataset_snapshot_id === datasetSnapshot.snapshot_id);
+  const usedKeys = new Set(
+    siblingJobs.map((job) => {
+      const value = (job.summary ?? {}) as Record<string, unknown>;
+      return typeof value.campaign_config_key === "string" ? value.campaign_config_key : "";
+    })
+  );
+  const initialConfigKey = getCampaignConfigKey(effectiveConfig);
+  if (usedKeys.has(initialConfigKey)) {
+    effectiveConfig.seed = Number(effectiveConfig.seed ?? recommendedDefaults.seed) + attemptIndex * 97;
+  }
+  const configKey = getCampaignConfigKey(effectiveConfig);
+
+  const initialSummary: Record<string, unknown> = {
+    campaign_id: campaign.campaign_id,
+    attempt_index: attemptIndex,
+    campaign_config_key: configKey,
+    dataset_snapshot_id: datasetSnapshot.snapshot_id,
+    dataset_snapshot_status: datasetSnapshot.status,
+    dataset_snapshot_signature: datasetSnapshot.dataset_signature,
+    dataset_snapshot_name: datasetSnapshot.dataset_name,
+    preprocess_cache_lookup: preprocessCache ? "hit" : datasetHasPreparedTrainRaw ? "dataset_ready" : "miss",
+    preprocess_cache_dataset_signature: datasetSignature,
+    preprocess_cache_source_file_count: datasetSignatureInfo?.sourceCount ?? null,
+    preprocess_cache_r2_prefix: datasetSnapshot.cache_r2_prefix ?? preprocessCache?.cache_r2_prefix ?? null,
+    preprocess_cache_train_raw_r2_key:
+      preprocessCache?.train_raw_r2_key ?? (datasetHasPreparedTrainRaw ? datasetTrainRawKey : null),
+    queue_active_limit: getMaxActiveTrainingJobsPerVoice(c),
+  };
+
+  const job: TrainingJob = {
+    job_id: jobId,
+    voice_id: voice.voice_id,
+    campaign_id: campaign.campaign_id,
+    attempt_index: attemptIndex,
+    round_id: null,
+    dataset_snapshot_id: datasetSnapshot.snapshot_id,
+    runpod_pod_id: null,
+    job_token: jobToken,
+    status: "queued",
+    config: effectiveConfig,
+    progress: {},
+    summary: initialSummary,
+    metrics: {},
+    supervisor: {
+      phase: "queued",
+      checks: 0,
+      recovery_attempts: 0,
+      last_transition_at: now,
+    },
+    dataset_r2_prefix: datasetPrefix,
+    log_r2_prefix: null,
+    error_message: null,
+    last_heartbeat_at: null,
+    started_at: null,
+    completed_at: null,
+    created_at: now,
+    updated_at: now,
+  };
+  await createTrainingJob(c.env.DB, job);
+
+  const jobConfig = {
+    voice_id: voice.voice_id,
+    dataset_r2_prefix: datasetPrefix,
+    speaker_name: voice.speaker_name,
+    model_size: modelSize,
+    batch_size: Number(effectiveConfig.batch_size ?? recommendedDefaults.batch_size),
+    learning_rate: Number(effectiveConfig.learning_rate ?? recommendedDefaults.learning_rate),
+    num_epochs: Number(effectiveConfig.num_epochs ?? recommendedDefaults.num_epochs),
+    run_name: runName,
+    gradient_accumulation_steps: Number(
+      effectiveConfig.gradient_accumulation_steps ?? recommendedDefaults.gradient_accumulation_steps
+    ),
+    speaker_id: Number(requestedCfg.speaker_id ?? 3000),
+    mixed_precision: String(requestedCfg.mixed_precision ?? "bf16"),
+    torch_dtype: String(requestedCfg.torch_dtype ?? "bfloat16"),
+    attn_implementation: String(requestedCfg.attn_implementation ?? "sdpa"),
+    weight_decay: Number(requestedCfg.weight_decay ?? 0.01),
+    max_grad_norm: Number(requestedCfg.max_grad_norm ?? 1.0),
+    subtalker_loss_weight: Number(
+      effectiveConfig.subtalker_loss_weight ?? recommendedDefaults.subtalker_loss_weight
+    ),
+    log_every_n_steps: Number(requestedCfg.log_every_n_steps ?? 10),
+    save_every_n_epochs: Number(effectiveConfig.save_every_n_epochs ?? recommendedDefaults.save_every_n_epochs),
+    max_steps: Number(requestedCfg.max_steps ?? 0),
+    seed: Number(effectiveConfig.seed ?? recommendedDefaults.seed),
+    job_token: jobToken,
+    worker_api_url: workerUrl,
+    whisper_language:
+      typeof effectiveConfig.whisper_language === "string" ? effectiveConfig.whisper_language : undefined,
+    dataset_signature: datasetSignature,
+    dataset_snapshot_id: datasetSnapshot.snapshot_id,
+    preprocess_cache_r2_prefix:
+      datasetSnapshot.cache_r2_prefix ?? preprocessCache?.cache_r2_prefix ?? undefined,
+  };
+
+  await c.env.R2.put(`jobs/${jobId}/config.json`, JSON.stringify(jobConfig), {
+    httpMetadata: { contentType: "application/json" },
+  });
+
+  await updateTrainingCampaign(c.env.DB, campaign.campaign_id, {
+    dataset_r2_prefix: datasetPrefix,
+    dataset_snapshot_id: datasetSnapshot.snapshot_id,
+    planner_state: {
+      ...(campaign.planner_state ?? {}),
+      last_attempt_index: attemptIndex,
+      last_job_id: jobId,
+      last_config_key: configKey,
+    },
+  });
+
+  await launchQueuedTrainingJobsForVoice(c, voice.voice_id);
+  return (await getTrainingJob(c.env.DB, jobId)) ?? job;
+};
+
+const advanceTrainingCampaign = async (
+  c: Context<AppContext>,
+  campaignId: string
+): Promise<TrainingCampaign | null> => {
+  const campaign = await getTrainingCampaign(c.env.DB, campaignId);
+  if (!campaign) {
+    return null;
+  }
+  if (!CAMPAIGN_ACTIVE_STATUSES.has(campaign.status)) {
+    return campaign;
+  }
+
+  try {
+    await updateTrainingCampaign(c.env.DB, campaignId, {
+      expected_updated_at: campaign.updated_at,
+      updated_at: Date.now(),
+    });
+  } catch (error) {
+    if (isCampaignStateConflictError(error)) {
+      return getTrainingCampaign(c.env.DB, campaignId);
+    }
+    throw error;
+  }
+
+  const voice = await getVoice(c.env.DB, campaign.voice_id);
+  if (!voice) {
+    await updateTrainingCampaign(c.env.DB, campaignId, {
+      status: "failed",
+      summary: {
+        ...(campaign.summary ?? {}),
+        last_message: "voice_not_found",
+      },
+      completed_at: Date.now(),
+    });
+    return getTrainingCampaign(c.env.DB, campaignId);
+  }
+
+  const campaignJobs = await listTrainingJobs(c.env.DB, { campaign_id: campaignId, limit: 100 });
+  const terminalJobs = campaignJobs.filter((job) => TERMINAL_JOB_STATUSES.has(job.status));
+  const inflightJobs = campaignJobs.filter((job) => !TERMINAL_JOB_STATUSES.has(job.status));
+  const stopRules = campaign.stop_rules ?? {};
+  const maxAsrFailures = getCampaignStopRule(stopRules.max_asr_failures, 2);
+  const maxInfraFailures = getCampaignStopRule(stopRules.max_infra_failures, 2);
+  const minScoreImprovement = getCampaignFloatStopRule(stopRules.min_score_improvement, 0);
+  const stagnationWindow = Math.max(2, Math.min(getCampaignStopRule(stopRules.stagnation_window, 2), 6));
+  const failureSummary = summarizeCampaignFailures(terminalJobs);
+
+  if (failureSummary.asr >= maxAsrFailures) {
+    await updateTrainingCampaign(c.env.DB, campaignId, {
+      status: "blocked_dataset",
+      summary: {
+        ...(campaign.summary ?? {}),
+        reason: "asr_failure_limit",
+        asr_failures: failureSummary.asr,
+        infra_failures: failureSummary.infra,
+      },
+      completed_at: Date.now(),
+    });
+    return getTrainingCampaign(c.env.DB, campaignId);
+  }
+
+  if (failureSummary.infra >= maxInfraFailures) {
+    await updateTrainingCampaign(c.env.DB, campaignId, {
+      status: "blocked_budget",
+      summary: {
+        ...(campaign.summary ?? {}),
+        reason: "infra_failure_limit",
+        asr_failures: failureSummary.asr,
+        infra_failures: failureSummary.infra,
+      },
+      completed_at: Date.now(),
+    });
+    return getTrainingCampaign(c.env.DB, campaignId);
+  }
+
+  if (minScoreImprovement > 0 && terminalJobs.length >= stagnationWindow) {
+    const recentScores = terminalJobs
+      .slice()
+      .sort((left, right) => {
+        const leftTime = left.completed_at ?? left.updated_at;
+        const rightTime = right.completed_at ?? right.updated_at;
+        return leftTime - rightTime;
+      })
+      .map((job) => ({
+        score: getCampaignAttemptScore(job),
+        attemptIndex: job.attempt_index ?? Number.MAX_SAFE_INTEGER,
+      }))
+      .filter((item): item is { score: number; attemptIndex: number } => item.score !== null)
+      .slice(-stagnationWindow);
+
+    if (recentScores.length >= stagnationWindow) {
+      const baseline = recentScores[0].score;
+      const peak = recentScores.reduce((best, current) => (current.score > best ? current.score : best), baseline);
+      const improvement = peak - baseline;
+      if (improvement < minScoreImprovement) {
+        await updateTrainingCampaign(c.env.DB, campaignId, {
+          status: "blocked_budget",
+          summary: {
+            ...(campaign.summary ?? {}),
+            reason: "stagnation",
+            min_score_improvement: minScoreImprovement,
+            stagnation_window: stagnationWindow,
+            observed_improvement: Number(improvement.toFixed(6)),
+            asr_failures: failureSummary.asr,
+            infra_failures: failureSummary.infra,
+          },
+          completed_at: Date.now(),
+        });
+        return getTrainingCampaign(c.env.DB, campaignId);
+      }
+    }
+  }
+
+  const createdAttempts = campaignJobs.length;
+  if (createdAttempts >= campaign.attempt_count && inflightJobs.length === 0) {
+    const successfulAttempts = terminalJobs.filter((job) => job.status === "completed").length;
+    const finalStatus: TrainingCampaignStatus = successfulAttempts > 0 ? "completed" : "failed";
+    await updateTrainingCampaign(c.env.DB, campaignId, {
+      status: finalStatus,
+      summary: {
+        ...(campaign.summary ?? {}),
+        attempts_created: createdAttempts,
+        attempts_completed: terminalJobs.length,
+        attempts_succeeded: successfulAttempts,
+        reason: successfulAttempts > 0 ? (campaign.summary?.reason ?? null) : "all_attempts_failed",
+      },
+      completed_at: Date.now(),
+    });
+    return getTrainingCampaign(c.env.DB, campaignId);
+  }
+
+  const perVoiceActiveLimit = getMaxActiveTrainingJobsPerVoice(c);
+  const parallelism = Math.max(1, Math.min(campaign.parallelism, perVoiceActiveLimit));
+  const voiceJobs = await listTrainingJobs(c.env.DB, { voice_id: voice.voice_id, limit: 100 });
+  const voiceActiveCount = voiceJobs.filter((job) => ACTIVE_JOB_STATUSES.has(job.status)).length;
+  const campaignOpenSlots = Math.max(0, parallelism - inflightJobs.length);
+  const voiceOpenSlots = Math.max(0, perVoiceActiveLimit - voiceActiveCount);
+  const remainingAttempts = Math.max(0, campaign.attempt_count - createdAttempts);
+  const attemptsToCreate = Math.min(campaignOpenSlots, voiceOpenSlots, remainingAttempts);
+
+  let nextAttemptIndex = createdAttempts + 1;
+  for (let i = 0; i < attemptsToCreate; i += 1) {
+    const latestCampaign = await getTrainingCampaign(c.env.DB, campaignId);
+    if (!latestCampaign || !CAMPAIGN_ACTIVE_STATUSES.has(latestCampaign.status)) {
+      break;
+    }
+
+    try {
+      const createdJob = await enqueueCampaignAttempt(c, campaign, voice, nextAttemptIndex, voiceJobs);
+      voiceJobs.push(createdJob);
+      nextAttemptIndex += 1;
+    } catch (error) {
+      if (isCampaignAttemptUniquenessError(error)) {
+        break;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      await updateTrainingCampaign(c.env.DB, campaignId, {
+        status: "failed",
+        summary: {
+          ...(campaign.summary ?? {}),
+          last_message: message,
+        },
+        completed_at: Date.now(),
+      });
+      return getTrainingCampaign(c.env.DB, campaignId);
+    }
+  }
+
+  const refreshedJobs = await listTrainingJobs(c.env.DB, { campaign_id: campaignId, limit: 100 });
+  const activeCount = refreshedJobs.filter((job) => ACTIVE_JOB_STATUSES.has(job.status)).length;
+  const queuedCount = refreshedJobs.filter((job) => job.status === "queued" || job.status === "pending").length;
+  await updateTrainingCampaign(c.env.DB, campaignId, {
+    status: "running",
+    summary: {
+      ...(campaign.summary ?? {}),
+      attempts_created: refreshedJobs.length,
+      attempts_completed: refreshedJobs.filter((job) => TERMINAL_JOB_STATUSES.has(job.status)).length,
+      active_jobs: activeCount,
+      queued_jobs: queuedCount,
+      asr_failures: failureSummary.asr,
+      infra_failures: failureSummary.infra,
+    },
+  });
+
+  return getTrainingCampaign(c.env.DB, campaignId);
+};
+
+const runTrainingCampaignSweep = async (c: Context<AppContext>): Promise<number> => {
+  const campaigns = await listTrainingCampaigns(c.env.DB, {
+    status_in: ["planning", "running"],
+    limit: 50,
+  });
+  let advanced = 0;
+  for (const campaign of campaigns) {
+    try {
+      await advanceTrainingCampaign(c, campaign.campaign_id);
+      advanced += 1;
+    } catch (error) {
+      console.warn(`Training campaign sweep failed for ${campaign.campaign_id}:`, error);
+    }
+  }
+  return advanced;
 };
 
 const getDirectFallbackDockerArgs = (
@@ -1951,7 +2529,7 @@ const recoverStalledProvisioningJob = async (
           });
 
         try {
-          let newPod;
+          let newPod: { podId: string; desiredStatus: string };
           try {
             newPod = await tryCreateDirect("COMMUNITY");
           } catch {
@@ -4981,6 +5559,7 @@ export const runTrainingSupervisorSweep = async (
   timed_out: number;
   failed: number;
   launched_queued: number;
+  campaigns_advanced: number;
 }> => {
   const jobs = await listTrainingJobs(env.DB, { limit: TRAINING_SWEEP_LIMIT });
   const syntheticContext = createSyntheticContext(env, resolveWorkerPublicUrl(env));
@@ -4994,6 +5573,7 @@ export const runTrainingSupervisorSweep = async (
   let timedOut = 0;
   let failed = 0;
   let launchedQueued = 0;
+  let campaignsAdvanced = 0;
 
   for (const job of candidates) {
     try {
@@ -5028,14 +5608,191 @@ export const runTrainingSupervisorSweep = async (
     }
   }
 
+  try {
+    campaignsAdvanced = await runTrainingCampaignSweep(syntheticContext);
+  } catch (error) {
+    failed += 1;
+    console.warn("Training campaign sweep failed", error);
+  }
+
   return {
     checked: candidates.length,
     reconciled,
     timed_out: timedOut,
     failed,
     launched_queued: launchedQueued,
+    campaigns_advanced: campaignsAdvanced,
   };
 };
+
+app.post("/campaigns", async (c) => {
+  const body = (await c.req.json()) as TrainingCampaignRequest;
+  if (!body.voice_id) {
+    return c.json({ detail: { message: "voice_id is required" } }, 400);
+  }
+
+  const voice = await getVoice(c.env.DB, body.voice_id);
+  if (!voice) {
+    return c.json({ detail: { message: "Voice not found" } }, 404);
+  }
+
+  const rawAttempts = Number(body.attempt_count ?? DEFAULT_CAMPAIGN_ATTEMPT_COUNT);
+  const attemptCount = Number.isFinite(rawAttempts)
+    ? Math.max(1, Math.min(Math.trunc(rawAttempts), MAX_CAMPAIGN_ATTEMPTS))
+    : DEFAULT_CAMPAIGN_ATTEMPT_COUNT;
+  const requestedParallelism = Number(body.parallelism ?? DEFAULT_CAMPAIGN_PARALLELISM);
+  const perVoiceActiveLimit = getMaxActiveTrainingJobsPerVoice(c);
+  const parallelism = Number.isFinite(requestedParallelism)
+    ? Math.max(1, Math.min(Math.trunc(requestedParallelism), perVoiceActiveLimit))
+    : 1;
+
+  const baseConfig = body.base_config_overrides ?? {};
+  const baseCfg = baseConfig as Record<string, unknown>;
+  const baseModelSize =
+    typeof baseConfig.model_size === "string" && baseConfig.model_size
+      ? baseConfig.model_size
+      : (voice.model_size || "1.7B");
+  const baseDefaults = getRecommendedTrainingDefaults(baseModelSize);
+  const normalizedBaseConfig: TrainingConfig = {
+    ...baseConfig,
+    model_size: baseModelSize,
+    batch_size: readNumber(baseConfig.batch_size) ?? baseDefaults.batch_size,
+    learning_rate: readNumber(baseConfig.learning_rate) ?? baseDefaults.learning_rate,
+    num_epochs: readNumber(baseConfig.num_epochs ?? baseCfg.epochs) ?? baseDefaults.num_epochs,
+    gradient_accumulation_steps:
+      readNumber(baseCfg.gradient_accumulation_steps) ?? baseDefaults.gradient_accumulation_steps,
+    subtalker_loss_weight: readNumber(baseCfg.subtalker_loss_weight) ?? baseDefaults.subtalker_loss_weight,
+    save_every_n_epochs: readNumber(baseCfg.save_every_n_epochs) ?? baseDefaults.save_every_n_epochs,
+    seed: readNumber(baseCfg.seed) ?? baseDefaults.seed,
+    gpu_type_id:
+      typeof baseCfg.gpu_type_id === "string" && baseCfg.gpu_type_id
+        ? baseCfg.gpu_type_id
+        : baseDefaults.gpu_type_id,
+  };
+  if (typeof baseCfg.whisper_language === "string" && baseCfg.whisper_language.trim()) {
+    normalizedBaseConfig.whisper_language = baseCfg.whisper_language.trim();
+  }
+
+  const baseNumEpochs = Number(normalizedBaseConfig.num_epochs ?? baseDefaults.num_epochs);
+  const baseBatchSize = Number(normalizedBaseConfig.batch_size ?? baseDefaults.batch_size);
+  const baseMaxSteps = Number(baseCfg.max_steps ?? 0);
+  if (baseNumEpochs < 1 || baseNumEpochs > 30) {
+    return c.json({ detail: { message: "base_config_overrides.num_epochs must be between 1 and 30" } }, 400);
+  }
+  if (baseBatchSize < 1 || baseBatchSize > 16) {
+    return c.json({ detail: { message: "base_config_overrides.batch_size must be between 1 and 16" } }, 400);
+  }
+  if (baseMaxSteps < 0 || baseMaxSteps > 100000) {
+    return c.json({ detail: { message: "base_config_overrides.max_steps must be between 0 and 100000" } }, 400);
+  }
+
+  const now = Date.now();
+  const campaignId = crypto.randomUUID();
+  const campaign: TrainingCampaign = {
+    campaign_id: campaignId,
+    voice_id: voice.voice_id,
+    dataset_name: typeof body.dataset_name === "string" ? body.dataset_name.trim() || null : null,
+    dataset_r2_prefix: null,
+    dataset_snapshot_id: null,
+    attempt_count: attemptCount,
+    parallelism,
+    status: "planning",
+    base_config: normalizedBaseConfig,
+    stop_rules: body.stop_rules ?? {},
+    planner_state: {},
+    summary: {},
+    created_at: now,
+    updated_at: now,
+    completed_at: null,
+  };
+
+  await createTrainingCampaign(c.env.DB, campaign);
+  const updated = await advanceTrainingCampaign(c, campaignId);
+  const jobs = await listTrainingJobs(c.env.DB, { campaign_id: campaignId, limit: 100 });
+
+  return c.json({
+    campaign: updated ?? campaign,
+    attempts: jobs.map(serializeTrainingJob),
+  });
+});
+
+app.get("/campaigns/:campaign_id", async (c) => {
+  const campaignId = c.req.param("campaign_id");
+  if (!campaignId) {
+    return c.json({ detail: { message: "campaign_id is required" } }, 400);
+  }
+  const campaign = await getTrainingCampaign(c.env.DB, campaignId);
+  if (!campaign) {
+    return c.json({ detail: { message: "Campaign not found" } }, 404);
+  }
+  const attempts = await listTrainingJobs(c.env.DB, { campaign_id: campaignId, limit: 100 });
+  return c.json({ campaign, attempts: attempts.map(serializeTrainingJob) });
+});
+
+app.post("/campaigns/:campaign_id/cancel", async (c) => {
+  const campaignId = c.req.param("campaign_id");
+  if (!campaignId) {
+    return c.json({ detail: { message: "campaign_id is required" } }, 400);
+  }
+  const campaign = await getTrainingCampaign(c.env.DB, campaignId);
+  if (!campaign) {
+    return c.json({ detail: { message: "Campaign not found" } }, 404);
+  }
+
+  if (!CAMPAIGN_ACTIVE_STATUSES.has(campaign.status)) {
+    const attempts = await listTrainingJobs(c.env.DB, { campaign_id: campaignId, limit: 100 });
+    return c.json({ campaign, attempts: attempts.map(serializeTrainingJob) });
+  }
+
+  await updateTrainingCampaign(c.env.DB, campaignId, {
+    status: "cancelled",
+    summary: {
+      ...(campaign.summary ?? {}),
+      cancel_requested_at: Date.now(),
+    },
+    completed_at: Date.now(),
+  });
+
+  const attemptsBeforeCancel = await listTrainingJobs(c.env.DB, { campaign_id: campaignId, limit: 100 });
+  for (const attempt of attemptsBeforeCancel) {
+    if (TERMINAL_JOB_STATUSES.has(attempt.status)) {
+      continue;
+    }
+
+    if (attempt.runpod_pod_id) {
+      try {
+        await terminatePod(c.env, attempt.runpod_pod_id);
+      } catch {
+        // Pod may already be terminated — safe to ignore
+      }
+    }
+
+    await updateTrainingJob(c.env.DB, attempt.job_id, {
+      status: "cancelled",
+      completed_at: Date.now(),
+      expected_updated_at: attempt.updated_at,
+      summary: {
+        ...(attempt.summary ?? {}),
+        campaign_cancelled_at: Date.now(),
+      },
+      supervisor: {
+        ...(attempt.supervisor ?? {}),
+        phase: "cancelled",
+        last_transition_at: Date.now(),
+      },
+    });
+  }
+
+  const attemptsAfterCancel = await listTrainingJobs(c.env.DB, { campaign_id: campaignId, limit: 100 });
+  const allTerminal = attemptsAfterCancel.every((attempt) => TERMINAL_JOB_STATUSES.has(attempt.status));
+  if (allTerminal) {
+    await launchQueuedTrainingJobsForVoice(c, campaign.voice_id);
+  }
+
+  const next = await getTrainingCampaign(c.env.DB, campaignId);
+  const attempts = await listTrainingJobs(c.env.DB, { campaign_id: campaignId, limit: 100 });
+  return c.json({ campaign: next ?? campaign, attempts: attempts.map(serializeTrainingJob) });
+});
 
 app.post("/start", async (c) => {
   const body = (await c.req.json()) as {
