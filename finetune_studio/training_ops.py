@@ -129,7 +129,7 @@ def _resolve_prepare_device(device: str) -> str:
     if selected and selected.lower() != "auto":
         return selected
     try:
-        import torch
+        torch = __import__("torch")
 
         if torch.cuda.is_available():
             return "cuda:0"
@@ -156,7 +156,12 @@ def _resolve_training_mixed_precision(mixed_precision: str, device: str) -> str:
 def _resolve_training_torch_dtype(torch_dtype: str, device: str) -> str:
     v = (torch_dtype or "").strip().lower()
     if v and v != "auto":
-        return torch_dtype
+        allowed = {"float32", "fp32", "float16", "fp16", "bfloat16", "bf16"}
+        if v not in allowed:
+            raise ValueError(
+                "torch_dtype must be one of: auto, float32/fp32, float16/fp16, bfloat16/bf16"
+            )
+        return v
     if device.startswith("cuda"):
         return "bfloat16"
     if device == "mps":
@@ -201,7 +206,9 @@ def run_prepare_data(
     batch_infer_num: int = 32,
 ) -> Generator[dict[str, Any], None, None]:
     if is_running(PREPARE_KEY):
-        raise AlreadyRunningError("Prepare is already running. Stop it before starting a new prepare run.")
+        raise AlreadyRunningError(
+            "Prepare is already running. Stop it before starting a new prepare run."
+        )
 
     input_path = Path(input_jsonl).resolve()
     if not input_path.exists():
@@ -309,7 +316,9 @@ def run_training(
     random_seed: int = 42,
 ) -> Generator[dict[str, Any], None, None]:
     if is_running(TRAIN_KEY):
-        raise AlreadyRunningError("Training is already running. Stop it before starting a new run.")
+        raise AlreadyRunningError(
+            "Training is already running. Stop it before starting a new run."
+        )
 
     train_path = Path(train_jsonl).resolve()
     if not train_path.exists():
@@ -332,15 +341,17 @@ def run_training(
     if float(subtalker_loss_weight) < 0:
         raise ValueError("subtalker_loss_weight must be >= 0.")
 
+    resolved_device = _resolve_prepare_device("auto")
+    resolved_mixed_precision = _resolve_training_mixed_precision(
+        mixed_precision, resolved_device
+    )
+    resolved_torch_dtype = _resolve_training_torch_dtype(torch_dtype, resolved_device)
+
     final_run_name = sanitize_name(run_name, default_run_name())
     output_dir = ensure_unique_dir(run_dir(final_run_name))
     output_dir.mkdir(parents=True, exist_ok=True)
     train_log_path = output_dir / "train.log"
     train_log_path.write_text("", encoding="utf-8")
-
-    resolved_device = _resolve_prepare_device("auto")
-    resolved_mixed_precision = _resolve_training_mixed_precision(mixed_precision, resolved_device)
-    resolved_torch_dtype = _resolve_training_torch_dtype(torch_dtype, resolved_device)
 
     config_path = output_dir / "run_config.json"
     run_config = {
@@ -463,7 +474,9 @@ def run_training(
             env=_process_env(),
         )
     except AlreadyRunningError:
-        raise AlreadyRunningError("Training is already running. Stop it before starting a new run.")
+        raise AlreadyRunningError(
+            "Training is already running. Stop it before starting a new run."
+        )
     except Exception as e:
         update_run_summary(
             output_dir,
@@ -548,12 +561,12 @@ def run_training(
         success = return_code == 0
 
         checkpoints = [
-            p.resolve()
-            for p in output_dir.glob("checkpoint-epoch-*")
-            if p.is_dir()
+            p.resolve() for p in output_dir.glob("checkpoint-epoch-*") if p.is_dir()
         ]
         checkpoints = sorted(checkpoints, key=lambda p: (checkpoint_epoch(p), p.name))
-        loadable_checkpoints = [str(p) for p in checkpoints if is_loadable_checkpoint_dir(p)]
+        loadable_checkpoints = [
+            str(p) for p in checkpoints if is_loadable_checkpoint_dir(p)
+        ]
         all_checkpoints = [str(p) for p in checkpoints]
         last_checkpoint = loadable_checkpoints[-1] if loadable_checkpoints else ""
 
@@ -594,7 +607,9 @@ def run_training(
                 "loadable_checkpoints": loadable_checkpoints,
                 "exit_code": return_code,
                 "process_pid": None,
-                "process_script": str((THIRD_PARTY_FINETUNE_DIR / "sft_12hz.py").resolve()),
+                "process_script": str(
+                    (THIRD_PARTY_FINETUNE_DIR / "sft_12hz.py").resolve()
+                ),
                 "stale_process": False,
             },
         )

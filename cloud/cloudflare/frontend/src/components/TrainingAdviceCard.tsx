@@ -36,6 +36,11 @@ export function TrainingAdviceCard({
             <span className="rounded-full border border-edge bg-surface px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider text-muted">
               {advice.mode}
             </span>
+            {advice.analysisProvider === 'llm' && (
+              <span className="rounded-full border border-accent/30 bg-accent-dim px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider text-accent">
+                AI
+              </span>
+            )}
           </div>
           <div className="mt-1 text-primary text-sm">{advice.title}</div>
         </div>

@@ -1304,6 +1304,80 @@ def upload_preprocess_cache(
     return cache_prefix
 
 
+def persist_preprocessed_dataset_artifacts(
+    *,
+    r2: R2Storage,
+    cfg: JobConfig,
+    dataset_dir: Path,
+) -> None:
+    dataset_prefix = cfg.dataset_r2_prefix.strip().rstrip("/")
+    if not dataset_prefix:
+        return
+
+    train_raw_jsonl = dataset_dir / "train_raw.jsonl"
+    if train_raw_jsonl.exists():
+        r2.upload_file(
+            train_raw_jsonl,
+            f"{dataset_prefix}/train_raw.jsonl",
+            content_type="application/jsonl",
+        )
+
+    ref_audio_path = dataset_dir / "ref_audio.wav"
+    ref_audio_key = f"{dataset_prefix}/ref_audio.wav"
+    if ref_audio_path.exists():
+        r2.upload_file(
+            ref_audio_path,
+            ref_audio_key,
+            content_type="audio/wav",
+        )
+
+    reference_profile_path = dataset_dir / "reference_profile.json"
+    if reference_profile_path.exists():
+        r2.upload_file(
+            reference_profile_path,
+            f"{dataset_prefix}/reference_profile.json",
+            content_type="application/json",
+        )
+    else:
+        preprocess_report_path = dataset_dir / "preprocess_report.json"
+        if preprocess_report_path.exists():
+            try:
+                preprocess_report = json.loads(preprocess_report_path.read_text(encoding="utf-8"))
+            except Exception:
+                preprocess_report = {}
+            reference_text = (
+                str(preprocess_report.get("reference_text", "")).strip()
+                if isinstance(preprocess_report, dict)
+                else ""
+            )
+            r2.upload_json(
+                {
+                    "reference_audio_key": ref_audio_key,
+                    "reference_text": reference_text,
+                },
+                f"{dataset_prefix}/reference_profile.json",
+            )
+
+    preprocess_report_path = dataset_dir / "preprocess_report.json"
+    if preprocess_report_path.exists():
+        r2.upload_file(
+            preprocess_report_path,
+            f"{dataset_prefix}/preprocess_report.json",
+            content_type="application/json",
+        )
+
+    segments_dir = dataset_dir / "segments"
+    if segments_dir.exists():
+        for seg_path in segments_dir.rglob("*"):
+            if seg_path.is_file():
+                relative = seg_path.relative_to(dataset_dir)
+                r2.upload_file(
+                    seg_path,
+                    f"{dataset_prefix}/{relative.as_posix()}",
+                    content_type="audio/wav",
+                )
+
+
 def run_prepare(
     *,
     finetune_dir: Path,
@@ -1715,19 +1789,13 @@ def main() -> int:
                     raise UnrecoverableError(f"Preprocessing failed: {exc}") from exc
                 generated_train_raw = True
                 try:
-                    ref_audio_local = DATASET_DIR / "ref_audio.wav"
-                    if ref_audio_local.exists():
-                        r2.upload_file(
-                            ref_audio_local,
-                            f"{cfg.dataset_r2_prefix}/ref_audio.wav",
-                            content_type="audio/wav",
-                        )
-                    if preprocess_report is not None:
-                        ref_meta = dict(preprocess_report)
-                        ref_meta["reference_audio_key"] = f"{cfg.dataset_r2_prefix}/ref_audio.wav"
-                        r2.upload_json(ref_meta, f"{cfg.dataset_r2_prefix}/reference_profile.json")
+                    persist_preprocessed_dataset_artifacts(
+                        r2=r2,
+                        cfg=cfg,
+                        dataset_dir=DATASET_DIR,
+                    )
                 except Exception as exc:
-                    LOGGER.warning("Failed to upload generated reference profile: %s", exc)
+                    LOGGER.warning("Failed to persist preprocess artifacts into dataset prefix: %s", exc)
                 try:
                     upload_preprocess_cache(
                         r2=r2,

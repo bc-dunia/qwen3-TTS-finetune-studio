@@ -15,9 +15,11 @@ import {
   fetchTrainingLogs,
   fetchTrainingLogChunkText,
   fetchTrainingPreprocessCache,
+  fetchTrainingCheckoutLedger,
   type DatasetInfo,
   type DatasetSnapshot,
   type DatasetPreprocessCacheEntry,
+  type TrainingCheckoutLedgerEntry,
   type TrainingRound,
   type TrainingLogChunk,
   type TrainingPreprocessCacheResponse,
@@ -32,30 +34,14 @@ import {
   formatTime,
 } from '../lib/api'
 import { TrainingAdviceCard } from '../components/TrainingAdviceCard'
+import {
+  getTrainingCheckoutSearch,
+  getTrainingJobDisplayStatus,
+  isActiveTrainingJobStatus,
+  needsTrainingValidationFollowup,
+  shouldWatchTrainingJob,
+} from '../lib/trainingCheckout'
 import { buildTrainingAdvice } from '../lib/trainingAdvisor'
-
-const ACTIVE_JOB_STATUSES = new Set([
-  'pending',
-  'running',
-  'provisioning',
-  'downloading',
-  'preprocessing',
-  'preparing',
-  'training',
-  'uploading',
-])
-
-function isJobActiveStatus(status: string): boolean {
-  return ACTIVE_JOB_STATUSES.has(status)
-}
-
-function needsValidationFollowup(job: TrainingJob): boolean {
-  return job.status === 'completed' && job.summary?.validation_checked !== true
-}
-
-function shouldPollJob(job: TrainingJob): boolean {
-  return isJobActiveStatus(job.status) || needsValidationFollowup(job)
-}
 
 function getRecommendedTrainingPreset(modelSize: string) {
   if (modelSize.includes('0.6')) {
@@ -230,7 +216,7 @@ function buildJobCardMeta(jobs: TrainingJob[], voices: Voice[], now: number): Ma
     const progressRatio = getJobProgressRatio(job)
 
     let estimatedFinishAt: number | null = null
-    if (isJobActiveStatus(job.status) && startedAt !== null) {
+    if (isActiveTrainingJobStatus(job.status) && startedAt !== null) {
       const progressEstimateMs =
         progressRatio !== null && progressRatio > 0.03 && elapsedMs !== null
           ? elapsedMs / progressRatio
@@ -276,6 +262,7 @@ export function Training() {
   const [subtalkerLossWeight, setSubtalkerLossWeight] = useState(0.3)
   const [saveEveryNEpochs, setSaveEveryNEpochs] = useState(1)
   const [gpuTypeId, setGpuTypeId] = useState('NVIDIA A100-SXM4-80GB')
+  const [showAdvancedConfig, setShowAdvancedConfig] = useState(false)
   const [availableDatasets, setAvailableDatasets] = useState<DatasetInfo[]>([])
   const [loadingDatasets, setLoadingDatasets] = useState(false)
   const [selectedDatasetName, setSelectedDatasetName] = useState('')
@@ -350,7 +337,7 @@ export function Training() {
   }, [])
 
   // Poll active jobs every 5 seconds
-  const hasActiveJobs = jobs.some((j) => shouldPollJob(j))
+  const hasActiveJobs = jobs.some((j) => shouldWatchTrainingJob(j))
   const selectedVoice = voices.find((voice) => voice.voice_id === selectedVoiceId)
   const selectedPreset = selectedVoice
     ? getRecommendedTrainingPreset(selectedVoice.model_size)
@@ -362,11 +349,17 @@ export function Training() {
     .filter((job) => job.voice_id === selectedVoiceId)
     .filter((job) => selectedVoiceResetAt === null || job.created_at >= selectedVoiceResetAt)
   const selectedVoiceAdviceSignature = selectedVoiceJobs
-    .map((job) => `${job.job_id}:${job.status}:${job.updated_at ?? job.created_at}:${job.summary?.validation_checked === true ? 1 : 0}`)
+    .map((job) => `${job.job_id}:${job.status}:${job.updated_at ?? job.created_at}:${getTrainingCheckoutSearch(job).status}`)
     .join('|')
   const selectedVoiceRounds = rounds.filter((round) => round.voice_id === selectedVoiceId)
   const selectedVoiceSnapshots = snapshots.filter((snapshot) => snapshot.voice_id === selectedVoiceId)
   const activeRound = selectedVoiceRounds.find((round) => round.round_id === selectedVoice?.active_round_id) ?? selectedVoiceRounds[0] ?? null
+  const productionEpoch = activeRound?.production_epoch ?? selectedVoice?.epoch ?? null
+  const productionScore = activeRound?.production_score ?? selectedVoice?.checkpoint_score ?? null
+  const productionPreset = activeRound?.production_preset ?? selectedVoice?.checkpoint_preset ?? null
+  const candidateEpoch = activeRound?.candidate_epoch ?? selectedVoice?.candidate_epoch ?? null
+  const candidateScore = activeRound?.candidate_score ?? selectedVoice?.candidate_score ?? null
+  const candidatePreset = selectedVoice?.candidate_preset ?? null
   const selectedDatasetSnapshot =
     selectedVoiceSnapshots.find((snapshot) => snapshot.dataset_name === effectiveDatasetName) ?? null
   const localTrainingAdvice = buildTrainingAdvice(selectedVoice ?? null, selectedVoiceJobs)
@@ -488,7 +481,7 @@ export function Training() {
     const interval = setInterval(async () => {
       const currentJobs = jobsRef.current
       const activeJobIds = currentJobs
-        .filter((j) => shouldPollJob(j))
+        .filter((j) => shouldWatchTrainingJob(j))
         .map((j) => j.job_id)
 
       if (activeJobIds.length === 0) return
@@ -642,9 +635,9 @@ export function Training() {
     (a, b) => (readTimestamp(b.created_at) ?? 0) - (readTimestamp(a.created_at) ?? 0),
   )
   const jobCardMeta = buildJobCardMeta(jobsByRecency, voices, Date.now())
-  const activeJobs = jobsByRecency.filter((j) => shouldPollJob(j))
+  const activeJobs = jobsByRecency.filter((j) => shouldWatchTrainingJob(j))
   const completedJobs = jobsByRecency.filter(
-    (j) => !shouldPollJob(j) && (j.status === 'completed' || j.status === 'failed' || j.status === 'cancelled'),
+    (j) => !shouldWatchTrainingJob(j) && (j.status === 'completed' || j.status === 'failed' || j.status === 'cancelled'),
   )
 
   return (
@@ -721,6 +714,18 @@ export function Training() {
                 <span>signature={selectedDatasetSnapshot?.dataset_signature?.slice(0, 10) ?? 'pending'}</span>
                 <span>segments={selectedDatasetSnapshot?.segments_accepted ?? 'n/a'}</span>
               </div>
+              <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
+                <Metric label="Production" value={formatCheckpointMetric(productionEpoch, productionScore, productionPreset)} />
+                <Metric label="Champion" value={formatCheckpointMetric(activeRound?.champion_epoch, activeRound?.champion_score, activeRound?.champion_preset)} />
+                <Metric label="Selected" value={formatCheckpointMetric(activeRound?.selected_epoch, activeRound?.selected_score, activeRound?.selected_preset)} />
+                <Metric label="Candidate" value={formatCheckpointMetric(candidateEpoch, candidateScore, candidatePreset)} />
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2 text-[10px] font-mono text-muted">
+                <span className="rounded-full bg-raised px-2 py-1">round_status={activeRound?.status ?? 'none'}</span>
+                <span className="rounded-full bg-raised px-2 py-1">adoption={activeRound?.adoption_mode ?? 'n/a'}</span>
+                <span className="rounded-full bg-raised px-2 py-1">production_job={activeRound?.production_job_id?.slice(0, 8) ?? 'n/a'}</span>
+                <span className="rounded-full bg-raised px-2 py-1">selected_job={activeRound?.selected_job_id?.slice(0, 8) ?? 'n/a'}</span>
+              </div>
               {selectedVoice.candidate_checkpoint_r2_prefix && (
                 <p className="mt-3 text-[11px] text-warning">
                   A validated candidate is waiting. It will not replace production until you promote it from Compare.
@@ -795,51 +800,6 @@ export function Training() {
               )}
             </div>
 
-            {/* Batch Size */}
-            <div>
-              <label htmlFor="training-batch-size" className="text-subtle text-xs font-medium mb-1.5 block">Batch Size</label>
-              <input
-                id="training-batch-size"
-                type="number"
-                value={batchSize}
-                onChange={(e) => setBatchSize(parseInt(e.target.value) || 1)}
-                min={1}
-                max={32}
-                className="w-full bg-surface border border-edge rounded-lg px-3 py-2.5 text-sm text-primary font-mono focus:border-accent transition-colors"
-              />
-            </div>
-
-            {/* Epochs */}
-            <div>
-              <label htmlFor="training-epochs" className="text-subtle text-xs font-medium mb-1.5 block">Epochs</label>
-              <input
-                id="training-epochs"
-                type="number"
-                value={epochs}
-                onChange={(e) => setEpochs(parseInt(e.target.value) || 1)}
-                min={1}
-                max={50}
-                className="w-full bg-surface border border-edge rounded-lg px-3 py-2.5 text-sm text-primary font-mono focus:border-accent transition-colors"
-              />
-              <p className="text-muted text-[10px] font-mono mt-1">Recommended: 5–15 (more epochs = higher similarity, risk of overfitting)</p>
-            </div>
-
-            {/* Learning Rate */}
-            <div>
-              <label htmlFor="training-learning-rate" className="text-subtle text-xs font-medium mb-1.5 block">Learning Rate</label>
-              <input
-                id="training-learning-rate"
-                type="text"
-                value={learningRate}
-                onChange={(e) => {
-                  const val = parseFloat(e.target.value)
-                  if (!isNaN(val)) setLearningRate(val)
-                }}
-                className="w-full bg-surface border border-edge rounded-lg px-3 py-2.5 text-sm text-primary font-mono focus:border-accent transition-colors"
-              />
-              <p className="text-muted text-[10px] font-mono mt-1">Recommended: 1e-5 to 5e-5</p>
-            </div>
-
             {/* Language */}
             <div>
               <label htmlFor="training-language" className="text-subtle text-xs font-medium mb-1.5 block">Language</label>
@@ -856,62 +816,119 @@ export function Training() {
               </select>
             </div>
 
-            <div>
-              <label htmlFor="training-seed" className="text-subtle text-xs font-medium mb-1.5 block">Seed</label>
-              <input
-                id="training-seed"
-                type="number"
-                value={trainingSeed}
-                onChange={(e) => setTrainingSeed(parseInt(e.target.value, 10) || 1)}
-                className="w-full bg-surface border border-edge rounded-lg px-3 py-2.5 text-sm text-primary font-mono focus:border-accent transition-colors"
-              />
-            </div>
+            <div className="rounded-lg border border-edge bg-surface px-3 py-2.5">
+              <button
+                type="button"
+                onClick={() => setShowAdvancedConfig((previous) => !previous)}
+                className="flex w-full items-center justify-between text-left"
+              >
+                <span className="text-primary text-xs font-semibold">Advanced training settings</span>
+                <span className="text-muted text-[10px] font-mono">{showAdvancedConfig ? 'Hide' : 'Show'}</span>
+              </button>
 
-            <div>
-              <label htmlFor="training-grad-acc" className="text-subtle text-xs font-medium mb-1.5 block">Gradient Accumulation</label>
-              <input
-                id="training-grad-acc"
-                type="number"
-                min={1}
-                value={gradientAccumulationSteps}
-                onChange={(e) => setGradientAccumulationSteps(parseInt(e.target.value, 10) || 1)}
-                className="w-full bg-surface border border-edge rounded-lg px-3 py-2.5 text-sm text-primary font-mono focus:border-accent transition-colors"
-              />
-            </div>
+              {showAdvancedConfig && (
+                <div className="mt-3 space-y-4">
+                  <div>
+                    <label htmlFor="training-batch-size" className="text-subtle text-xs font-medium mb-1.5 block">Batch Size</label>
+                    <input
+                      id="training-batch-size"
+                      type="number"
+                      value={batchSize}
+                      onChange={(e) => setBatchSize(parseInt(e.target.value) || 1)}
+                      min={1}
+                      max={32}
+                      className="w-full bg-raised border border-edge rounded-lg px-3 py-2.5 text-sm text-primary font-mono focus:border-accent transition-colors"
+                    />
+                  </div>
 
-            <div>
-              <label htmlFor="training-subtalker" className="text-subtle text-xs font-medium mb-1.5 block">Subtalker Loss Weight</label>
-              <input
-                id="training-subtalker"
-                type="number"
-                step="0.05"
-                value={subtalkerLossWeight}
-                onChange={(e) => setSubtalkerLossWeight(parseFloat(e.target.value) || 0)}
-                className="w-full bg-surface border border-edge rounded-lg px-3 py-2.5 text-sm text-primary font-mono focus:border-accent transition-colors"
-              />
-            </div>
+                  <div>
+                    <label htmlFor="training-epochs" className="text-subtle text-xs font-medium mb-1.5 block">Epochs</label>
+                    <input
+                      id="training-epochs"
+                      type="number"
+                      value={epochs}
+                      onChange={(e) => setEpochs(parseInt(e.target.value) || 1)}
+                      min={1}
+                      max={50}
+                      className="w-full bg-raised border border-edge rounded-lg px-3 py-2.5 text-sm text-primary font-mono focus:border-accent transition-colors"
+                    />
+                    <p className="text-muted text-[10px] font-mono mt-1">Recommended: 5–15 (more epochs = higher similarity, risk of overfitting)</p>
+                  </div>
 
-            <div>
-              <label htmlFor="training-save-every" className="text-subtle text-xs font-medium mb-1.5 block">Save Every N Epochs</label>
-              <input
-                id="training-save-every"
-                type="number"
-                min={1}
-                value={saveEveryNEpochs}
-                onChange={(e) => setSaveEveryNEpochs(parseInt(e.target.value, 10) || 1)}
-                className="w-full bg-surface border border-edge rounded-lg px-3 py-2.5 text-sm text-primary font-mono focus:border-accent transition-colors"
-              />
-            </div>
+                  <div>
+                    <label htmlFor="training-learning-rate" className="text-subtle text-xs font-medium mb-1.5 block">Learning Rate</label>
+                    <input
+                      id="training-learning-rate"
+                      type="text"
+                      value={learningRate}
+                      onChange={(e) => {
+                        const val = parseFloat(e.target.value)
+                        if (!isNaN(val)) setLearningRate(val)
+                      }}
+                      className="w-full bg-raised border border-edge rounded-lg px-3 py-2.5 text-sm text-primary font-mono focus:border-accent transition-colors"
+                    />
+                    <p className="text-muted text-[10px] font-mono mt-1">Recommended: 1e-5 to 5e-5</p>
+                  </div>
 
-            <div>
-              <label htmlFor="training-gpu" className="text-subtle text-xs font-medium mb-1.5 block">GPU Type</label>
-              <input
-                id="training-gpu"
-                type="text"
-                value={gpuTypeId}
-                onChange={(e) => setGpuTypeId(e.target.value)}
-                className="w-full bg-surface border border-edge rounded-lg px-3 py-2.5 text-sm text-primary font-mono focus:border-accent transition-colors"
-              />
+                  <div>
+                    <label htmlFor="training-seed" className="text-subtle text-xs font-medium mb-1.5 block">Seed</label>
+                    <input
+                      id="training-seed"
+                      type="number"
+                      value={trainingSeed}
+                      onChange={(e) => setTrainingSeed(parseInt(e.target.value, 10) || 1)}
+                      className="w-full bg-raised border border-edge rounded-lg px-3 py-2.5 text-sm text-primary font-mono focus:border-accent transition-colors"
+                    />
+                  </div>
+
+                  <div>
+                    <label htmlFor="training-grad-acc" className="text-subtle text-xs font-medium mb-1.5 block">Gradient Accumulation</label>
+                    <input
+                      id="training-grad-acc"
+                      type="number"
+                      min={1}
+                      value={gradientAccumulationSteps}
+                      onChange={(e) => setGradientAccumulationSteps(parseInt(e.target.value, 10) || 1)}
+                      className="w-full bg-raised border border-edge rounded-lg px-3 py-2.5 text-sm text-primary font-mono focus:border-accent transition-colors"
+                    />
+                  </div>
+
+                  <div>
+                    <label htmlFor="training-subtalker" className="text-subtle text-xs font-medium mb-1.5 block">Subtalker Loss Weight</label>
+                    <input
+                      id="training-subtalker"
+                      type="number"
+                      step="0.05"
+                      value={subtalkerLossWeight}
+                      onChange={(e) => setSubtalkerLossWeight(parseFloat(e.target.value) || 0)}
+                      className="w-full bg-raised border border-edge rounded-lg px-3 py-2.5 text-sm text-primary font-mono focus:border-accent transition-colors"
+                    />
+                  </div>
+
+                  <div>
+                    <label htmlFor="training-save-every" className="text-subtle text-xs font-medium mb-1.5 block">Save Every N Epochs</label>
+                    <input
+                      id="training-save-every"
+                      type="number"
+                      min={1}
+                      value={saveEveryNEpochs}
+                      onChange={(e) => setSaveEveryNEpochs(parseInt(e.target.value, 10) || 1)}
+                      className="w-full bg-raised border border-edge rounded-lg px-3 py-2.5 text-sm text-primary font-mono focus:border-accent transition-colors"
+                    />
+                  </div>
+
+                  <div>
+                    <label htmlFor="training-gpu" className="text-subtle text-xs font-medium mb-1.5 block">GPU Type</label>
+                    <input
+                      id="training-gpu"
+                      type="text"
+                      value={gpuTypeId}
+                      onChange={(e) => setGpuTypeId(e.target.value)}
+                      className="w-full bg-raised border border-edge rounded-lg px-3 py-2.5 text-sm text-primary font-mono focus:border-accent transition-colors"
+                    />
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Error */}
@@ -1031,8 +1048,9 @@ function JobCard({
   const [busyAction, setBusyAction] = useState<'refresh' | 'reconcile' | 'revalidate' | ''>('')
   const [actionError, setActionError] = useState('')
   const [showLogs, setShowLogs] = useState(false)
-  const isActive = isJobActiveStatus(job.status)
-  const isValidationPending = needsValidationFollowup(job)
+  const checkout = getTrainingCheckoutSearch(job)
+  const isActive = isActiveTrainingJobStatus(job.status)
+  const isValidationPending = needsTrainingValidationFollowup(job)
   const isPolling = isActive || isValidationPending
   const epoch = typeof job.progress.epoch === 'number' ? job.progress.epoch : 0
   const totalEpochs = typeof job.progress.total_epochs === 'number' ? job.progress.total_epochs : 0
@@ -1046,23 +1064,17 @@ function JobCard({
   const finalLoss = typeof job.summary?.final_loss === 'number' ? job.summary.final_loss : null
   const finalEpoch = typeof job.summary?.final_epoch === 'number' ? job.summary.final_epoch : null
   const summaryTotalEpochs = typeof job.summary?.total_epochs === 'number' ? job.summary.total_epochs : null
-  const selectedCheckpointEpoch = typeof job.summary?.selected_checkpoint_epoch === 'number'
-    ? job.summary.selected_checkpoint_epoch
-    : null
-  const evaluatedCheckpoints = Array.isArray(job.summary?.evaluated_checkpoints)
-    ? job.summary?.evaluated_checkpoints
-    : []
-  const canCompareCheckpoints = evaluatedCheckpoints.length > 0
-  const validationPassed = job.summary?.validation_passed === true
-  const validationChecked = job.summary?.validation_checked === true
-  const validationRejected = validationChecked && !validationPassed && evaluatedCheckpoints.length > 0
-  const statusLabel = isValidationPending ? 'validating' : validationRejected ? 'rejected' : job.status
-  const validationMessage = typeof job.summary?.validation_message === 'string'
-    ? job.summary.validation_message
-    : null
-  const lastMessage = typeof job.summary?.last_message === 'string'
-    ? job.summary.last_message
-    : null
+  const championCheckpointEpoch = checkout.champion?.epoch ?? null
+  const championCheckpointScore = checkout.champion?.score ?? null
+  const selectedCheckpointEpoch = checkout.selected?.epoch ?? null
+  const selectedCheckpointScore = checkout.selected?.score ?? null
+  const canCompareCheckpoints = checkout.compare_ready
+  const validationPassed = checkout.validation_passed
+  const validationChecked = checkout.validation_checked
+  const validationRejected = checkout.status === 'rejected'
+  const statusLabel = getTrainingJobDisplayStatus(job)
+  const validationMessage = checkout.message
+  const lastMessage = checkout.last_message
   const startedAt = meta?.startedAt ?? readTimestamp(job.created_at)
   const finishedAt = meta?.finishedAt ?? getJobCompletedAt(job)
   const lastTouchedAt = meta?.lastTouchedAt ?? readTimestamp(job.updated_at)
@@ -1088,6 +1100,10 @@ function JobCard({
     uploading: { bg: 'bg-accent-dim', text: 'text-accent' },
     completed: { bg: 'bg-accent-dim', text: 'text-accent' },
     validating: { bg: 'bg-accent-dim', text: 'text-accent' },
+    promoted: { bg: 'bg-accent-dim', text: 'text-accent' },
+    manual_promoted: { bg: 'bg-accent-dim', text: 'text-accent' },
+    candidate_ready: { bg: 'bg-warning-dim', text: 'text-warning' },
+    kept_current: { bg: 'bg-raised', text: 'text-muted' },
     rejected: { bg: 'bg-warning-dim', text: 'text-warning' },
     failed: { bg: 'bg-error-dim', text: 'text-error' },
     cancelled: { bg: 'bg-raised', text: 'text-muted' },
@@ -1170,8 +1186,8 @@ function JobCard({
         <span className="rounded-full bg-raised px-2 py-1">round={job.round_id?.slice(0, 8) ?? 'n/a'}</span>
         <span className="rounded-full bg-raised px-2 py-1">snapshot={job.dataset_snapshot_id?.slice(0, 8) ?? 'n/a'}</span>
         <span className="rounded-full bg-raised px-2 py-1">phase={String(job.supervisor?.phase ?? job.status)}</span>
-        {typeof job.summary?.candidate_promotion_mode === 'string' && (
-          <span className="rounded-full bg-raised px-2 py-1">adoption={job.summary.candidate_promotion_mode}</span>
+        {checkout.adoption_mode && (
+          <span className="rounded-full bg-raised px-2 py-1">adoption={checkout.adoption_mode}</span>
         )}
       </div>
 
@@ -1183,23 +1199,27 @@ function JobCard({
         </div>
       )}
 
-      {(validationChecked || selectedCheckpointEpoch !== null) && (
-        <div className="mt-3 grid grid-cols-2 gap-3">
+      {(validationChecked || championCheckpointEpoch !== null || selectedCheckpointEpoch !== null) && (
+        <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-3">
           <Metric
             label="Validation"
-            value={
-              validationPassed
-                ? 'passed'
-                : validationRejected
-                  ? 'rejected'
-                  : validationChecked
-                    ? 'failed'
-                  : 'pending'
-            }
+            value={validationChecked ? checkout.status : 'pending'}
           />
           <Metric
             label="Champion"
-            value={selectedCheckpointEpoch !== null ? `epoch ${selectedCheckpointEpoch}` : '—'}
+            value={
+              championCheckpointEpoch !== null
+                ? `e${championCheckpointEpoch}${championCheckpointScore !== null ? ` · ${championCheckpointScore.toFixed(3)}` : ''}`
+                : '—'
+            }
+          />
+          <Metric
+            label="Selected"
+            value={
+              selectedCheckpointEpoch !== null
+                ? `e${selectedCheckpointEpoch}${selectedCheckpointScore !== null ? ` · ${selectedCheckpointScore.toFixed(3)}` : ''}`
+                : '—'
+            }
           />
         </div>
       )}
@@ -1335,6 +1355,17 @@ function getPathLabel(path: string): string {
   return parts[parts.length - 1] ?? path
 }
 
+function formatCheckpointMetric(
+  epoch: number | null | undefined,
+  score: number | null | undefined,
+  preset?: string | null,
+): string {
+  if (typeof epoch !== 'number') return '—'
+  const scoreLabel = typeof score === 'number' ? ` · ${score.toFixed(3)}` : ''
+  const presetLabel = preset ? ` · ${preset}` : ''
+  return `e${epoch}${scoreLabel}${presetLabel}`
+}
+
 function JobLogsModal({
   job,
   onClose,
@@ -1342,12 +1373,15 @@ function JobLogsModal({
   job: TrainingJob
   onClose: () => void
 }) {
-  const [activeTab, setActiveTab] = useState<'logs' | 'transcripts'>('logs')
+  const [activeTab, setActiveTab] = useState<'logs' | 'checkout' | 'transcripts'>('logs')
   const [chunks, setChunks] = useState<TrainingLogChunk[]>([])
   const [selectedSeq, setSelectedSeq] = useState<number | null>(null)
   const [content, setContent] = useState('')
   const [loadingLogs, setLoadingLogs] = useState(true)
   const [logError, setLogError] = useState('')
+  const [checkoutLedger, setCheckoutLedger] = useState<TrainingCheckoutLedgerEntry[]>([])
+  const [loadingLedger, setLoadingLedger] = useState(true)
+  const [ledgerError, setLedgerError] = useState('')
   const [preprocess, setPreprocess] = useState<TrainingPreprocessCacheResponse | null>(null)
   const [loadingPreprocess, setLoadingPreprocess] = useState(true)
   const [preprocessError, setPreprocessError] = useState('')
@@ -1404,18 +1438,33 @@ function JobLogsModal({
     }
   }
 
+  async function loadCheckoutLedger() {
+    setLoadingLedger(true)
+    setLedgerError('')
+    try {
+      const response = await fetchTrainingCheckoutLedger(job.job_id)
+      setCheckoutLedger(response.entries)
+    } catch (err) {
+      setLedgerError(err instanceof Error ? err.message : 'Failed to load checkout ledger')
+    } finally {
+      setLoadingLedger(false)
+    }
+  }
+
   useEffect(() => {
     void Promise.all([
       loadLogs(),
       loadPreprocess(),
+      loadCheckoutLedger(),
     ])
   }, [job.job_id])
 
   useEffect(() => {
-    if (!shouldPollJob(job)) return
+    if (!shouldWatchTrainingJob(job)) return
     const interval = setInterval(() => {
       void loadLogs({ keepSelection: true })
       void loadPreprocess({ keepSelection: true })
+      void loadCheckoutLedger()
     }, 10000)
     return () => clearInterval(interval)
   }, [job])
@@ -1449,6 +1498,7 @@ function JobLogsModal({
     null
   const totalLogBytes = chunks.reduce((sum, chunk) => sum + (chunk.bytes ?? 0), 0)
   const totalLogLines = chunks.reduce((sum, chunk) => sum + (chunk.lines ?? 0), 0)
+  const championLedgerCount = checkoutLedger.filter((entry) => entry.role === 'champion').length
   const firstChunkAt = chunks.length > 0 ? chunks[chunks.length - 1]?.created_at ?? null : null
   const lastChunkAt = chunks[0]?.created_at ?? null
   const cacheLookup =
@@ -1524,17 +1574,19 @@ function JobLogsModal({
           <div>
             <div className="text-heading text-sm font-semibold">Run Inspector</div>
             <div className="text-[10px] font-mono text-muted">{job.job_id.slice(0, 12)}</div>
-            <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
+            <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-5">
               <Metric label="Status" value={job.status} />
               <Metric label="Cache" value={String(cacheLookup)} />
               <Metric label="Logs" value={String(chunks.length)} />
               <Metric label="Entries" value={preprocess?.cache ? `${includedEntries.length}/${entries.length}` : '—'} />
+              <Metric label="Ledger" value={String(checkoutLedger.length)} />
             </div>
             <div className="mt-3 flex flex-wrap gap-4 text-[10px] font-mono text-muted">
               {lastChunkAt !== null && <span>last_log={formatDateTime(lastChunkAt)}</span>}
               {firstChunkAt !== null && <span>first_log={formatDateTime(firstChunkAt)}</span>}
               {preprocess?.cache?.updated_at ? <span>cache_updated={formatDateTime(preprocess.cache.updated_at)}</span> : null}
               {preprocess?.hydrated_from_r2 ? <span>cache_sync=refreshed</span> : null}
+              {championLedgerCount > 0 ? <span>champion_entries={championLedgerCount}</span> : null}
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -1542,6 +1594,7 @@ function JobLogsModal({
               onClick={() => {
                 void loadLogs({ keepSelection: true })
                 void loadPreprocess({ keepSelection: true })
+                void loadCheckoutLedger()
               }}
               className="rounded-lg border border-edge px-3 py-2 text-[11px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent"
               type="button"
@@ -1569,6 +1622,17 @@ function JobLogsModal({
             type="button"
           >
             Logs
+          </button>
+          <button
+            onClick={() => setActiveTab('checkout')}
+            className={`rounded-lg px-3 py-2 text-[11px] font-semibold transition-colors ${
+              activeTab === 'checkout'
+                ? 'bg-accent text-void'
+                : 'border border-edge text-primary hover:border-accent hover:text-accent'
+            }`}
+            type="button"
+          >
+            Checkout Ledger
           </button>
           <button
             onClick={() => setActiveTab('transcripts')}
@@ -1644,6 +1708,56 @@ function JobLogsModal({
                 )}
               </div>
             </div>
+          </div>
+        ) : activeTab === 'checkout' ? (
+          <div className="min-h-0 flex-1 overflow-y-auto rounded-xl border border-edge bg-raised p-4">
+            {ledgerError ? (
+              <div className="rounded-lg border border-error/20 bg-error-dim px-3 py-2 text-error text-sm">
+                {ledgerError}
+              </div>
+            ) : loadingLedger ? (
+              <div className="text-sm text-muted">Loading checkout ledger…</div>
+            ) : checkoutLedger.length === 0 ? (
+              <div className="rounded-lg border border-dashed border-edge bg-surface px-3 py-6 text-center text-sm text-subtle">
+                No persisted checkout entries for this run yet.
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {checkoutLedger.map((entry) => (
+                  <div key={entry.entry_id} className="rounded-xl border border-edge bg-surface p-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <div className="text-primary text-sm font-semibold">{entry.role.replaceAll('_', ' ')}</div>
+                        <div className="mt-1 text-[10px] font-mono text-muted">
+                          {entry.run_name ?? 'checkpoint'} · epoch={entry.epoch ?? 'n/a'} · score={typeof entry.score === 'number' ? entry.score.toFixed(3) : 'n/a'}
+                        </div>
+                      </div>
+                      <div className="text-right text-[10px] font-mono">
+                        <div className={entry.ok === true ? 'text-accent' : entry.ok === false ? 'text-error' : 'text-muted'}>
+                          {entry.ok === true ? 'passed' : entry.ok === false ? 'failed' : 'n/a'}
+                        </div>
+                        <div className="text-muted">{formatDateTime(entry.created_at)}</div>
+                      </div>
+                    </div>
+
+                    <div className="mt-3 flex flex-wrap gap-2 text-[10px] font-mono text-muted">
+                      <span className="rounded-full bg-raised px-2 py-0.5">preset={entry.preset ?? 'n/a'}</span>
+                      <span className="rounded-full bg-raised px-2 py-0.5">source={entry.source}</span>
+                      {entry.adoption_mode && (
+                        <span className="rounded-full bg-raised px-2 py-0.5">adoption={entry.adoption_mode}</span>
+                      )}
+                      {typeof entry.passed_samples === 'number' && typeof entry.total_samples === 'number' && (
+                        <span className="rounded-full bg-raised px-2 py-0.5">samples={entry.passed_samples}/{entry.total_samples}</span>
+                      )}
+                    </div>
+
+                    {entry.message && (
+                      <div className="mt-3 text-[11px] leading-relaxed text-subtle">{entry.message}</div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         ) : (
           <div className="grid min-h-0 flex-1 grid-cols-[320px_1fr] gap-4">

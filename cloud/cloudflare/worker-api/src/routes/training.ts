@@ -18,6 +18,8 @@ import {
   getVoice,
   listTrainingJobs,
   listTrainingLogChunks,
+  listTrainingCheckoutLedger,
+  replaceTrainingCheckoutLedgerForJob,
   replaceDatasetPreprocessCacheEntries,
   updateTrainingRound,
   updateDatasetPreprocessCacheEntry,
@@ -27,6 +29,7 @@ import {
   upsertDatasetPreprocessCache,
   type DatasetPreprocessCache,
   type DatasetPreprocessCacheEntry,
+  type TrainingCheckoutLedgerEntry,
 } from "../lib/d1";
 import {
   createPod,
@@ -38,7 +41,9 @@ import {
   invokeServerlessAsync,
   terminatePod,
 } from "../lib/runpod";
+import { buildTrainingCheckoutSearch } from "../lib/training-checkout";
 import { buildTrainingAdvice } from "../lib/training-advisor";
+import { buildLLMTrainingAdvice } from "../lib/training-advisor-llm";
 import { enrichOutputWithReviewAsr } from "../lib/review-asr";
 import { authMiddleware } from "../middleware/auth";
 import type {
@@ -196,8 +201,8 @@ type ValidationSampleOutcome = {
   failureMessage: string | null;
 };
 
+const QUEUED_JOB_STATUSES = new Set(["queued"]);
 const ACTIVE_JOB_STATUSES = new Set([
-  "pending",
   "running",
   "provisioning",
   "downloading",
@@ -207,7 +212,6 @@ const ACTIVE_JOB_STATUSES = new Set([
   "uploading",
 ]);
 const ACTIVE_RUNTIME_RECOVERY_STATUSES = new Set([
-  "pending",
   "running",
   "downloading",
   "preprocessing",
@@ -216,7 +220,6 @@ const ACTIVE_RUNTIME_RECOVERY_STATUSES = new Set([
   "uploading",
 ]);
 const ACTIVE_STAGE_STALE_MS: Record<string, number> = {
-  pending: 5 * 60 * 1000,
   running: 12 * 60 * 1000,
   downloading: 10 * 60 * 1000,
   preprocessing: 30 * 60 * 1000,
@@ -227,6 +230,7 @@ const ACTIVE_STAGE_STALE_MS: Record<string, number> = {
 const MAX_STALL_RECOVERY_ATTEMPTS = 3;
 const DEFAULT_WORKER_PUBLIC_URL = "https://qwen-tts-api.brian-367.workers.dev";
 const TRAINING_SWEEP_LIMIT = 100;
+const DEFAULT_MAX_ACTIVE_TRAINING_JOBS_PER_VOICE = 3;
 const DEFAULT_TRAINING_IMAGE_FALLBACKS = [
   "ghcr.io/bc-dunia/qwen3-tts-training@sha256:fd32cc16f8febc7ce23a08eea38b9b62beaa7819139895e241a8bdddb6bf2357",
 ];
@@ -698,10 +702,26 @@ const ensureTrainingRound = async ({
     voice_id: voice.voice_id,
     dataset_snapshot_id: datasetSnapshotId,
     round_index: (previousRound?.round_index ?? 0) + 1,
-    status: "running",
+    status: "queued",
     production_checkpoint_r2_prefix: voice.checkpoint_r2_prefix,
     production_run_name: voice.run_name,
     production_epoch: voice.epoch,
+    production_preset: voice.checkpoint_preset,
+    production_score: voice.checkpoint_score,
+    production_job_id: voice.checkpoint_job_id,
+    champion_checkpoint_r2_prefix: null,
+    champion_run_name: null,
+    champion_epoch: null,
+    champion_preset: null,
+    champion_score: null,
+    champion_job_id: null,
+    selected_checkpoint_r2_prefix: null,
+    selected_run_name: null,
+    selected_epoch: null,
+    selected_preset: null,
+    selected_score: null,
+    selected_job_id: null,
+    adoption_mode: null,
     candidate_checkpoint_r2_prefix: null,
     candidate_run_name: null,
     candidate_epoch: null,
@@ -725,6 +745,9 @@ const getCurrentReadyVoiceScore = async (
   if (voice.status !== "ready" || !currentPrefix) {
     return null;
   }
+  if (typeof voice.checkpoint_score === "number" && Number.isFinite(voice.checkpoint_score)) {
+    return voice.checkpoint_score;
+  }
 
   const jobs = await listTrainingJobs(c.env.DB, { voice_id: voice.voice_id, limit: 100 });
   for (const candidate of jobs) {
@@ -734,6 +757,14 @@ const getCurrentReadyVoiceScore = async (
     if (selectedPrefix === currentPrefix) {
       const selectedScore = Number(summary.selected_score);
       if (Number.isFinite(selectedScore)) {
+        await updateVoice(c.env.DB, voice.voice_id, {
+          checkpoint_score: selectedScore,
+          checkpoint_preset:
+            typeof summary.selected_preset === "string" && summary.selected_preset.trim()
+              ? summary.selected_preset.trim()
+              : null,
+          checkpoint_job_id: candidate.job_id,
+        });
         return selectedScore;
       }
     }
@@ -745,6 +776,14 @@ const getCurrentReadyVoiceScore = async (
     if (manualPrefix === currentPrefix) {
       const manualScore = Number(summary.manual_promoted_score);
       if (Number.isFinite(manualScore)) {
+        await updateVoice(c.env.DB, voice.voice_id, {
+          checkpoint_score: manualScore,
+          checkpoint_preset:
+            typeof summary.manual_promoted_preset === "string" && summary.manual_promoted_preset.trim()
+              ? summary.manual_promoted_preset.trim()
+              : null,
+          checkpoint_job_id: candidate.job_id,
+        });
         return manualScore;
       }
     }
@@ -921,13 +960,17 @@ const applyValidatedCheckpointOutcome = async ({
       checkpoint_r2_prefix: candidatePrefix,
       run_name: candidateRunName,
       epoch: candidateEpoch,
+      checkpoint_preset: candidatePreset,
+      checkpoint_score: candidateScore,
+      checkpoint_job_id: job.job_id,
       candidate_checkpoint_r2_prefix: null,
       candidate_run_name: null,
       candidate_epoch: null,
+      candidate_preset: null,
       candidate_score: null,
       candidate_job_id: null,
       settings: promotedSettings,
-      active_round_id: job.round_id ?? voice.active_round_id ?? null,
+      active_round_id: voice.active_round_id ?? job.round_id ?? null,
     });
     if (job.round_id) {
       await updateTrainingRound(c.env.DB, job.round_id, {
@@ -935,6 +978,22 @@ const applyValidatedCheckpointOutcome = async ({
         production_checkpoint_r2_prefix: candidatePrefix,
         production_run_name: candidateRunName,
         production_epoch: candidateEpoch,
+        production_preset: candidatePreset,
+        production_score: candidateScore,
+        production_job_id: job.job_id,
+        champion_checkpoint_r2_prefix: candidatePrefix,
+        champion_run_name: candidateRunName,
+        champion_epoch: candidateEpoch,
+        champion_preset: candidatePreset,
+        champion_score: candidateScore,
+        champion_job_id: job.job_id,
+        selected_checkpoint_r2_prefix: candidatePrefix,
+        selected_run_name: candidateRunName,
+        selected_epoch: candidateEpoch,
+        selected_preset: candidatePreset,
+        selected_score: candidateScore,
+        selected_job_id: job.job_id,
+        adoption_mode: decision.mode,
         candidate_checkpoint_r2_prefix: null,
         candidate_run_name: null,
         candidate_epoch: null,
@@ -958,13 +1017,27 @@ const applyValidatedCheckpointOutcome = async ({
       candidate_checkpoint_r2_prefix: candidatePrefix,
       candidate_run_name: candidateRunName,
       candidate_epoch: candidateEpoch,
+      candidate_preset: candidatePreset,
       candidate_score: candidateScore,
       candidate_job_id: job.job_id,
-      active_round_id: job.round_id ?? voice.active_round_id ?? null,
+      active_round_id: voice.active_round_id ?? job.round_id ?? null,
     });
     if (job.round_id) {
       await updateTrainingRound(c.env.DB, job.round_id, {
         status: "candidate_ready",
+        champion_checkpoint_r2_prefix: candidatePrefix,
+        champion_run_name: candidateRunName,
+        champion_epoch: candidateEpoch,
+        champion_preset: candidatePreset,
+        champion_score: candidateScore,
+        champion_job_id: job.job_id,
+        selected_checkpoint_r2_prefix: candidatePrefix,
+        selected_run_name: candidateRunName,
+        selected_epoch: candidateEpoch,
+        selected_preset: candidatePreset,
+        selected_score: candidateScore,
+        selected_job_id: job.job_id,
+        adoption_mode: decision.mode,
         candidate_checkpoint_r2_prefix: candidatePrefix,
         candidate_run_name: candidateRunName,
         candidate_epoch: candidateEpoch,
@@ -986,6 +1059,19 @@ const applyValidatedCheckpointOutcome = async ({
   if (job.round_id) {
     await updateTrainingRound(c.env.DB, job.round_id, {
       status: "superseded",
+      champion_checkpoint_r2_prefix: candidatePrefix,
+      champion_run_name: candidateRunName,
+      champion_epoch: candidateEpoch,
+      champion_preset: candidatePreset,
+      champion_score: candidateScore,
+      champion_job_id: job.job_id,
+      selected_checkpoint_r2_prefix: decision.preservedPrefix,
+      selected_run_name: voice.run_name,
+      selected_epoch: decision.preservedEpoch,
+      selected_preset: voice.checkpoint_preset ?? "kept_existing_best",
+      selected_score: decision.preservedScore,
+      selected_job_id: voice.checkpoint_job_id,
+      adoption_mode: decision.mode,
       candidate_checkpoint_r2_prefix: candidatePrefix,
       candidate_run_name: candidateRunName,
       candidate_epoch: candidateEpoch,
@@ -1421,6 +1507,104 @@ const getConfiguredTrainingTemplateId = (c: Context<AppContext>): string | null 
   return templateId ? templateId : null;
 };
 
+const getMaxActiveTrainingJobsPerVoice = (c: Context<AppContext>): number => {
+  const raw = Number(c.env.TRAINING_MAX_ACTIVE_JOBS_PER_VOICE ?? DEFAULT_MAX_ACTIVE_TRAINING_JOBS_PER_VOICE);
+  if (!Number.isFinite(raw)) {
+    return DEFAULT_MAX_ACTIVE_TRAINING_JOBS_PER_VOICE;
+  }
+  return Math.max(1, Math.min(Math.trunc(raw), 6));
+};
+
+const isGpuSupplyConstraintErrorMessage = (message: string | null | undefined): boolean => {
+  const normalized = String(message ?? "").toLowerCase();
+  return normalized.includes("no longer any instances available") || normalized.includes("supply_constraint");
+};
+
+const getJobDatasetSignature = (job: Pick<TrainingJob, "summary">): string | null =>
+  getSummaryString((job.summary ?? {}) as Record<string, unknown>, "preprocess_cache_dataset_signature");
+
+const getDatasetTrainRawR2Key = (datasetPrefix: string): string =>
+  `${stripSlashes(datasetPrefix)}/train_raw.jsonl`;
+
+const hasReusablePreprocessArtifacts = async (
+  c: Context<AppContext>,
+  job: Pick<TrainingJob, "voice_id" | "dataset_r2_prefix" | "summary">
+): Promise<boolean> => {
+  const summary = (job.summary ?? {}) as Record<string, unknown>;
+  if (
+    getSummaryString(summary, "preprocess_cache_r2_prefix") ||
+    getSummaryString(summary, "preprocess_cache_train_raw_r2_key")
+  ) {
+    return true;
+  }
+  const datasetSignature = getJobDatasetSignature(job);
+  if (datasetSignature) {
+    const cache = await getDatasetPreprocessCache(
+      c.env.DB,
+      job.voice_id,
+      job.dataset_r2_prefix,
+      datasetSignature
+    );
+    if (cache?.train_raw_r2_key || cache?.cache_r2_prefix) {
+      return true;
+    }
+  }
+  const trainRawKey = getDatasetTrainRawR2Key(job.dataset_r2_prefix);
+  return Boolean(await c.env.R2.head(trainRawKey));
+};
+
+const sameDatasetPreprocessScope = (left: TrainingJob, right: TrainingJob): boolean => {
+  if (left.dataset_r2_prefix !== right.dataset_r2_prefix) {
+    return false;
+  }
+  const leftSignature = getJobDatasetSignature(left);
+  const rightSignature = getJobDatasetSignature(right);
+  if (!leftSignature || !rightSignature) {
+    return true;
+  }
+  return leftSignature === rightSignature;
+};
+
+const queueTrainingJob = async (
+  c: Context<AppContext>,
+  job: TrainingJob,
+  reason: string,
+  extraSummary: Record<string, unknown> = {}
+): Promise<TrainingJob> => {
+  const now = Date.now();
+  await updateTrainingJob(c.env.DB, job.job_id, {
+    runpod_pod_id: null,
+    status: "queued",
+    started_at: null,
+    completed_at: null,
+    error_message: null,
+    summary: {
+      ...(job.summary ?? {}),
+      queue_wait_reason: reason,
+      queue_last_enqueued_at: now,
+      queue_active_limit: getMaxActiveTrainingJobsPerVoice(c),
+      ...extraSummary,
+    },
+    supervisor: {
+      ...(job.supervisor ?? {}),
+      phase: "queued",
+      last_transition_at: now,
+    },
+  });
+  if (job.round_id) {
+    const round = await getTrainingRound(c.env.DB, job.round_id);
+    await updateTrainingRound(c.env.DB, job.round_id, {
+      status: "queued",
+      summary: {
+        ...(round?.summary ?? {}),
+        queue_wait_reason: reason,
+        last_job_id: job.job_id,
+      },
+    });
+  }
+  return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
+};
+
 const createTrainingPodForJob = async (
   c: Context<AppContext>,
   job: TrainingJob,
@@ -1480,6 +1664,140 @@ const createTrainingPodForJob = async (
   }
 
   throw new Error("No training template or direct image configured");
+};
+
+const launchTrainingJob = async (
+  c: Context<AppContext>,
+  job: TrainingJob,
+  options?: { imageAttemptIndex?: number }
+): Promise<TrainingJob> => {
+  let launchResult: Awaited<ReturnType<typeof createTrainingPodForJob>>;
+  try {
+    launchResult = await createTrainingPodForJob(c, job, options);
+  } catch (podError) {
+    const errMsg = podError instanceof Error ? podError.message : String(podError);
+    if (isGpuSupplyConstraintErrorMessage(errMsg)) {
+      return queueTrainingJob(c, job, "gpu_supply_constraint", {
+        queue_last_launch_error: errMsg,
+        queue_last_launch_attempt_at: Date.now(),
+      });
+    }
+    await updateTrainingJob(c.env.DB, job.job_id, {
+      status: "failed",
+      error_message: errMsg,
+      completed_at: Date.now(),
+      summary: {
+        ...(job.summary ?? {}),
+        queue_last_launch_error: errMsg,
+        queue_last_launch_attempt_at: Date.now(),
+      },
+      supervisor: {
+        ...(job.supervisor ?? {}),
+        phase: "failed",
+        last_transition_at: Date.now(),
+      },
+    });
+    if (job.round_id) {
+      await updateTrainingRound(c.env.DB, job.round_id, {
+        status: "failed",
+        completed_at: Date.now(),
+        summary: {
+          failed_job_id: job.job_id,
+          error_message: errMsg,
+        },
+      });
+    }
+    return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
+  }
+
+  const now = Date.now();
+  await updateTrainingJob(c.env.DB, job.job_id, {
+    runpod_pod_id: launchResult.pod.podId,
+    status: "provisioning",
+    progress: {},
+    last_heartbeat_at: null,
+    started_at: now,
+    completed_at: null,
+    error_message: null,
+    summary: {
+      ...(job.summary ?? {}),
+      ...launchResult.summary,
+      queue_wait_reason: null,
+      queue_last_launch_error: null,
+      queue_last_launch_attempt_at: now,
+    },
+    supervisor: {
+      ...(job.supervisor ?? {}),
+      phase: "provisioning",
+      last_transition_at: now,
+      last_pod_id: launchResult.pod.podId,
+    },
+  });
+
+  if (job.round_id) {
+    await updateTrainingRound(c.env.DB, job.round_id, {
+      status: "running",
+      started_at: now,
+      summary: {
+        dataset_snapshot_id: job.dataset_snapshot_id,
+        initial_job_id: job.job_id,
+        training_image_name: launchResult.summary.training_image_name ?? null,
+        training_resolved_image_name: launchResult.summary.training_resolved_image_name ?? null,
+      },
+    });
+  }
+
+  return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
+};
+
+const launchQueuedTrainingJobsForVoice = async (
+  c: Context<AppContext>,
+  voiceId: string
+): Promise<number> => {
+  const jobs = (await listTrainingJobs(c.env.DB, { voice_id: voiceId, limit: 100 })).sort(
+    (left, right) => left.created_at - right.created_at
+  );
+  if (jobs.length === 0) {
+    return 0;
+  }
+
+  const activeLimit = getMaxActiveTrainingJobsPerVoice(c);
+  let activeCount = jobs.filter((job) => ACTIVE_JOB_STATUSES.has(job.status)).length;
+  if (activeCount >= activeLimit) {
+    return 0;
+  }
+
+  let launched = 0;
+  for (const job of jobs) {
+    if (!(job.status === "queued" || job.status === "pending")) {
+      continue;
+    }
+    if (activeCount >= activeLimit) {
+      break;
+    }
+
+    const preprocessReady = await hasReusablePreprocessArtifacts(c, job);
+    if (!preprocessReady) {
+      const hasSiblingBuilder = jobs.some(
+        (candidate) =>
+          candidate.job_id !== job.job_id &&
+          ACTIVE_JOB_STATUSES.has(candidate.status) &&
+          sameDatasetPreprocessScope(candidate, job)
+      );
+      if (hasSiblingBuilder) {
+        await queueTrainingJob(c, job, "waiting_for_preprocess_artifacts");
+        continue;
+      }
+    }
+
+    const updated = await launchTrainingJob(c, job);
+    if (ACTIVE_JOB_STATUSES.has(updated.status)) {
+      activeCount += 1;
+      launched += 1;
+    }
+  }
+
+  return launched;
 };
 
 const getDirectFallbackDockerArgs = (
@@ -1833,35 +2151,14 @@ const recoverFailedDependencyJob = async (
     voice_id: job.voice_id,
     limit: 20,
   });
-  const hasDifferentActiveJob = siblingJobs.some(
+  const activeSiblingCount = siblingJobs.filter(
     (candidate) => candidate.job_id !== job.job_id && ACTIVE_JOB_STATUSES.has(candidate.status)
-  );
-  if (hasDifferentActiveJob) {
-    await updateTrainingJob(c.env.DB, job.job_id, {
-      summary: {
-        ...summary,
-        training_image_recovery_deferred: true,
-        training_image_recovery_deferred_reason: "another_active_job_exists",
-      },
+  ).length;
+  if (activeSiblingCount >= getMaxActiveTrainingJobsPerVoice(c)) {
+    return queueTrainingJob(c, job, "concurrency_limit", {
+      training_image_recovery_deferred: true,
+      training_image_recovery_deferred_reason: "concurrency_limit",
     });
-    return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
-  }
-
-  const voice = await getVoice(c.env.DB, job.voice_id);
-  if (
-    voice?.active_round_id &&
-    job.round_id &&
-    voice.active_round_id !== job.round_id
-  ) {
-    await updateTrainingJob(c.env.DB, job.job_id, {
-      summary: {
-        ...summary,
-        training_image_recovery_deferred: true,
-        training_image_recovery_deferred_reason: "obsolete_round",
-        active_round_id: voice.active_round_id,
-      },
-    });
-    return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
   }
 
   if (job.runpod_pod_id) {
@@ -1924,12 +2221,20 @@ const recoverFailedDependencyJob = async (
     }
     return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
   } catch (error) {
+    const errMsg =
+      error instanceof Error ? error.message : "Failed to launch dependency recovery pod";
+    if (isGpuSupplyConstraintErrorMessage(errMsg)) {
+      return queueTrainingJob(c, job, "gpu_supply_constraint", {
+        ...baseSummary,
+        training_image_recovery_deferred: true,
+        training_image_recovery_deferred_reason: "gpu_supply_constraint",
+        queue_last_launch_error: errMsg,
+        queue_last_launch_attempt_at: Date.now(),
+      });
+    }
     await updateTrainingJob(c.env.DB, job.job_id, {
       status: "failed",
-      error_message:
-        error instanceof Error
-          ? error.message
-          : "Failed to launch dependency recovery pod",
+      error_message: errMsg,
       completed_at: Date.now(),
       summary: {
         ...baseSummary,
@@ -2369,9 +2674,104 @@ const buildValidationScoreParts = ({
   return parts;
 };
 
-const serializeTrainingJob = (job: TrainingJob): Omit<TrainingJob, "job_token"> => {
+const buildTrainingCheckoutLedgerEntries = (
+  job: TrainingJob,
+  summary: Record<string, unknown>,
+  createdAt: number
+): TrainingCheckoutLedgerEntry[] => {
+  const checkout = buildTrainingCheckoutSearch({
+    ...job,
+    summary,
+  });
+  const evaluationsByPrefix = new Map(checkout.evaluated.map((value) => [value.prefix, value]));
+  const entries: TrainingCheckoutLedgerEntry[] = checkout.evaluated.map((value) => ({
+    entry_id: crypto.randomUUID(),
+    round_id: job.round_id ?? null,
+    job_id: job.job_id,
+    voice_id: job.voice_id,
+    checkpoint_r2_prefix: value.prefix,
+    run_name: value.run_name,
+    epoch: value.epoch,
+    preset: value.preset,
+    score: value.score,
+    ok: value.ok,
+    passed_samples: value.passed_samples,
+    total_samples: value.total_samples,
+    message: value.message,
+    role: "evaluated",
+    source: "validation",
+    adoption_mode: checkout.adoption_mode,
+    created_at: createdAt,
+    updated_at: createdAt,
+  }));
+
+  const pushRoleEntry = (
+    role: "champion" | "selected" | "manual_promoted",
+    target: NonNullable<typeof checkout.champion>,
+    source: "validation" | "manual_promotion" | "recovery"
+  ) => {
+    const evaluation = evaluationsByPrefix.get(target.prefix) ?? null;
+    entries.push({
+      entry_id: crypto.randomUUID(),
+      round_id: job.round_id ?? null,
+      job_id: job.job_id,
+      voice_id: job.voice_id,
+      checkpoint_r2_prefix: target.prefix,
+      run_name: target.run_name,
+      epoch: target.epoch,
+      preset: target.preset,
+      score: target.score,
+      ok: evaluation?.ok ?? (checkout.validation_passed ? true : null),
+      passed_samples: evaluation?.passed_samples ?? null,
+      total_samples: evaluation?.total_samples ?? null,
+      message: evaluation?.message ?? checkout.message,
+      role,
+      source,
+      adoption_mode: checkout.adoption_mode,
+      created_at: createdAt,
+      updated_at: createdAt,
+    });
+  };
+
+  if (checkout.champion) {
+    pushRoleEntry("champion", checkout.champion, "validation");
+  }
+  if (checkout.selected) {
+    pushRoleEntry(
+      "selected",
+      checkout.selected,
+      checkout.manual_promoted?.prefix === checkout.selected.prefix
+        ? "manual_promotion"
+        : checkout.evaluated.length === 0
+          ? "recovery"
+          : "validation"
+    );
+  }
+  if (checkout.manual_promoted) {
+    pushRoleEntry("manual_promoted", checkout.manual_promoted, "manual_promotion");
+  }
+
+  return entries;
+};
+
+const syncTrainingCheckoutLedgerForJob = async (
+  c: Context<AppContext>,
+  job: TrainingJob,
+  summary: Record<string, unknown>,
+  createdAt = Date.now()
+): Promise<void> => {
+  const entries = buildTrainingCheckoutLedgerEntries(job, summary, createdAt);
+  await replaceTrainingCheckoutLedgerForJob(c.env.DB, job.job_id, entries);
+};
+
+const serializeTrainingJob = (
+  job: TrainingJob
+): Omit<TrainingJob, "job_token"> & { checkout_search: NonNullable<TrainingJob["checkout_search"]> } => {
   const { job_token: _jobToken, ...safeJob } = job;
-  return safeJob;
+  return {
+    ...safeJob,
+    checkout_search: buildTrainingCheckoutSearch(job),
+  };
 };
 
 const serializeTrainingRound = (round: TrainingRound): TrainingRound => round;
@@ -3056,28 +3456,30 @@ const advanceAsyncCheckpointValidation = async (
         : adoption.mode === "candidate"
           ? `${champion.message} | stored as candidate; production remains unchanged until promotion`
           : champion.message;
+    const nextSummary = {
+      ...currentSummary,
+      force_revalidation: false,
+      validation_in_progress: false,
+      validation_checked: true,
+      validation_passed: true,
+      validation_message: validationMessage,
+      selected_checkpoint_prefix: adoption.selectedPrefix,
+      selected_checkpoint_epoch: adoption.selectedEpoch,
+      selected_preset: adoption.selectedPreset,
+      selected_score: adoption.selectedScore,
+      candidate_checkpoint_prefix: champion.prefix,
+      candidate_checkpoint_epoch: champion.epoch,
+      candidate_preset: champion.preset_name,
+      candidate_score: champion.score,
+      candidate_promotion_mode: adoption.mode,
+      evaluated_checkpoints: evaluations,
+      async_validation: null,
+    };
     await updateTrainingJob(c.env.DB, job.job_id, {
       status: "completed",
       completed_at: job.completed_at ?? Date.now(),
       progress,
-      summary: {
-        ...currentSummary,
-        validation_in_progress: false,
-        validation_checked: true,
-        validation_passed: true,
-        validation_message: validationMessage,
-        selected_checkpoint_prefix: adoption.selectedPrefix,
-        selected_checkpoint_epoch: adoption.selectedEpoch,
-        selected_preset: adoption.selectedPreset,
-        selected_score: adoption.selectedScore,
-        candidate_checkpoint_prefix: champion.prefix,
-        candidate_checkpoint_epoch: champion.epoch,
-        candidate_preset: champion.preset_name,
-        candidate_score: champion.score,
-        candidate_promotion_mode: adoption.mode,
-        evaluated_checkpoints: evaluations,
-        async_validation: null,
-      },
+      summary: nextSummary,
       supervisor: {
         ...(job.supervisor ?? {}),
         phase: "validation_completed",
@@ -3085,6 +3487,7 @@ const advanceAsyncCheckpointValidation = async (
         last_validation_checkpoint_epoch: champion.epoch,
       },
     });
+    await syncTrainingCheckoutLedgerForJob(c, job, nextSummary, job.completed_at ?? Date.now());
     return { status: "completed", progress };
   };
 
@@ -3092,21 +3495,24 @@ const advanceAsyncCheckpointValidation = async (
     message: string,
     evaluations: CheckpointEvaluation[]
   ): Promise<{ status: string; progress: TrainingProgress }> => {
-    if (
-      !shouldKeepReadyVoiceOnValidationFailure(voice, currentSummary, {
-        evaluatedCheckpoints: evaluations,
-        validationRunName: parseRunNameFromCheckpointPrefix(candidateCheckpoints[0]?.r2_prefix ?? ""),
-        forceRevalidation: currentSummary.force_revalidation === true,
-      })
-    ) {
+    const keepReadyVoice = shouldKeepReadyVoiceOnValidationFailure(voice, currentSummary, {
+      evaluatedCheckpoints: evaluations,
+      validationRunName: parseRunNameFromCheckpointPrefix(candidateCheckpoints[0]?.r2_prefix ?? ""),
+      forceRevalidation: currentSummary.force_revalidation === true,
+    });
+    if (!keepReadyVoice) {
       await updateVoice(c.env.DB, job.voice_id, {
         status: "created",
         checkpoint_r2_prefix: null,
         run_name: null,
         epoch: null,
+        checkpoint_preset: null,
+        checkpoint_score: null,
+        checkpoint_job_id: null,
         candidate_checkpoint_r2_prefix: null,
         candidate_run_name: null,
         candidate_epoch: null,
+        candidate_preset: null,
         candidate_score: null,
         candidate_job_id: null,
       });
@@ -3115,6 +3521,30 @@ const advanceAsyncCheckpointValidation = async (
     if (job.round_id) {
       await updateTrainingRound(c.env.DB, job.round_id, {
         status: "failed",
+        production_checkpoint_r2_prefix: keepReadyVoice ? voice.checkpoint_r2_prefix : null,
+        production_run_name: keepReadyVoice ? voice.run_name : null,
+        production_epoch: keepReadyVoice ? voice.epoch : null,
+        production_preset: keepReadyVoice ? voice.checkpoint_preset : null,
+        production_score: keepReadyVoice ? voice.checkpoint_score : null,
+        production_job_id: keepReadyVoice ? voice.checkpoint_job_id : null,
+        champion_checkpoint_r2_prefix: null,
+        champion_run_name: null,
+        champion_epoch: null,
+        champion_preset: null,
+        champion_score: null,
+        champion_job_id: null,
+        selected_checkpoint_r2_prefix: null,
+        selected_run_name: null,
+        selected_epoch: null,
+        selected_preset: null,
+        selected_score: null,
+        selected_job_id: null,
+        adoption_mode: null,
+        candidate_checkpoint_r2_prefix: null,
+        candidate_run_name: null,
+        candidate_epoch: null,
+        candidate_score: null,
+        candidate_job_id: null,
         completed_at: Date.now(),
         summary: {
           ...(await getTrainingRound(c.env.DB, job.round_id))?.summary,
@@ -3124,32 +3554,34 @@ const advanceAsyncCheckpointValidation = async (
       });
     }
 
+    const nextSummary = {
+      ...currentSummary,
+      force_revalidation: false,
+      validation_in_progress: false,
+      validation_checked: true,
+      validation_passed: false,
+      validation_failed: true,
+      validation_rejected: true,
+      validation_message: message,
+      selected_checkpoint_prefix: null,
+      selected_checkpoint_epoch: null,
+      selected_preset: null,
+      selected_score: null,
+      evaluated_checkpoints: evaluations,
+      async_validation: null,
+    };
     await updateTrainingJob(c.env.DB, job.job_id, {
       status: "completed",
       error_message: null,
       completed_at: job.completed_at ?? Date.now(),
       progress,
-      summary: {
-        ...currentSummary,
-        force_revalidation: false,
-        validation_in_progress: false,
-        validation_checked: true,
-        validation_passed: false,
-        validation_failed: true,
-        validation_rejected: true,
-        validation_message: message,
-        selected_checkpoint_prefix: null,
-        selected_checkpoint_epoch: null,
-        selected_preset: null,
-        selected_score: null,
-        evaluated_checkpoints: evaluations,
-        async_validation: null,
-      },
+      summary: nextSummary,
       supervisor: {
         ...(job.supervisor ?? {}),
         phase: "validation_failed",
       },
     });
+    await syncTrainingCheckoutLedgerForJob(c, job, nextSummary, job.completed_at ?? Date.now());
     return { status: "completed", progress };
   };
 
@@ -3745,29 +4177,30 @@ const advanceAsync06bCheckpointValidation = async (
         : adoption.mode === "candidate"
           ? `${result.message} | stored as candidate; production remains unchanged until promotion`
           : result.message;
+    const nextSummary = {
+      ...currentSummary,
+      force_revalidation: false,
+      validation_in_progress: false,
+      validation_checked: true,
+      validation_passed: true,
+      validation_message: validationMessage,
+      selected_checkpoint_prefix: adoption.selectedPrefix,
+      selected_checkpoint_epoch: adoption.selectedEpoch,
+      selected_preset: adoption.selectedPreset,
+      selected_score: adoption.selectedScore,
+      candidate_checkpoint_prefix: promotedPrefix,
+      candidate_checkpoint_epoch: promotedEpoch,
+      candidate_preset: result.presetName,
+      candidate_score: result.aggregateScore,
+      candidate_promotion_mode: adoption.mode,
+      evaluated_checkpoints: nextEvaluations,
+      async_validation: null,
+    };
     await updateTrainingJob(c.env.DB, job.job_id, {
       status: "completed",
       completed_at: job.completed_at ?? Date.now(),
       progress,
-        summary: {
-          ...currentSummary,
-          force_revalidation: false,
-          validation_in_progress: false,
-          validation_checked: true,
-          validation_passed: true,
-          validation_message: validationMessage,
-          selected_checkpoint_prefix: adoption.selectedPrefix,
-          selected_checkpoint_epoch: adoption.selectedEpoch,
-          selected_preset: adoption.selectedPreset,
-          selected_score: adoption.selectedScore,
-          candidate_checkpoint_prefix: promotedPrefix,
-          candidate_checkpoint_epoch: promotedEpoch,
-          candidate_preset: result.presetName,
-          candidate_score: result.aggregateScore,
-          candidate_promotion_mode: adoption.mode,
-          evaluated_checkpoints: nextEvaluations,
-          async_validation: null,
-        },
+      summary: nextSummary,
       supervisor: {
         ...(job.supervisor ?? {}),
         phase: "validation_completed",
@@ -3775,6 +4208,7 @@ const advanceAsync06bCheckpointValidation = async (
         last_validation_checkpoint_epoch: promotedEpoch,
       },
     });
+    await syncTrainingCheckoutLedgerForJob(c, job, nextSummary, job.completed_at ?? Date.now());
     return { status: "completed", progress };
   }
 
@@ -3792,21 +4226,24 @@ const advanceAsync06bCheckpointValidation = async (
     return startCheckpointValidation(nextIndex, nextEvaluations);
   }
 
-  if (
-    !shouldKeepReadyVoiceOnValidationFailure(voice, currentSummary, {
-      evaluatedCheckpoints: nextEvaluations,
-      validationRunName: parseRunNameFromCheckpointPrefix(candidateCheckpoints[0]?.r2_prefix ?? ""),
-      forceRevalidation: currentSummary.force_revalidation === true,
-    })
-  ) {
+  const keepReadyVoice = shouldKeepReadyVoiceOnValidationFailure(voice, currentSummary, {
+    evaluatedCheckpoints: nextEvaluations,
+    validationRunName: parseRunNameFromCheckpointPrefix(candidateCheckpoints[0]?.r2_prefix ?? ""),
+    forceRevalidation: currentSummary.force_revalidation === true,
+  });
+  if (!keepReadyVoice) {
     await updateVoice(c.env.DB, job.voice_id, {
       status: "created",
       checkpoint_r2_prefix: null,
       run_name: null,
       epoch: null,
+      checkpoint_preset: null,
+      checkpoint_score: null,
+      checkpoint_job_id: null,
       candidate_checkpoint_r2_prefix: null,
       candidate_run_name: null,
       candidate_epoch: null,
+      candidate_preset: null,
       candidate_score: null,
       candidate_job_id: null,
     });
@@ -3815,6 +4252,30 @@ const advanceAsync06bCheckpointValidation = async (
   if (job.round_id) {
     await updateTrainingRound(c.env.DB, job.round_id, {
       status: "failed",
+      production_checkpoint_r2_prefix: keepReadyVoice ? voice.checkpoint_r2_prefix : null,
+      production_run_name: keepReadyVoice ? voice.run_name : null,
+      production_epoch: keepReadyVoice ? voice.epoch : null,
+      production_preset: keepReadyVoice ? voice.checkpoint_preset : null,
+      production_score: keepReadyVoice ? voice.checkpoint_score : null,
+      production_job_id: keepReadyVoice ? voice.checkpoint_job_id : null,
+      champion_checkpoint_r2_prefix: null,
+      champion_run_name: null,
+      champion_epoch: null,
+      champion_preset: null,
+      champion_score: null,
+      champion_job_id: null,
+      selected_checkpoint_r2_prefix: null,
+      selected_run_name: null,
+      selected_epoch: null,
+      selected_preset: null,
+      selected_score: null,
+      selected_job_id: null,
+      adoption_mode: null,
+      candidate_checkpoint_r2_prefix: null,
+      candidate_run_name: null,
+      candidate_epoch: null,
+      candidate_score: null,
+      candidate_job_id: null,
       completed_at: Date.now(),
       summary: {
         ...(await getTrainingRound(c.env.DB, job.round_id))?.summary,
@@ -3824,32 +4285,34 @@ const advanceAsync06bCheckpointValidation = async (
     });
   }
 
+  const nextSummary = {
+    ...currentSummary,
+    force_revalidation: false,
+    validation_in_progress: false,
+    validation_checked: true,
+    validation_passed: false,
+    validation_failed: true,
+    validation_rejected: true,
+    validation_message: result.message,
+    selected_checkpoint_prefix: null,
+    selected_checkpoint_epoch: null,
+    selected_preset: null,
+    selected_score: null,
+    evaluated_checkpoints: nextEvaluations,
+    async_validation: null,
+  };
   await updateTrainingJob(c.env.DB, job.job_id, {
     status: "completed",
     error_message: null,
     completed_at: job.completed_at ?? Date.now(),
     progress,
-    summary: {
-      ...currentSummary,
-      force_revalidation: false,
-      validation_in_progress: false,
-      validation_checked: true,
-      validation_passed: false,
-      validation_failed: true,
-      validation_rejected: true,
-      validation_message: result.message,
-      selected_checkpoint_prefix: null,
-      selected_checkpoint_epoch: null,
-      selected_preset: null,
-      selected_score: null,
-      evaluated_checkpoints: nextEvaluations,
-      async_validation: null,
-    },
+    summary: nextSummary,
     supervisor: {
       ...(job.supervisor ?? {}),
       phase: "validation_failed",
     },
   });
+  await syncTrainingCheckoutLedgerForJob(c, job, nextSummary, job.completed_at ?? Date.now());
   return { status: "completed", progress };
 };
 
@@ -4249,28 +4712,76 @@ const reconcileJobStatus = async (
       return { status: "failed", progress };
     }
 
+    const currentSummary = (currentJob.summary ?? {}) as Record<string, unknown>;
+
     if (!Array.isArray(parsedStatus.checkpoints) || parsedStatus.checkpoints.length === 0) {
       const message = "Training completed but no checkpoints found in status payload";
-      await updateVoice(c.env.DB, job.voice_id, {
-        status: "created",
-      });
+      const keepReadyVoice = shouldPreserveCurrentReadyVoice(voice);
+      if (!keepReadyVoice) {
+        await updateVoice(c.env.DB, job.voice_id, {
+          status: "created",
+          checkpoint_r2_prefix: null,
+          run_name: null,
+          epoch: null,
+          checkpoint_preset: null,
+          checkpoint_score: null,
+          checkpoint_job_id: null,
+          candidate_checkpoint_r2_prefix: null,
+          candidate_run_name: null,
+          candidate_epoch: null,
+          candidate_preset: null,
+          candidate_score: null,
+          candidate_job_id: null,
+        });
+      }
+      if (currentJob.round_id) {
+        await updateTrainingRound(c.env.DB, currentJob.round_id, {
+          status: "failed",
+          production_checkpoint_r2_prefix: keepReadyVoice ? voice.checkpoint_r2_prefix : null,
+          production_run_name: keepReadyVoice ? voice.run_name : null,
+          production_epoch: keepReadyVoice ? voice.epoch : null,
+          production_preset: keepReadyVoice ? voice.checkpoint_preset : null,
+          production_score: keepReadyVoice ? voice.checkpoint_score : null,
+          production_job_id: keepReadyVoice ? voice.checkpoint_job_id : null,
+          champion_checkpoint_r2_prefix: null,
+          champion_run_name: null,
+          champion_epoch: null,
+          champion_preset: null,
+          champion_score: null,
+          champion_job_id: null,
+          selected_checkpoint_r2_prefix: null,
+          selected_run_name: null,
+          selected_epoch: null,
+          selected_preset: null,
+          selected_score: null,
+          selected_job_id: null,
+          adoption_mode: null,
+          candidate_checkpoint_r2_prefix: null,
+          candidate_run_name: null,
+          candidate_epoch: null,
+          candidate_score: null,
+          candidate_job_id: null,
+          completed_at: currentJob.completed_at ?? Date.now(),
+        });
+      }
+      const nextSummary = {
+        ...(currentJob.summary ?? {}),
+        validation_failed: true,
+        validation_checked: true,
+        validation_passed: false,
+        validation_message: message,
+      };
       await updateTrainingJob(c.env.DB, job.job_id, {
         status: "failed",
         error_message: message,
-        summary: {
-          ...(currentJob.summary ?? {}),
-          validation_failed: true,
-          validation_checked: true,
-          validation_passed: false,
-          validation_message: message,
-        },
+        summary: nextSummary,
         completed_at: currentJob.completed_at ?? Date.now(),
         progress,
       });
+      await syncTrainingCheckoutLedgerForJob(c, currentJob, nextSummary, currentJob.completed_at ?? Date.now());
       return { status: "failed", progress };
     }
 
-    const currentSummary = (currentJob.summary ?? {}) as Record<string, unknown>;
     const forceRevalidation = currentSummary.force_revalidation === true;
     const persistedReadyCheckpoint =
       voice.status === "ready" &&
@@ -4280,26 +4791,59 @@ const reconcileJobStatus = async (
         : null;
 
     if (persistedReadyCheckpoint && !forceRevalidation) {
+      const nextSummary = {
+        ...currentSummary,
+        validation_checked: true,
+        validation_passed: true,
+        validation_message:
+          typeof currentSummary.validation_message === "string" && currentSummary.validation_message.trim()
+            ? currentSummary.validation_message
+            : "Recovered validation result from persisted ready voice checkpoint",
+        selected_checkpoint_prefix: persistedReadyCheckpoint,
+        selected_checkpoint_epoch: voice.epoch,
+        selected_preset:
+          typeof currentSummary.selected_preset === "string" && currentSummary.selected_preset.trim()
+            ? currentSummary.selected_preset
+            : voice.checkpoint_preset ?? "high_similarity",
+        selected_score: voice.checkpoint_score ?? null,
+      };
       await updateTrainingJob(c.env.DB, job.job_id, {
         status: "completed",
         completed_at: currentJob.completed_at ?? Date.now(),
         progress,
-        summary: {
-          ...currentSummary,
-          validation_checked: true,
-          validation_passed: true,
-          validation_message:
-            typeof currentSummary.validation_message === "string" && currentSummary.validation_message.trim()
-              ? currentSummary.validation_message
-              : "Recovered validation result from persisted ready voice checkpoint",
-          selected_checkpoint_prefix: persistedReadyCheckpoint,
-          selected_checkpoint_epoch: voice.epoch,
-          selected_preset:
-            typeof currentSummary.selected_preset === "string" && currentSummary.selected_preset.trim()
-              ? currentSummary.selected_preset
-              : "high_similarity",
-        },
+        summary: nextSummary,
       });
+      if (currentJob.round_id) {
+        await updateTrainingRound(c.env.DB, currentJob.round_id, {
+          status: "promoted",
+          production_checkpoint_r2_prefix: persistedReadyCheckpoint,
+          production_run_name: voice.run_name,
+          production_epoch: voice.epoch,
+          production_preset: voice.checkpoint_preset,
+          production_score: voice.checkpoint_score,
+          production_job_id: voice.checkpoint_job_id,
+          champion_checkpoint_r2_prefix: null,
+          champion_run_name: null,
+          champion_epoch: null,
+          champion_preset: null,
+          champion_score: null,
+          champion_job_id: null,
+          selected_checkpoint_r2_prefix: persistedReadyCheckpoint,
+          selected_run_name: voice.run_name,
+          selected_epoch: voice.epoch,
+          selected_preset: voice.checkpoint_preset,
+          selected_score: voice.checkpoint_score,
+          selected_job_id: voice.checkpoint_job_id,
+          adoption_mode: "promote",
+          candidate_checkpoint_r2_prefix: null,
+          candidate_run_name: null,
+          candidate_epoch: null,
+          candidate_score: null,
+          candidate_job_id: null,
+          completed_at: currentJob.completed_at ?? Date.now(),
+        });
+      }
+      await syncTrainingCheckoutLedgerForJob(c, currentJob, nextSummary, currentJob.completed_at ?? Date.now());
       return { status: "completed", progress };
     }
 
@@ -4311,22 +4855,69 @@ const reconcileJobStatus = async (
 
     if (candidateCheckpoints.length === 0) {
       const message = "Training completed but checkpoint metadata is invalid";
-      await updateVoice(c.env.DB, job.voice_id, {
-        status: "created",
-      });
+      const keepReadyVoice = shouldPreserveCurrentReadyVoice(voice);
+      if (!keepReadyVoice) {
+        await updateVoice(c.env.DB, job.voice_id, {
+          status: "created",
+          checkpoint_r2_prefix: null,
+          run_name: null,
+          epoch: null,
+          checkpoint_preset: null,
+          checkpoint_score: null,
+          checkpoint_job_id: null,
+          candidate_checkpoint_r2_prefix: null,
+          candidate_run_name: null,
+          candidate_epoch: null,
+          candidate_preset: null,
+          candidate_score: null,
+          candidate_job_id: null,
+        });
+      }
+      if (currentJob.round_id) {
+        await updateTrainingRound(c.env.DB, currentJob.round_id, {
+          status: "failed",
+          production_checkpoint_r2_prefix: keepReadyVoice ? voice.checkpoint_r2_prefix : null,
+          production_run_name: keepReadyVoice ? voice.run_name : null,
+          production_epoch: keepReadyVoice ? voice.epoch : null,
+          production_preset: keepReadyVoice ? voice.checkpoint_preset : null,
+          production_score: keepReadyVoice ? voice.checkpoint_score : null,
+          production_job_id: keepReadyVoice ? voice.checkpoint_job_id : null,
+          champion_checkpoint_r2_prefix: null,
+          champion_run_name: null,
+          champion_epoch: null,
+          champion_preset: null,
+          champion_score: null,
+          champion_job_id: null,
+          selected_checkpoint_r2_prefix: null,
+          selected_run_name: null,
+          selected_epoch: null,
+          selected_preset: null,
+          selected_score: null,
+          selected_job_id: null,
+          adoption_mode: null,
+          candidate_checkpoint_r2_prefix: null,
+          candidate_run_name: null,
+          candidate_epoch: null,
+          candidate_score: null,
+          candidate_job_id: null,
+          completed_at: currentJob.completed_at ?? Date.now(),
+        });
+      }
+      const nextSummary = {
+        ...(currentJob.summary ?? {}),
+        validation_failed: true,
+        validation_checked: true,
+        validation_passed: false,
+        validation_message: message,
+      };
       await updateTrainingJob(c.env.DB, job.job_id, {
         status: "failed",
         error_message: message,
-        summary: {
-          ...(currentJob.summary ?? {}),
-          validation_failed: true,
-          validation_checked: true,
-          validation_passed: false,
-          validation_message: message,
-        },
+        summary: nextSummary,
         completed_at: currentJob.completed_at ?? Date.now(),
         progress,
       });
+      await syncTrainingCheckoutLedgerForJob(c, currentJob, nextSummary, currentJob.completed_at ?? Date.now());
       return { status: "failed", progress };
     }
 
@@ -4384,7 +4975,13 @@ const reconcileJobStatusWithTimeout = async (
 
 export const runTrainingSupervisorSweep = async (
   env: Env
-): Promise<{ checked: number; reconciled: number; timed_out: number; failed: number }> => {
+): Promise<{
+  checked: number;
+  reconciled: number;
+  timed_out: number;
+  failed: number;
+  launched_queued: number;
+}> => {
   const jobs = await listTrainingJobs(env.DB, { limit: TRAINING_SWEEP_LIMIT });
   const syntheticContext = createSyntheticContext(env, resolveWorkerPublicUrl(env));
   const candidates = jobs.filter(
@@ -4396,6 +4993,7 @@ export const runTrainingSupervisorSweep = async (
   let reconciled = 0;
   let timedOut = 0;
   let failed = 0;
+  let launchedQueued = 0;
 
   for (const job of candidates) {
     try {
@@ -4414,11 +5012,28 @@ export const runTrainingSupervisorSweep = async (
     }
   }
 
+  const queuedVoiceIds = Array.from(
+    new Set(
+      jobs
+        .filter((job) => QUEUED_JOB_STATUSES.has(job.status) || job.status === "pending")
+        .map((job) => job.voice_id)
+    )
+  );
+  for (const voiceId of queuedVoiceIds) {
+    try {
+      launchedQueued += await launchQueuedTrainingJobsForVoice(syntheticContext, voiceId);
+    } catch (error) {
+      failed += 1;
+      console.warn(`Queued training launch sweep failed for ${voiceId}:`, error);
+    }
+  }
+
   return {
     checked: candidates.length,
     reconciled,
     timed_out: timedOut,
     failed,
+    launched_queued: launchedQueued,
   };
 };
 
@@ -4436,15 +5051,6 @@ app.post("/start", async (c) => {
   const voice = await getVoice(c.env.DB, body.voice_id);
   if (!voice) {
     return c.json({ detail: { message: "Voice not found" } }, 404);
-  }
-
-  const activeJobs = await listTrainingJobs(c.env.DB, { voice_id: body.voice_id, limit: 10 });
-  const hasActiveJob = activeJobs.some((j) => ACTIVE_JOB_STATUSES.has(j.status));
-  if (hasActiveJob) {
-    return c.json(
-      { detail: { message: "A training job is already active for this voice. Cancel it first or wait for completion." } },
-      409
-    );
   }
 
   const now = Date.now();
@@ -4502,6 +5108,8 @@ app.post("/start", async (c) => {
 
   const datasetSignatureInfo = await computeDatasetSignature(datasetPrefix, datasetObjects);
   const datasetSignature = datasetSignatureInfo?.signature ?? buildSyntheticDatasetSignature(datasetPrefix);
+  const datasetTrainRawKey = getDatasetTrainRawR2Key(datasetPrefix);
+  const datasetHasPreparedTrainRaw = Boolean(await c.env.R2.head(datasetTrainRawKey));
   const preprocessCache =
     datasetSignatureInfo !== null
       ? await getDatasetPreprocessCache(c.env.DB, body.voice_id, datasetPrefix, datasetSignature)
@@ -4528,10 +5136,13 @@ app.post("/start", async (c) => {
     dataset_snapshot_status: datasetSnapshot.status,
     dataset_snapshot_signature: datasetSnapshot.dataset_signature,
     dataset_snapshot_name: datasetSnapshot.dataset_name,
-    preprocess_cache_lookup: preprocessCache ? "hit" : "miss",
+    preprocess_cache_lookup: preprocessCache ? "hit" : datasetHasPreparedTrainRaw ? "dataset_ready" : "miss",
     preprocess_cache_dataset_signature: datasetSignature,
     preprocess_cache_source_file_count: datasetSignatureInfo?.sourceCount ?? null,
     preprocess_cache_r2_prefix: preprocessCache?.cache_r2_prefix ?? null,
+    preprocess_cache_train_raw_r2_key:
+      preprocessCache?.train_raw_r2_key ?? (datasetHasPreparedTrainRaw ? datasetTrainRawKey : null),
+    queue_active_limit: getMaxActiveTrainingJobsPerVoice(c),
   };
 
   const job: TrainingJob = {
@@ -4541,13 +5152,13 @@ app.post("/start", async (c) => {
     dataset_snapshot_id: datasetSnapshot.snapshot_id,
     runpod_pod_id: null,
     job_token: jobToken,
-    status: "pending",
+    status: "queued",
     config: effectiveConfig,
     progress: {},
     summary: initialSummary,
     metrics: {},
     supervisor: {
-      phase: "pending",
+      phase: "queued",
       checks: 0,
       recovery_attempts: 0,
       last_transition_at: now,
@@ -4605,73 +5216,27 @@ app.post("/start", async (c) => {
     httpMetadata: { contentType: "application/json" },
   });
 
-  // Default GPU based on model size: 1.7B needs ≥40GB VRAM, 0.6B fits on 24GB
-  const gpuTypeId = getTrainingGpuType(job);
-
-  let launchResult: Awaited<ReturnType<typeof createTrainingPodForJob>>;
-  try {
-    launchResult = await createTrainingPodForJob(c, job);
-  } catch (podError) {
-    // Pod creation failed (e.g., GPU supply constraint) — mark job as failed
-    const errMsg = podError instanceof Error ? podError.message : String(podError);
-    await updateTrainingJob(c.env.DB, jobId, {
-      status: "failed",
-      error_message: errMsg,
-      completed_at: Date.now(),
-    });
-    await updateTrainingRound(c.env.DB, round.round_id, {
-      status: "failed",
-      completed_at: Date.now(),
-      summary: {
-        dataset_snapshot_id: datasetSnapshot.snapshot_id,
-        failed_job_id: jobId,
-        error_message: errMsg,
-      },
-    });
-    // Re-throw to let the global error handler return appropriate status
-    throw podError;
-  }
-
-  await updateTrainingJob(c.env.DB, jobId, {
-    runpod_pod_id: launchResult.pod.podId,
-    status: "provisioning",
-    started_at: Date.now(),
-    summary: {
-      ...(job.summary ?? {}),
-      ...launchResult.summary,
-    },
-    supervisor: {
-      ...(job.supervisor ?? {}),
-      phase: "provisioning",
-      last_transition_at: Date.now(),
-      last_pod_id: launchResult.pod.podId,
-    },
-  });
-
-  await updateTrainingRound(c.env.DB, round.round_id, {
-    status: "running",
-    started_at: Date.now(),
-    summary: {
-      dataset_snapshot_id: datasetSnapshot.snapshot_id,
-      initial_job_id: jobId,
-      training_image_name: launchResult.summary.training_image_name ?? null,
-      training_resolved_image_name: launchResult.summary.training_resolved_image_name ?? null,
-    },
-  });
+  await launchQueuedTrainingJobsForVoice(c, body.voice_id);
 
   const persistedJob = await getTrainingJob(c.env.DB, jobId);
   if (!persistedJob) {
     return c.json({ detail: { message: "Training job not found" } }, 404);
   }
 
-  const reconciled = await reconcileJobStatus(c, persistedJob);
+  let responseStatus = persistedJob.status;
+  let responseProgress = persistedJob.progress;
+  if (ACTIVE_JOB_STATUSES.has(persistedJob.status)) {
+    const reconciled = await reconcileJobStatus(c, persistedJob);
+    responseStatus = reconciled.status;
+    responseProgress = reconciled.progress;
+  }
 
   return c.json({
     job_id: jobId,
     round_id: round.round_id,
     dataset_snapshot_id: datasetSnapshot.snapshot_id,
-    status: reconciled.status,
-    progress: reconciled.progress,
+    status: responseStatus,
+    progress: responseProgress,
   });
 });
 
@@ -4727,13 +5292,41 @@ app.get("/advice", async (c) => {
     limit,
   });
 
+  const hydratedJobs = await Promise.all(
+    jobs.map(async (job) => {
+      try {
+        if (
+          !ACTIVE_JOB_STATUSES.has(job.status) &&
+          !needsCompletedValidation(job) &&
+          !shouldRecoverFailedDependencyJob(c, job)
+        ) {
+          return job;
+        }
+        await reconcileJobStatusWithTimeout(c, job);
+        return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
+      } catch (error) {
+        console.warn(`Failed to hydrate training advice job ${job.job_id}:`, error);
+        return job;
+      }
+    })
+  );
+
+  let advice: ReturnType<typeof buildTrainingAdvice> = null;
+  try {
+    advice = await buildLLMTrainingAdvice(c.env, voice, hydratedJobs);
+  } catch (error) {
+    console.warn("LLM advisor error, falling back to heuristic:", error);
+  }
+  if (!advice) {
+    advice = buildTrainingAdvice(voice, hydratedJobs);
+  }
+
   return c.json({
-    advice: buildTrainingAdvice(voice, jobs),
+    advice,
     voice_id: voiceId,
-    jobs_considered: jobs.length,
+    jobs_considered: hydratedJobs.length,
   });
 });
-
 app.get("/rounds", async (c) => {
   const voiceId = c.req.query("voice_id")?.trim();
   const limitRaw = c.req.query("limit");
@@ -5067,6 +5660,17 @@ app.get("/:job_id", async (c) => {
   return c.json(serializeTrainingJob(job));
 });
 
+app.get("/:job_id/checkout-ledger", async (c) => {
+  const jobId = c.req.param("job_id");
+  const job = await getTrainingJob(c.env.DB, jobId);
+  if (!job) {
+    return c.json({ detail: { message: "Training job not found" } }, 404);
+  }
+
+  const entries = await listTrainingCheckoutLedger(c.env.DB, { job_id: jobId, limit: 500 });
+  return c.json({ entries });
+});
+
 app.get("/debug/template/:template_id", async (c) => {
   const templateId = c.req.param("template_id");
   try {
@@ -5105,6 +5709,14 @@ app.post("/:job_id/reconcile", async (c) => {
   }
 
   if (!ACTIVE_JOB_STATUSES.has(job.status) && !needsCompletedValidation(job)) {
+    if (QUEUED_JOB_STATUSES.has(job.status) || job.status === "pending") {
+      waitForBackgroundTask(c, launchQueuedTrainingJobsForVoice(c, job.voice_id));
+      return c.json({
+        status: "accepted",
+        validation_started: false,
+        job_id: jobId,
+      });
+    }
     return c.json({
       status: "noop",
       job: serializeTrainingJob(job),
@@ -5138,15 +5750,69 @@ app.post("/:job_id/revalidate", async (c) => {
     validation_failed: _validationFailed,
     validation_in_progress: _validationInProgress,
     validation_message: _validationMessage,
+    validation_rejected: _validationRejected,
     evaluated_checkpoints: _evaluatedCheckpoints,
     async_validation: _asyncValidation,
     selected_checkpoint_prefix: _selectedCheckpointPrefix,
     selected_checkpoint_epoch: _selectedCheckpointEpoch,
     selected_preset: _selectedPreset,
     selected_score: _selectedScore,
+    candidate_checkpoint_prefix: _candidateCheckpointPrefix,
+    candidate_checkpoint_epoch: _candidateCheckpointEpoch,
+    candidate_preset: _candidatePreset,
+    candidate_score: _candidateScore,
+    candidate_promotion_mode: _candidatePromotionMode,
+    manual_promoted_checkpoint_prefix: _manualPromotedCheckpointPrefix,
+    manual_promoted_checkpoint_epoch: _manualPromotedCheckpointEpoch,
+    manual_promoted_preset: _manualPromotedPreset,
+    manual_promoted_score: _manualPromotedScore,
+    manual_promotion_at: _manualPromotionAt,
     ...restSummary
   } = summary;
 
+  const voice = await getVoice(c.env.DB, job.voice_id);
+  if (voice?.candidate_job_id === jobId) {
+    await updateVoice(c.env.DB, job.voice_id, {
+      candidate_checkpoint_r2_prefix: null,
+      candidate_run_name: null,
+      candidate_epoch: null,
+      candidate_preset: null,
+      candidate_score: null,
+      candidate_job_id: null,
+    });
+  }
+
+  if (job.round_id) {
+    const existingRound = await getTrainingRound(c.env.DB, job.round_id);
+    await updateTrainingRound(c.env.DB, job.round_id, {
+      status: "validating",
+      champion_checkpoint_r2_prefix: null,
+      champion_run_name: null,
+      champion_epoch: null,
+      champion_preset: null,
+      champion_score: null,
+      champion_job_id: null,
+      selected_checkpoint_r2_prefix: null,
+      selected_run_name: null,
+      selected_epoch: null,
+      selected_preset: null,
+      selected_score: null,
+      selected_job_id: null,
+      adoption_mode: null,
+      candidate_checkpoint_r2_prefix: null,
+      candidate_run_name: null,
+      candidate_epoch: null,
+      candidate_score: null,
+      candidate_job_id: null,
+      completed_at: null,
+      summary: {
+        ...(existingRound?.summary ?? {}),
+        revalidation_started_at: Date.now(),
+      },
+    });
+  }
+
+  await replaceTrainingCheckoutLedgerForJob(c.env.DB, jobId, []);
   await updateTrainingJob(c.env.DB, jobId, {
     status: "completed",
     error_message: null,
@@ -5210,28 +5876,33 @@ app.post("/:job_id/promote", async (c) => {
     checkpoint_r2_prefix: candidate.prefix,
     run_name: parseRunNameFromCheckpointPrefix(candidate.prefix),
     epoch: candidate.epoch,
+    checkpoint_preset: candidate.preset,
+    checkpoint_score: candidate.score,
+    checkpoint_job_id: job.job_id,
     candidate_checkpoint_r2_prefix: null,
     candidate_run_name: null,
     candidate_epoch: null,
+    candidate_preset: null,
     candidate_score: null,
     candidate_job_id: null,
-    active_round_id: job.round_id ?? voice.active_round_id ?? null,
+    active_round_id: voice.active_round_id ?? job.round_id ?? null,
     settings: resolvePromotionSettings(voice, candidate.preset),
   });
 
+  const nextSummary = {
+    ...summary,
+    selected_checkpoint_prefix: candidate.prefix,
+    selected_checkpoint_epoch: candidate.epoch,
+    selected_preset: candidate.preset,
+    selected_score: candidate.score,
+    manual_promoted_checkpoint_prefix: candidate.prefix,
+    manual_promoted_checkpoint_epoch: candidate.epoch,
+    manual_promoted_preset: candidate.preset,
+    manual_promoted_score: candidate.score,
+    manual_promotion_at: Date.now(),
+  };
   await updateTrainingJob(c.env.DB, jobId, {
-    summary: {
-      ...summary,
-      selected_checkpoint_prefix: candidate.prefix,
-      selected_checkpoint_epoch: candidate.epoch,
-      selected_preset: candidate.preset,
-      selected_score: candidate.score,
-      manual_promoted_checkpoint_prefix: candidate.prefix,
-      manual_promoted_checkpoint_epoch: candidate.epoch,
-      manual_promoted_preset: candidate.preset,
-      manual_promoted_score: candidate.score,
-      manual_promotion_at: Date.now(),
-    },
+    summary: nextSummary,
     supervisor: {
       ...(job.supervisor ?? {}),
       phase: "promoted",
@@ -5240,11 +5911,37 @@ app.post("/:job_id/promote", async (c) => {
   });
 
   if (job.round_id) {
+    const championPrefix =
+      typeof summary.candidate_checkpoint_prefix === "string" && summary.candidate_checkpoint_prefix.trim()
+        ? summary.candidate_checkpoint_prefix.trim()
+        : candidate.prefix;
+    const championEpoch = readNumber(summary.candidate_checkpoint_epoch) ?? candidate.epoch;
+    const championPreset =
+      typeof summary.candidate_preset === "string" && summary.candidate_preset.trim()
+        ? summary.candidate_preset.trim()
+        : candidate.preset;
+    const championScore = readNumber(summary.candidate_score) ?? candidate.score;
     await updateTrainingRound(c.env.DB, job.round_id, {
       status: "promoted",
       production_checkpoint_r2_prefix: candidate.prefix,
       production_run_name: parseRunNameFromCheckpointPrefix(candidate.prefix),
       production_epoch: candidate.epoch,
+      production_preset: candidate.preset,
+      production_score: candidate.score,
+      production_job_id: job.job_id,
+      champion_checkpoint_r2_prefix: championPrefix,
+      champion_run_name: parseRunNameFromCheckpointPrefix(championPrefix),
+      champion_epoch: championEpoch,
+      champion_preset: championPreset,
+      champion_score: championScore,
+      champion_job_id: job.job_id,
+      selected_checkpoint_r2_prefix: candidate.prefix,
+      selected_run_name: parseRunNameFromCheckpointPrefix(candidate.prefix),
+      selected_epoch: candidate.epoch,
+      selected_preset: candidate.preset,
+      selected_score: candidate.score,
+      selected_job_id: job.job_id,
+      adoption_mode: "promote",
       candidate_checkpoint_r2_prefix: null,
       candidate_run_name: null,
       candidate_epoch: null,
@@ -5259,6 +5956,8 @@ app.post("/:job_id/promote", async (c) => {
       },
     });
   }
+
+  await syncTrainingCheckoutLedgerForJob(c, job, nextSummary, Date.now());
 
   const updatedVoice = await getVoice(c.env.DB, job.voice_id);
   const updatedJob = await getTrainingJob(c.env.DB, jobId);
@@ -5289,6 +5988,16 @@ app.post("/:job_id/cancel", async (c) => {
     status: "cancelled",
     completed_at: Date.now(),
   });
+  if (job.round_id) {
+    await updateTrainingRound(c.env.DB, job.round_id, {
+      status: "cancelled",
+      completed_at: Date.now(),
+      summary: {
+        cancelled_job_id: job.job_id,
+      },
+    });
+  }
+  await launchQueuedTrainingJobsForVoice(c, job.voice_id);
 
   return c.json({ status: "ok" });
 });

@@ -1,4 +1,5 @@
 import type { TrainingAdvice, TrainingConfig, TrainingJob, Voice } from './api'
+import { getTrainingCheckoutSearch } from './trainingCheckout'
 
 type EvaluatedCheckpoint = {
   epoch: number
@@ -14,6 +15,10 @@ function readNumber(value: unknown): number | null {
 
 function readText(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+
+function getCheckout(job: TrainingJob) {
+  return getTrainingCheckoutSearch(job)
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -73,50 +78,42 @@ function sanitizeConfig(source: Partial<TrainingConfig>, modelSize: string, lang
       readNumber(source.save_every_n_epochs) ?? defaults.save_every_n_epochs,
     seed: readNumber(source.seed) ?? defaults.seed,
     whisper_language: readText(source.whisper_language) ?? defaults.whisper_language,
-    gpu_type_id: readText(source.gpu_type_id) ?? defaults.gpu_type_id,
+    gpu_type_id: defaults.gpu_type_id,
   }
 }
 
 function getSelectedScore(job: TrainingJob): number | null {
-  return readNumber(job.summary?.selected_score)
+  const checkout = getCheckout(job)
+  return checkout.selected?.score ?? checkout.manual_promoted?.score ?? checkout.champion?.score ?? null
 }
 
 function getSelectedPrefix(job: TrainingJob): string | null {
-  return readText(job.summary?.selected_checkpoint_prefix)
+  const checkout = getCheckout(job)
+  return checkout.selected?.prefix ?? checkout.manual_promoted?.prefix ?? checkout.champion?.prefix ?? null
 }
 
 function getSelectedEpoch(job: TrainingJob): number | null {
-  return readNumber(job.summary?.selected_checkpoint_epoch)
+  const checkout = getCheckout(job)
+  return checkout.selected?.epoch ?? checkout.manual_promoted?.epoch ?? checkout.champion?.epoch ?? null
 }
 
 function getValidationMessage(job: TrainingJob): string | null {
-  return readText(job.summary?.validation_message) ?? readText(job.error_message)
+  const checkout = getCheckout(job)
+  return checkout.message ?? readText(job.error_message)
 }
 
 function getEvaluatedCheckpoints(job: TrainingJob): EvaluatedCheckpoint[] {
-  const raw = Array.isArray(job.summary?.evaluated_checkpoints)
-    ? job.summary?.evaluated_checkpoints
-    : []
-  return raw
-    .map((value) => {
-      if (!value || typeof value !== 'object') return null
-      const record = value as Record<string, unknown>
-      const epoch = readNumber(record.epoch)
-      const ok = record.ok === true
-      if (epoch === null) return null
-      return {
-        epoch,
-        ok,
-        score: readNumber(record.score),
-        message: readText(record.message),
-      }
-    })
-    .filter((value): value is EvaluatedCheckpoint => value !== null)
+  return getCheckout(job).evaluated.map((checkpoint) => ({
+    epoch: checkpoint.epoch,
+    ok: checkpoint.ok,
+    score: checkpoint.score,
+    message: checkpoint.message,
+  }))
 }
 
 function getBaseConfig(voice: Voice, jobs: TrainingJob[]): TrainingConfig {
   const validated = jobs
-    .filter((job) => job.summary?.validation_passed === true)
+    .filter((job) => getCheckout(job).validation_passed === true)
     .sort((a, b) => (getSelectedScore(b) ?? -1) - (getSelectedScore(a) ?? -1))
   const latest = [...jobs].sort((a, b) => (Number(b.created_at) || 0) - (Number(a.created_at) || 0))
   const source = validated[0]?.config ?? latest[0]?.config ?? {}
@@ -166,6 +163,125 @@ function tuneForCheckpointSweep(base: TrainingConfig, modelSize: string): Traini
   }
 }
 
+const ACTIVE_ADVICE_JOB_STATUSES = new Set([
+  'queued',
+  'pending',
+  'running',
+  'provisioning',
+  'downloading',
+  'preprocessing',
+  'preparing',
+  'training',
+  'uploading',
+])
+
+function isAdviceActiveJob(job: TrainingJob): boolean {
+  return ACTIVE_ADVICE_JOB_STATUSES.has(job.status) || getCheckout(job).validation_in_progress === true
+}
+
+function toAdviceConfigKey(config: TrainingConfig): string {
+  const batchSize = readNumber(config.batch_size) ?? 0
+  const numEpochs = readNumber(config.num_epochs) ?? 0
+  const learningRate = readNumber(config.learning_rate) ?? 0
+  const gradientAccumulation = readNumber(config.gradient_accumulation_steps) ?? 0
+  const subtalkerLossWeight = readNumber(config.subtalker_loss_weight) ?? 0
+  const saveEvery = readNumber(config.save_every_n_epochs) ?? 0
+  const seed = readNumber(config.seed) ?? 0
+  const whisperLanguage = readText(config.whisper_language) ?? ''
+  const gpuType = readText(config.gpu_type_id) ?? ''
+  return [
+    config.model_size,
+    batchSize,
+    numEpochs,
+    learningRate,
+    gradientAccumulation,
+    subtalkerLossWeight,
+    saveEvery,
+    seed,
+    whisperLanguage,
+    gpuType,
+  ].join('|')
+}
+
+function rotateAwayFromActiveConfigs(
+  config: TrainingConfig,
+  activeKeys: Set<string>,
+  modelSize: string,
+): TrainingConfig | null {
+  const visitedSeeds = new Set<number>()
+  let candidate = config
+  while (true) {
+    const candidateKey = toAdviceConfigKey(candidate)
+    if (!activeKeys.has(candidateKey)) {
+      return candidate
+    }
+    const currentSeed = readNumber(candidate.seed) ?? 0
+    if (visitedSeeds.has(currentSeed)) {
+      return null
+    }
+    visitedSeeds.add(currentSeed)
+    candidate = {
+      ...candidate,
+      seed: pickAlternateSeed(currentSeed, modelSize),
+    }
+  }
+}
+
+function diversifyAdviceForActiveRuns(
+  advice: TrainingAdvice,
+  voice: Voice,
+  activeJobs: TrainingJob[],
+): TrainingAdvice {
+  if (!advice.suggestedConfig || activeJobs.length === 0) {
+    return advice
+  }
+
+  const activeKeys = new Set(
+    activeJobs.map((job) =>
+      toAdviceConfigKey(sanitizeConfig(job.config, voice.model_size, voice.labels?.language)),
+    ),
+  )
+
+  const baseSuggestion = sanitizeConfig(advice.suggestedConfig, voice.model_size, voice.labels?.language)
+  const baseKey = toAdviceConfigKey(baseSuggestion)
+  if (!activeKeys.has(baseKey)) {
+    return advice
+  }
+
+  const rotatedSuggestion = rotateAwayFromActiveConfigs(baseSuggestion, activeKeys, voice.model_size)
+  if (rotatedSuggestion) {
+    return {
+      ...advice,
+      suggestedConfig: rotatedSuggestion,
+      reasons: [
+        ...advice.reasons,
+        'A run with matching knobs is already active, so this suggestion rotates seed to test a different lane.',
+      ],
+    }
+  }
+
+  if (advice.mode === 'checkpoint-window') {
+    return advice
+  }
+
+  const shiftedBase =
+    advice.mode === 'stability-reset'
+      ? tuneForTone(baseSuggestion, voice.model_size)
+      : tuneForStability(baseSuggestion, voice.model_size)
+  const shiftedSuggestion = sanitizeConfig(shiftedBase, voice.model_size, voice.labels?.language)
+  const shiftedNonDuplicate =
+    rotateAwayFromActiveConfigs(shiftedSuggestion, activeKeys, voice.model_size) ?? shiftedSuggestion
+
+  return {
+    ...advice,
+    suggestedConfig: shiftedNonDuplicate,
+    reasons: [
+      ...advice.reasons,
+      'A run with matching knobs is already active, so this suggestion shifts to a different strategy lane.',
+    ],
+  }
+}
+
 function describeConfig(config: TrainingConfig): string {
   return `batch=${config.batch_size} epochs=${config.num_epochs} lr=${config.learning_rate} grad_acc=${config.gradient_accumulation_steps ?? 4} subtalker=${config.subtalker_loss_weight ?? 0} seed=${config.seed ?? 0}`
 }
@@ -188,10 +304,15 @@ export function buildTrainingAdvice(voice: Voice | null, jobs: TrainingJob[]): T
   const voiceJobs = [...jobs]
     .filter((job) => job.voice_id === voice.voice_id)
     .sort((a, b) => (Number(b.created_at) || 0) - (Number(a.created_at) || 0))
+  const activeVoiceJobs = voiceJobs.filter((job) => isAdviceActiveJob(job))
+  const finalizeAdvice = (advice: TrainingAdvice): TrainingAdvice => ({
+    ...diversifyAdviceForActiveRuns(advice, voice, activeVoiceJobs),
+    analysisProvider: 'heuristic' as const,
+  })
 
   const baseConfig = getBaseConfig(voice, voiceJobs)
   if (voiceJobs.length === 0) {
-    return {
+    return finalizeAdvice({
       mode: 'tone-explore',
       title: 'Start With The Safe Baseline',
       summary: `No training history yet. Start from the conservative preset, then compare before pushing style harder. ${describeConfig(baseConfig)}`,
@@ -204,14 +325,14 @@ export function buildTrainingAdvice(voice: Voice | null, jobs: TrainingJob[]): T
       compareFirst: false,
       reviewDatasetFirst: false,
       primaryActionLabel: 'Apply Baseline',
-    }
+    })
   }
 
   const validated = voiceJobs
-    .filter((job) => job.summary?.validation_passed === true && getSelectedScore(job) !== null)
+    .filter((job) => getCheckout(job).validation_passed === true && getSelectedScore(job) !== null)
     .sort((a, b) => (getSelectedScore(b) ?? -1) - (getSelectedScore(a) ?? -1))
   const rejected = voiceJobs.filter(
-    (job) => job.summary?.validation_checked === true && job.summary?.validation_passed !== true,
+    (job) => getCheckout(job).status === 'rejected',
   )
   const currentPrefix = readText(voice.checkpoint_r2_prefix)
   const currentValidatedJob =
@@ -219,7 +340,7 @@ export function buildTrainingAdvice(voice: Voice | null, jobs: TrainingJob[]): T
     voiceJobs.find((job) => getSelectedPrefix(job) === currentPrefix) ??
     null
   const bestValidatedJob = validated[0] ?? null
-  const currentScore = currentValidatedJob ? getSelectedScore(currentValidatedJob) : null
+  const currentScore = currentValidatedJob ? getSelectedScore(currentValidatedJob) : (voice.checkpoint_score ?? null)
   const bestScore = bestValidatedJob ? getSelectedScore(bestValidatedJob) : null
 
   const closeAlternatives = validated.filter((job) => {
@@ -278,7 +399,7 @@ export function buildTrainingAdvice(voice: Voice | null, jobs: TrainingJob[]): T
       sanitizeConfig(earlyPeakChampion.config, voice.model_size, voice.labels?.language),
       voice.model_size,
     )
-    return {
+    return finalizeAdvice({
       mode: 'checkpoint-window',
       title: 'Early Winner Is Being Missed',
       summary: `The best historical checkpoint peaked early at epoch ${bestValidatedEpoch}, but the latest failed run only evaluated epochs ${describeEpochList(latestRejectedEpochs)}. Run a short sweep that keeps every epoch inside the search window. ${describeConfig(suggestion)}`,
@@ -294,13 +415,13 @@ export function buildTrainingAdvice(voice: Voice | null, jobs: TrainingJob[]): T
       compareFirst: false,
       reviewDatasetFirst: false,
       primaryActionLabel: 'Apply Short Sweep',
-    }
+    })
   }
 
   if (bestValidatedJob && currentValidatedJob && bestScore !== null && currentScore !== null) {
     const gap = bestScore - currentScore
     if (gap >= 0 && gap <= 0.008 && (closeAlternatives.length > 0 || bestValidatedJob.job_id !== currentValidatedJob.job_id)) {
-      return {
+      return finalizeAdvice({
         mode: 'compare-first',
         title: 'Listen Before Spending Another Run',
         summary: `Validated checkpoints are clustered too tightly to trust the metric alone. Current=${currentScore.toFixed(3)} best=${bestScore.toFixed(3)}. Compare them side by side first.`,
@@ -314,12 +435,12 @@ export function buildTrainingAdvice(voice: Voice | null, jobs: TrainingJob[]): T
         compareFirst: true,
         reviewDatasetFirst: false,
         primaryActionLabel: 'Apply Tone Setup',
-      }
+      })
     }
   }
 
   if (asrFailures >= 2) {
-    return {
+    return finalizeAdvice({
       mode: 'dataset-first',
       title: 'Fix Text Alignment Before More Training',
       summary: 'Recent runs are failing mostly on ASR mismatch. More epochs will not recover tone if the transcript/reference path is drifting.',
@@ -333,12 +454,12 @@ export function buildTrainingAdvice(voice: Voice | null, jobs: TrainingJob[]): T
       compareFirst: false,
       reviewDatasetFirst: true,
       primaryActionLabel: 'Review Dataset',
-    }
+    })
   }
 
-  if (toneFailures >= 1 || speedFailures >= 2 || (validated.length > 0 && voice.model_size.includes('1.7'))) {
+  if (toneFailures >= 1 || speedFailures >= 2) {
     const suggestion = tuneForTone(baseConfig, voice.model_size)
-    return {
+    return finalizeAdvice({
       mode: 'tone-explore',
       title: 'Run A Tone-Preservation Exploration',
       summary: `Speaker match is already in range, but the current history still looks too neutral or rushed. Try a lower-LR, lower-subtalker run focused on phrasing retention. ${describeConfig(suggestion)}`,
@@ -356,12 +477,12 @@ export function buildTrainingAdvice(voice: Voice | null, jobs: TrainingJob[]): T
       compareFirst: validated.length >= 2,
       reviewDatasetFirst: false,
       primaryActionLabel: 'Apply Tone Setup',
-    }
+    })
   }
 
   if (overallFailures >= 2 || infraFailures >= 2) {
     const suggestion = tuneForStability(baseConfig, voice.model_size)
-    return {
+    return finalizeAdvice({
       mode: 'stability-reset',
       title: 'Stabilize Before Pushing Style Again',
       summary: `Recent attempts are failing on overall quality or infra noise. Pull the run back to a more conservative setup first. ${describeConfig(suggestion)}`,
@@ -376,10 +497,10 @@ export function buildTrainingAdvice(voice: Voice | null, jobs: TrainingJob[]): T
       compareFirst: false,
       reviewDatasetFirst: false,
       primaryActionLabel: 'Apply Stability Setup',
-    }
+    })
   }
 
-  return {
+  return finalizeAdvice({
     mode: 'hold-current',
     title: 'Current Champion Is Stable',
     summary: 'The current live checkpoint remains the cleanest validated option. Only queue another run if you are explicitly chasing tone, not headline score.',
@@ -392,5 +513,5 @@ export function buildTrainingAdvice(voice: Voice | null, jobs: TrainingJob[]): T
     compareFirst: validated.length >= 2,
     reviewDatasetFirst: false,
     primaryActionLabel: 'Apply Exploration Setup',
-  }
+  })
 }

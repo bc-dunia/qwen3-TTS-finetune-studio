@@ -160,17 +160,17 @@ def _model_supports_instruct(model: Any) -> bool:
 def _resolve_device(device: str) -> str:
     if device != "auto":
         return device
-    import torch
+    torch = __import__("torch")
 
     if torch.cuda.is_available():
         return "cuda:0"
-    if torch.backends.mps.is_available():
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         return "mps"
     return "cpu"
 
 
 def _resolve_dtype(device: str) -> Any:
-    import torch
+    torch = __import__("torch")
 
     if device.startswith("cuda"):
         return torch.bfloat16
@@ -179,9 +179,12 @@ def _resolve_dtype(device: str) -> Any:
     return torch.float32
 
 
-def _try_load_pretrained(resolved_path: str, resolved_device: str, err_prefix: str) -> Any:
+def _try_load_pretrained(
+    resolved_path: str, resolved_device: str, err_prefix: str
+) -> Any:
     """Load Qwen3TTSModel with 4-candidate fallback. Returns loaded model."""
-    from qwen_tts import Qwen3TTSModel
+    qwen_tts = __import__("qwen_tts", fromlist=["Qwen3TTSModel"])
+    Qwen3TTSModel = qwen_tts.Qwen3TTSModel
 
     dtype = _resolve_dtype(resolved_device)
     attn = "flash_attention_2" if resolved_device.startswith("cuda") else None
@@ -238,7 +241,9 @@ def _load_model(model_path: str, device: str) -> tuple[Any, str]:
         ):
             return _MODEL_CACHE.model, resolved_device
 
-        model = _try_load_pretrained(resolved_path, resolved_device, "Failed to load model")
+        model = _try_load_pretrained(
+            resolved_path, resolved_device, "Failed to load model"
+        )
         _patch_generate_min_tokens(model)
 
         _set_model_cache(
@@ -256,14 +261,11 @@ def _load_base_model(device: str) -> tuple[Any, str]:
 
     try:
         from huggingface_hub.constants import HF_HUB_CACHE
+
         hub_cache = Path(HF_HUB_CACHE)
     except Exception:
         hub_cache = Path.home() / ".cache" / "huggingface" / "hub"
-    snapshots_dir = (
-        hub_cache
-        / "models--Qwen--Qwen3-TTS-12Hz-0.6B-Base"
-        / "snapshots"
-    )
+    snapshots_dir = hub_cache / "models--Qwen--Qwen3-TTS-12Hz-0.6B-Base" / "snapshots"
     base_source = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
     if snapshots_dir.exists() and snapshots_dir.is_dir():
         candidates = [p for p in snapshots_dir.iterdir() if p.is_dir()]
@@ -284,7 +286,9 @@ def _load_base_model(device: str) -> tuple[Any, str]:
         ):
             return _BASE_MODEL_CACHE.model, resolved_device
 
-        model = _try_load_pretrained(resolved_path, resolved_device, "Failed to load base model")
+        model = _try_load_pretrained(
+            resolved_path, resolved_device, "Failed to load base model"
+        )
 
         _set_base_model_cache(
             LoadedModel(
@@ -307,7 +311,7 @@ def _seed_everything(seed: int | None) -> int | None:
     random.seed(value)
     np.random.seed(value)
     try:
-        import torch
+        torch = __import__("torch")
 
         torch.manual_seed(value)
         if torch.cuda.is_available():
@@ -323,11 +327,13 @@ def unload_model() -> str:
         _set_base_model_cache(None)
     try:
         import gc
-        import torch
+
+        torch = __import__("torch")
 
         gc.collect()
         if (
-            torch.backends.mps.is_available()
+            getattr(torch.backends, "mps", None)
+            and torch.backends.mps.is_available()
             and hasattr(torch, "mps")
             and hasattr(torch.mps, "empty_cache")
         ):
@@ -350,7 +356,6 @@ def _reraise_nan_inf(e: RuntimeError) -> None:
             "Hint: this often happens due to unstable sampling on some devices/dtypes. "
             "Try `device=cpu`, reduce `temperature`, or use a smaller `max_new_tokens`."
         ) from e
-
 
 
 def _generate_audio(
@@ -560,7 +565,9 @@ def synthesize_voice_clone_batch(
     if final_use_icl and not final_ref_text:
         raise ValueError("Reference transcript is required when ICL mode is enabled.")
 
-    lines = [line.strip() for line in (multiline_text or "").splitlines() if line.strip()]
+    lines = [
+        line.strip() for line in (multiline_text or "").splitlines() if line.strip()
+    ]
     if not lines:
         raise ValueError("Batch text is empty. Add one sentence per line.")
 
@@ -634,6 +641,7 @@ def synthesize_voice_clone_batch(
         f"Archive: {zip_path}"
     )
     return first_audio, zip_path, message
+
 
 def synthesize_batch(
     *,

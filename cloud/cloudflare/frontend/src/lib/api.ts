@@ -15,10 +15,14 @@ export interface Voice {
   model_size: string
   run_name?: string | null
   epoch?: number | null
+  checkpoint_preset?: string | null
+  checkpoint_score?: number | null
+  checkpoint_job_id?: string | null
   checkpoint_r2_prefix?: string | null
   candidate_checkpoint_r2_prefix?: string | null
   candidate_run_name?: string | null
   candidate_epoch?: number | null
+  candidate_preset?: string | null
   candidate_score?: number | null
   candidate_job_id?: string | null
   active_round_id?: string | null
@@ -77,6 +81,77 @@ export interface TrainingProgress {
   [key: string]: unknown
 }
 
+export type TrainingCheckoutAdoptionMode = 'promote' | 'candidate' | 'keep_current'
+
+export type TrainingCheckoutSearchStatus =
+  | 'pending'
+  | 'validating'
+  | 'promoted'
+  | 'candidate_ready'
+  | 'kept_current'
+  | 'manual_promoted'
+  | 'rejected'
+  | 'failed'
+
+export interface TrainingCheckoutTarget {
+  prefix: string
+  epoch: number | null
+  preset: string | null
+  score: number | null
+  run_name: string | null
+}
+
+export interface TrainingCheckoutEvaluation {
+  epoch: number
+  prefix: string
+  ok: boolean
+  score: number
+  message: string
+  preset: string
+  passed_samples: number
+  total_samples: number
+  run_name: string | null
+  is_champion: boolean
+  is_selected: boolean
+}
+
+export interface TrainingCheckoutLedgerEntry {
+  entry_id: string
+  round_id: string | null
+  job_id: string
+  voice_id: string
+  checkpoint_r2_prefix: string
+  run_name: string | null
+  epoch: number | null
+  preset: string | null
+  score: number | null
+  ok: boolean | null
+  passed_samples: number | null
+  total_samples: number | null
+  message: string | null
+  role: string
+  source: string
+  adoption_mode: string | null
+  created_at: number
+  updated_at: number
+}
+
+export interface TrainingCheckoutSearch {
+  status: TrainingCheckoutSearchStatus
+  validation_checked: boolean
+  validation_passed: boolean
+  validation_in_progress: boolean
+  has_candidates: boolean
+  compare_ready: boolean
+  adoption_mode: TrainingCheckoutAdoptionMode | null
+  message: string | null
+  last_message: string | null
+  champion: TrainingCheckoutTarget | null
+  selected: TrainingCheckoutTarget | null
+  manual_promoted: TrainingCheckoutTarget | null
+  evaluated: TrainingCheckoutEvaluation[]
+}
+
 export interface TrainingConfig {
   batch_size?: number
   num_epochs?: number
@@ -108,6 +183,7 @@ export interface TrainingAdvice {
   compareFirst: boolean
   reviewDatasetFirst: boolean
   primaryActionLabel?: string
+  analysisProvider?: 'heuristic' | 'llm'
 }
 
 export interface TrainingJob {
@@ -115,6 +191,7 @@ export interface TrainingJob {
   round_id?: string | null
   dataset_snapshot_id?: string | null
   status:
+    | 'queued'
     | 'pending'
     | 'running'
     | 'provisioning'
@@ -136,6 +213,7 @@ export interface TrainingJob {
   error_message?: string | null
   config: TrainingConfig
   summary?: Record<string, unknown>
+  checkout_search?: TrainingCheckoutSearch
   metrics?: Record<string, unknown>
   supervisor?: Record<string, unknown>
 }
@@ -171,6 +249,22 @@ export interface TrainingRound {
   production_checkpoint_r2_prefix?: string | null
   production_run_name?: string | null
   production_epoch?: number | null
+  production_preset?: string | null
+  production_score?: number | null
+  production_job_id?: string | null
+  champion_checkpoint_r2_prefix?: string | null
+  champion_run_name?: string | null
+  champion_epoch?: number | null
+  champion_preset?: string | null
+  champion_score?: number | null
+  champion_job_id?: string | null
+  selected_checkpoint_r2_prefix?: string | null
+  selected_run_name?: string | null
+  selected_epoch?: number | null
+  selected_preset?: string | null
+  selected_score?: number | null
+  selected_job_id?: string | null
+  adoption_mode?: string | null
   candidate_checkpoint_r2_prefix?: string | null
   candidate_run_name?: string | null
   candidate_epoch?: number | null
@@ -577,6 +671,10 @@ export async function startTraining(
 
 export async function fetchTrainingJob(jobId: string): Promise<TrainingJob> {
   return request<TrainingJob>(`/v1/training/${jobId}`)
+}
+
+export async function fetchTrainingCheckoutLedger(jobId: string): Promise<{ entries: TrainingCheckoutLedgerEntry[] }> {
+  return request<{ entries: TrainingCheckoutLedgerEntry[] }>(`/v1/training/${jobId}/checkout-ledger`)
 }
 
 export async function fetchTrainingJobs(

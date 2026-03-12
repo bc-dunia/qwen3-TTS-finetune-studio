@@ -18,9 +18,13 @@ CREATE TABLE IF NOT EXISTS voices (
     checkpoint_r2_prefix TEXT,                    -- R2 prefix: checkpoints/{voice_id}/{run_name}/checkpoint-epoch-N
     run_name          TEXT,                       -- Training run name
     epoch             INTEGER,                    -- Best checkpoint epoch number
+    checkpoint_preset TEXT,
+    checkpoint_score  REAL,
+    checkpoint_job_id TEXT,
     candidate_checkpoint_r2_prefix TEXT,         -- Validated candidate checkpoint pending promotion
     candidate_run_name TEXT,
     candidate_epoch   INTEGER,
+    candidate_preset  TEXT,
     candidate_score   REAL,
     candidate_job_id  TEXT,
     active_round_id   TEXT,
@@ -120,6 +124,22 @@ CREATE TABLE IF NOT EXISTS training_rounds (
     production_checkpoint_r2_prefix TEXT,
     production_run_name          TEXT,
     production_epoch             INTEGER,
+    production_preset            TEXT,
+    production_score             REAL,
+    production_job_id            TEXT,
+    champion_checkpoint_r2_prefix TEXT,
+    champion_run_name            TEXT,
+    champion_epoch               INTEGER,
+    champion_preset              TEXT,
+    champion_score               REAL,
+    champion_job_id              TEXT,
+    selected_checkpoint_r2_prefix TEXT,
+    selected_run_name            TEXT,
+    selected_epoch               INTEGER,
+    selected_preset              TEXT,
+    selected_score               REAL,
+    selected_job_id              TEXT,
+    adoption_mode                TEXT,
     candidate_checkpoint_r2_prefix TEXT,
     candidate_run_name           TEXT,
     candidate_epoch              INTEGER,
@@ -138,6 +158,40 @@ CREATE INDEX IF NOT EXISTS idx_training_rounds_voice
   ON training_rounds(voice_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_training_rounds_snapshot
   ON training_rounds(dataset_snapshot_id);
+
+
+-- ── Training Checkout Ledger ───────────────────────────────────────
+-- Persistent audit trail of validation outcomes and manual promotions.
+
+CREATE TABLE IF NOT EXISTS training_checkout_ledger (
+    entry_id                    TEXT PRIMARY KEY,
+    round_id                    TEXT REFERENCES training_rounds(round_id),
+    job_id                      TEXT NOT NULL REFERENCES training_jobs(job_id),
+    voice_id                    TEXT NOT NULL REFERENCES voices(voice_id),
+    checkpoint_r2_prefix        TEXT NOT NULL,
+    run_name                    TEXT,
+    epoch                       INTEGER,
+    preset                      TEXT,
+    score                       REAL,
+    ok                          INTEGER,
+    passed_samples              INTEGER,
+    total_samples               INTEGER,
+    message                     TEXT,
+    role                        TEXT NOT NULL,   -- 'evaluated' | 'champion' | 'selected' | 'manual_promoted'
+    source                      TEXT NOT NULL,   -- 'validation' | 'manual_promotion' | 'recovery'
+    adoption_mode               TEXT,
+    created_at                  INTEGER NOT NULL,
+    updated_at                  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_training_checkout_ledger_job
+  ON training_checkout_ledger(job_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_training_checkout_ledger_round
+  ON training_checkout_ledger(round_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_training_checkout_ledger_voice
+  ON training_checkout_ledger(voice_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_training_checkout_ledger_checkpoint
+  ON training_checkout_ledger(checkpoint_r2_prefix, created_at DESC);
 
 
 -- ── Dataset Preprocess Cache ───────────────────────────────────────

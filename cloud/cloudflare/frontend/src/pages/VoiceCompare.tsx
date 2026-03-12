@@ -20,19 +20,14 @@ import {
   type Voice,
   type VoiceSettings,
 } from '../lib/api'
+import {
+  getTrainingCheckoutSearch,
+  getTrainingJobDisplayStatus,
+  shouldWatchTrainingJob,
+} from '../lib/trainingCheckout'
 import { buildTrainingAdvice } from '../lib/trainingAdvisor'
 
 const MAX_COMPARE_CANDIDATES = 4
-const ACTIVE_TRAINING_STATUSES = new Set([
-  'pending',
-  'running',
-  'provisioning',
-  'downloading',
-  'preprocessing',
-  'preparing',
-  'training',
-  'uploading',
-])
 
 type CheckpointCandidate = {
   id: string
@@ -60,9 +55,9 @@ type RunSummary = {
   completedAt: number | null
   durationMs: number | null
   status: string
-  selectedScore: number | null
-  selectedEpoch: number | null
-  selectedPreset: string | null
+  championScore: number | null
+  championEpoch: number | null
+  championPreset: string | null
   validationMessage: string | null
   hasCandidates: boolean
   validationPassed: boolean
@@ -111,10 +106,6 @@ function parseRunNameFromPrefix(prefix: string | null | undefined): string | nul
 function toFiniteNumber(value: unknown): number | null {
   const numeric = Number(value)
   return Number.isFinite(numeric) ? numeric : null
-}
-
-function toStringOrNull(value: unknown): string | null {
-  return typeof value === 'string' && value.trim() ? value.trim() : null
 }
 
 function readTimestamp(value: unknown): number | null {
@@ -172,13 +163,9 @@ function buildAttemptNumbers(jobs: TrainingJob[]): Map<string, number> {
 function buildRunSummaries(jobs: TrainingJob[], attemptNumbers: Map<string, number>): RunSummary[] {
   return jobs
     .map((job) => {
-      const summary = job.summary ?? {}
-      const evaluated = Array.isArray(summary.evaluated_checkpoints) ? summary.evaluated_checkpoints : []
-      const validationPassed = summary.validation_passed === true
-      const validationRejected =
-        summary.validation_checked === true &&
-        summary.validation_passed !== true &&
-        evaluated.length > 0
+      const checkout = getTrainingCheckoutSearch(job)
+      const validationPassed = checkout.validation_passed
+      const validationRejected = checkout.status === 'rejected'
       return {
         jobId: job.job_id,
         createdAt: job.created_at,
@@ -186,17 +173,17 @@ function buildRunSummaries(jobs: TrainingJob[], attemptNumbers: Map<string, numb
         startedAt: getJobStartedAt(job),
         completedAt: getJobCompletedAt(job),
         durationMs: getJobDurationMs(job),
-        status: job.status,
-        selectedScore: toFiniteNumber(summary.selected_score),
-        selectedEpoch: toFiniteNumber(summary.selected_checkpoint_epoch),
-        selectedPreset: toStringOrNull(summary.selected_preset),
-        validationMessage: toStringOrNull(summary.validation_message),
-        hasCandidates: evaluated.length > 0,
+        status: getTrainingJobDisplayStatus(job),
+        championScore: checkout.champion?.score ?? checkout.selected?.score ?? null,
+        championEpoch: checkout.champion?.epoch ?? checkout.selected?.epoch ?? null,
+        championPreset: checkout.champion?.preset ?? checkout.selected?.preset ?? null,
+        validationMessage: checkout.message,
+        hasCandidates: checkout.has_candidates,
         validationPassed,
         validationRejected,
       }
     })
-    .filter((run) => run.hasCandidates || run.selectedScore !== null)
+    .filter((run) => run.hasCandidates || run.championScore !== null)
 }
 
 function getTrainingResetAt(voice: Voice | null): number | null {
@@ -208,8 +195,6 @@ function getTrainingResetAt(voice: Voice | null): number | null {
 }
 
 function getRunOutcomeLabel(run: RunSummary): string {
-  if (run.validationPassed) return 'validated'
-  if (run.validationRejected) return 'rejected'
   return run.status
 }
 
@@ -232,14 +217,11 @@ function buildCheckpointCandidates(
   const storedCandidatePrefix = voice?.candidate_checkpoint_r2_prefix ?? null
 
   for (const job of jobs) {
-    const summary = job.summary ?? {}
-    const evaluated = Array.isArray(summary.evaluated_checkpoints) ? summary.evaluated_checkpoints : []
-    const selectedPrefix = toStringOrNull(summary.selected_checkpoint_prefix)
-    const selectedEpoch = toFiniteNumber(summary.selected_checkpoint_epoch)
-    const selectedScore = toFiniteNumber(summary.selected_score)
-    const selectedPreset = toStringOrNull(summary.selected_preset)
-    const validationMessage = toStringOrNull(summary.validation_message)
-    const validationPassed = summary.validation_passed === true
+    const checkout = getTrainingCheckoutSearch(job)
+    const champion = checkout.champion
+    const selected = checkout.selected
+    const validationMessage = checkout.message
+    const validationPassed = checkout.validation_passed
 
     const registerCandidate = (input: {
       prefix: string
@@ -291,30 +273,38 @@ function buildCheckpointCandidates(
       })
     }
 
-    for (const value of evaluated) {
-      if (!value || typeof value !== 'object') continue
-      const candidate = value as Record<string, unknown>
-      const prefix = toStringOrNull(candidate.prefix)
-      if (!prefix) continue
+    for (const candidate of checkout.evaluated) {
       registerCandidate({
-        prefix,
-        epoch: toFiniteNumber(candidate.epoch),
-        score: toFiniteNumber(candidate.score),
-        preset: toStringOrNull(candidate.preset),
-        message: toStringOrNull(candidate.message),
-        isJobRecommendation: selectedPrefix === prefix,
-        validationPassed: candidate.ok === true,
+        prefix: candidate.prefix,
+        epoch: candidate.epoch,
+        score: candidate.score,
+        preset: candidate.preset,
+        message: candidate.message,
+        isJobRecommendation: champion?.prefix === candidate.prefix,
+        validationPassed: candidate.ok,
       })
     }
 
-    if (selectedPrefix) {
+    if (champion) {
       registerCandidate({
-        prefix: selectedPrefix,
-        epoch: selectedEpoch,
-        score: selectedScore,
-        preset: selectedPreset,
+        prefix: champion.prefix,
+        epoch: champion.epoch,
+        score: champion.score,
+        preset: champion.preset,
         message: validationMessage,
         isJobRecommendation: true,
+        validationPassed,
+      })
+    }
+
+    if (selected && selected.prefix !== champion?.prefix) {
+      registerCandidate({
+        prefix: selected.prefix,
+        epoch: selected.epoch,
+        score: selected.score,
+        preset: selected.preset,
+        message: validationMessage,
+        isJobRecommendation: false,
         validationPassed,
       })
     }
@@ -325,10 +315,13 @@ function buildCheckpointCandidates(
       id: voice.checkpoint_r2_prefix,
       prefix: voice.checkpoint_r2_prefix,
       epoch: typeof voice.epoch === 'number' ? voice.epoch : null,
-      score: null,
-      preset: null,
-      message: 'Current production checkpoint has no validated result in this cycle',
-      jobId: null,
+      score: typeof voice.checkpoint_score === 'number' ? voice.checkpoint_score : null,
+      preset: voice.checkpoint_preset ?? null,
+      message:
+        typeof voice.checkpoint_score === 'number'
+          ? 'Current production checkpoint from a previous validated cycle.'
+          : 'Current production checkpoint has no validated result in this cycle',
+      jobId: voice.checkpoint_job_id ?? null,
       createdAt: Number(new Date(voice.updated_at ?? voice.created_at).getTime()),
       completedAt: readTimestamp(voice.updated_at ?? voice.created_at),
       attemptNumber: null,
@@ -346,7 +339,7 @@ function buildCheckpointCandidates(
       prefix: voice.candidate_checkpoint_r2_prefix,
       epoch: typeof voice.candidate_epoch === 'number' ? voice.candidate_epoch : null,
       score: typeof voice.candidate_score === 'number' ? voice.candidate_score : null,
-      preset: null,
+      preset: voice.candidate_preset ?? null,
       message: 'Validated candidate currently staged for manual promotion.',
       jobId: voice.candidate_job_id ?? null,
       createdAt: Number(new Date(voice.updated_at ?? voice.created_at).getTime()),
@@ -477,7 +470,7 @@ export function VoiceCompare() {
     ? jobs
     : jobs.filter((job) => job.created_at >= trainingResetAt)
   const cycleJobsAdviceSignature = cycleJobs
-    .map((job) => `${job.job_id}:${job.status}:${job.updated_at ?? job.created_at}:${job.summary?.validation_checked === true ? 1 : 0}`)
+    .map((job) => `${job.job_id}:${job.status}:${job.updated_at ?? job.created_at}:${getTrainingCheckoutSearch(job).status}`)
     .join('|')
   const archivedJobsCount = Math.max(0, jobs.length - cycleJobs.length)
   const attemptNumbers = buildAttemptNumbers(cycleJobs)
@@ -498,9 +491,7 @@ export function VoiceCompare() {
     [...candidates]
       .filter((candidate) => !candidate.validationPassed && !candidate.isCurrentProduction)
       .sort((a, b) => b.createdAt - a.createdAt)[0] ?? null
-  const hasWatchableJobs = cycleJobs.some((job) =>
-    ACTIVE_TRAINING_STATUSES.has(job.status) || job.summary?.validation_checked !== true,
-  )
+  const hasWatchableJobs = cycleJobs.some((job) => shouldWatchTrainingJob(job))
   const localTrainingAdvice = buildTrainingAdvice(voice, cycleJobs)
   const trainingAdvice = serverTrainingAdvice ?? localTrainingAdvice
 
@@ -966,9 +957,9 @@ export function VoiceCompare() {
                   </div>
                   <div className="mt-2 flex flex-wrap gap-2 text-[10px] font-mono text-muted">
                     <span>status={getRunOutcomeLabel(run)}</span>
-                    <span>score={run.selectedScore !== null ? run.selectedScore.toFixed(3) : 'n/a'}</span>
-                    <span>epoch={run.selectedEpoch ?? 'n/a'}</span>
-                    <span>preset={run.selectedPreset ?? 'n/a'}</span>
+                    <span>score={run.championScore !== null ? run.championScore.toFixed(3) : 'n/a'}</span>
+                    <span>epoch={run.championEpoch ?? 'n/a'}</span>
+                    <span>preset={run.championPreset ?? 'n/a'}</span>
                     {run.durationMs !== null && <span>duration={formatDurationMs(run.durationMs)}</span>}
                   </div>
                   {run.validationMessage && (

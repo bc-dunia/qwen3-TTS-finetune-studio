@@ -21,9 +21,13 @@ type DbVoiceRow = {
   checkpoint_r2_prefix: string | null;
   run_name: string | null;
   epoch: number | null;
+  checkpoint_preset: string | null;
+  checkpoint_score: number | null;
+  checkpoint_job_id: string | null;
   candidate_checkpoint_r2_prefix: string | null;
   candidate_run_name: string | null;
   candidate_epoch: number | null;
+  candidate_preset: string | null;
   candidate_score: number | null;
   candidate_job_id: string | null;
   active_round_id: string | null;
@@ -127,6 +131,22 @@ type DbTrainingRoundRow = {
   production_checkpoint_r2_prefix: string | null;
   production_run_name: string | null;
   production_epoch: number | null;
+  production_preset: string | null;
+  production_score: number | null;
+  production_job_id: string | null;
+  champion_checkpoint_r2_prefix: string | null;
+  champion_run_name: string | null;
+  champion_epoch: number | null;
+  champion_preset: string | null;
+  champion_score: number | null;
+  champion_job_id: string | null;
+  selected_checkpoint_r2_prefix: string | null;
+  selected_run_name: string | null;
+  selected_epoch: number | null;
+  selected_preset: string | null;
+  selected_score: number | null;
+  selected_job_id: string | null;
+  adoption_mode: string | null;
   candidate_checkpoint_r2_prefix: string | null;
   candidate_run_name: string | null;
   candidate_epoch: number | null;
@@ -137,6 +157,48 @@ type DbTrainingRoundRow = {
   updated_at: number;
   started_at: number | null;
   completed_at: number | null;
+};
+
+export type TrainingCheckoutLedgerEntry = {
+  entry_id: string;
+  round_id: string | null;
+  job_id: string;
+  voice_id: string;
+  checkpoint_r2_prefix: string;
+  run_name: string | null;
+  epoch: number | null;
+  preset: string | null;
+  score: number | null;
+  ok: boolean | null;
+  passed_samples: number | null;
+  total_samples: number | null;
+  message: string | null;
+  role: string;
+  source: string;
+  adoption_mode: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+type DbTrainingCheckoutLedgerRow = {
+  entry_id: string;
+  round_id: string | null;
+  job_id: string;
+  voice_id: string;
+  checkpoint_r2_prefix: string;
+  run_name: string | null;
+  epoch: number | null;
+  preset: string | null;
+  score: number | null;
+  ok: number | null;
+  passed_samples: number | null;
+  total_samples: number | null;
+  message: string | null;
+  role: string;
+  source: string;
+  adoption_mode: string | null;
+  created_at: number;
+  updated_at: number;
 };
 
 const parseJson = <T>(value: string | null | undefined, fallback: T): T => {
@@ -162,9 +224,13 @@ const mapVoice = (row: DbVoiceRow): Voice => ({
   checkpoint_r2_prefix: row.checkpoint_r2_prefix,
   run_name: row.run_name,
   epoch: row.epoch,
+  checkpoint_preset: row.checkpoint_preset,
+  checkpoint_score: row.checkpoint_score,
+  checkpoint_job_id: row.checkpoint_job_id,
   candidate_checkpoint_r2_prefix: row.candidate_checkpoint_r2_prefix,
   candidate_run_name: row.candidate_run_name,
   candidate_epoch: row.candidate_epoch,
+  candidate_preset: row.candidate_preset,
   candidate_score: row.candidate_score,
   candidate_job_id: row.candidate_job_id,
   active_round_id: row.active_round_id,
@@ -313,6 +379,22 @@ const mapTrainingRound = (row: DbTrainingRoundRow): TrainingRound => ({
   production_checkpoint_r2_prefix: row.production_checkpoint_r2_prefix,
   production_run_name: row.production_run_name,
   production_epoch: row.production_epoch,
+  production_preset: row.production_preset,
+  production_score: row.production_score,
+  production_job_id: row.production_job_id,
+  champion_checkpoint_r2_prefix: row.champion_checkpoint_r2_prefix,
+  champion_run_name: row.champion_run_name,
+  champion_epoch: row.champion_epoch,
+  champion_preset: row.champion_preset,
+  champion_score: row.champion_score,
+  champion_job_id: row.champion_job_id,
+  selected_checkpoint_r2_prefix: row.selected_checkpoint_r2_prefix,
+  selected_run_name: row.selected_run_name,
+  selected_epoch: row.selected_epoch,
+  selected_preset: row.selected_preset,
+  selected_score: row.selected_score,
+  selected_job_id: row.selected_job_id,
+  adoption_mode: row.adoption_mode,
   candidate_checkpoint_r2_prefix: row.candidate_checkpoint_r2_prefix,
   candidate_run_name: row.candidate_run_name,
   candidate_epoch: row.candidate_epoch,
@@ -370,10 +452,10 @@ export const createVoice = async (db: D1Database, voice: Voice): Promise<void> =
     .prepare(
       `INSERT INTO voices (
         voice_id, name, description, speaker_name, model_size, model_id, category, status,
-        checkpoint_r2_prefix, run_name, epoch,
-        candidate_checkpoint_r2_prefix, candidate_run_name, candidate_epoch, candidate_score, candidate_job_id, active_round_id,
+        checkpoint_r2_prefix, run_name, epoch, checkpoint_preset, checkpoint_score, checkpoint_job_id,
+        candidate_checkpoint_r2_prefix, candidate_run_name, candidate_epoch, candidate_preset, candidate_score, candidate_job_id, active_round_id,
         sample_audio_r2_key, ref_audio_r2_key, labels_json, settings_json, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       voice.voice_id,
@@ -387,9 +469,13 @@ export const createVoice = async (db: D1Database, voice: Voice): Promise<void> =
       voice.checkpoint_r2_prefix,
       voice.run_name,
       voice.epoch,
+      voice.checkpoint_preset,
+      voice.checkpoint_score,
+      voice.checkpoint_job_id,
       voice.candidate_checkpoint_r2_prefix,
       voice.candidate_run_name,
       voice.candidate_epoch,
+      voice.candidate_preset,
       voice.candidate_score,
       voice.candidate_job_id,
       voice.active_round_id,
@@ -411,9 +497,13 @@ export const updateVoice = async (
     checkpoint_r2_prefix?: string | null;
     run_name?: string | null;
     epoch?: number | null;
+    checkpoint_preset?: string | null;
+    checkpoint_score?: number | null;
+    checkpoint_job_id?: string | null;
     candidate_checkpoint_r2_prefix?: string | null;
     candidate_run_name?: string | null;
     candidate_epoch?: number | null;
+    candidate_preset?: string | null;
     candidate_score?: number | null;
     candidate_job_id?: string | null;
     active_round_id?: string | null;
@@ -442,6 +532,18 @@ export const updateVoice = async (
     fields.push("epoch = ?");
     bindings.push(updates.epoch);
   }
+  if (updates.checkpoint_preset !== undefined) {
+    fields.push("checkpoint_preset = ?");
+    bindings.push(updates.checkpoint_preset);
+  }
+  if (updates.checkpoint_score !== undefined) {
+    fields.push("checkpoint_score = ?");
+    bindings.push(updates.checkpoint_score);
+  }
+  if (updates.checkpoint_job_id !== undefined) {
+    fields.push("checkpoint_job_id = ?");
+    bindings.push(updates.checkpoint_job_id);
+  }
   if (updates.candidate_checkpoint_r2_prefix !== undefined) {
     fields.push("candidate_checkpoint_r2_prefix = ?");
     bindings.push(updates.candidate_checkpoint_r2_prefix);
@@ -453,6 +555,10 @@ export const updateVoice = async (
   if (updates.candidate_epoch !== undefined) {
     fields.push("candidate_epoch = ?");
     bindings.push(updates.candidate_epoch);
+  }
+  if (updates.candidate_preset !== undefined) {
+    fields.push("candidate_preset = ?");
+    bindings.push(updates.candidate_preset);
   }
   if (updates.candidate_score !== undefined) {
     fields.push("candidate_score = ?");
@@ -586,9 +692,9 @@ export const createTrainingJob = async (db: D1Database, job: TrainingJob): Promi
     .bind(
       job.job_id,
       job.voice_id,
-      job.round_id,
-      job.dataset_snapshot_id,
-      job.runpod_pod_id,
+      job.round_id ?? null,
+      job.dataset_snapshot_id ?? null,
+      job.runpod_pod_id ?? null,
       job.job_token ?? null,
       job.status,
       JSON.stringify(job.config),
@@ -597,11 +703,11 @@ export const createTrainingJob = async (db: D1Database, job: TrainingJob): Promi
       JSON.stringify(job.metrics),
       JSON.stringify(job.supervisor ?? {}),
       job.dataset_r2_prefix,
-      job.log_r2_prefix,
-      job.error_message,
-      job.last_heartbeat_at,
-      job.started_at,
-      job.completed_at,
+      job.log_r2_prefix ?? null,
+      job.error_message ?? null,
+      job.last_heartbeat_at ?? null,
+      job.started_at ?? null,
+      job.completed_at ?? null,
       job.created_at,
       job.updated_at
     )
@@ -1031,21 +1137,21 @@ export const upsertDatasetSnapshot = async (
     .bind(
       snapshot.snapshot_id,
       snapshot.voice_id,
-      snapshot.dataset_name,
+      snapshot.dataset_name ?? null,
       snapshot.dataset_r2_prefix,
       snapshot.dataset_signature,
       snapshot.status,
-      snapshot.source_cache_id,
-      snapshot.cache_r2_prefix,
-      snapshot.train_raw_r2_key,
-      snapshot.ref_audio_r2_key,
-      snapshot.reference_profile_r2_key,
-      snapshot.reference_text,
-      snapshot.source_file_count,
-      snapshot.segments_created,
-      snapshot.segments_accepted,
-      snapshot.accepted_duration_min,
-      snapshot.created_from_job_id,
+      snapshot.source_cache_id ?? null,
+      snapshot.cache_r2_prefix ?? null,
+      snapshot.train_raw_r2_key ?? null,
+      snapshot.ref_audio_r2_key ?? null,
+      snapshot.reference_profile_r2_key ?? null,
+      snapshot.reference_text ?? null,
+      snapshot.source_file_count ?? null,
+      snapshot.segments_created ?? null,
+      snapshot.segments_accepted ?? null,
+      snapshot.accepted_duration_min ?? null,
+      snapshot.created_from_job_id ?? null,
       snapshot.created_at,
       snapshot.updated_at
     )
@@ -1112,30 +1218,51 @@ export const createTrainingRound = async (
       `INSERT INTO training_rounds (
         round_id, voice_id, dataset_snapshot_id, round_index, status,
         production_checkpoint_r2_prefix, production_run_name, production_epoch,
+        production_preset, production_score, production_job_id,
+        champion_checkpoint_r2_prefix, champion_run_name, champion_epoch,
+        champion_preset, champion_score, champion_job_id,
+        selected_checkpoint_r2_prefix, selected_run_name, selected_epoch,
+        selected_preset, selected_score, selected_job_id, adoption_mode,
         candidate_checkpoint_r2_prefix, candidate_run_name, candidate_epoch,
         candidate_score, candidate_job_id, summary_json, created_at, updated_at,
         started_at, completed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       round.round_id,
       round.voice_id,
-      round.dataset_snapshot_id,
+      round.dataset_snapshot_id ?? null,
       round.round_index,
       round.status,
-      round.production_checkpoint_r2_prefix,
-      round.production_run_name,
-      round.production_epoch,
-      round.candidate_checkpoint_r2_prefix,
-      round.candidate_run_name,
-      round.candidate_epoch,
-      round.candidate_score,
-      round.candidate_job_id,
+      round.production_checkpoint_r2_prefix ?? null,
+      round.production_run_name ?? null,
+      round.production_epoch ?? null,
+      round.production_preset ?? null,
+      round.production_score ?? null,
+      round.production_job_id ?? null,
+      round.champion_checkpoint_r2_prefix ?? null,
+      round.champion_run_name ?? null,
+      round.champion_epoch ?? null,
+      round.champion_preset ?? null,
+      round.champion_score ?? null,
+      round.champion_job_id ?? null,
+      round.selected_checkpoint_r2_prefix ?? null,
+      round.selected_run_name ?? null,
+      round.selected_epoch ?? null,
+      round.selected_preset ?? null,
+      round.selected_score ?? null,
+      round.selected_job_id ?? null,
+      round.adoption_mode ?? null,
+      round.candidate_checkpoint_r2_prefix ?? null,
+      round.candidate_run_name ?? null,
+      round.candidate_epoch ?? null,
+      round.candidate_score ?? null,
+      round.candidate_job_id ?? null,
       JSON.stringify(round.summary),
       round.created_at,
       round.updated_at,
-      round.started_at,
-      round.completed_at
+      round.started_at ?? null,
+      round.completed_at ?? null
     )
     .run();
 };
@@ -1149,6 +1276,22 @@ export const updateTrainingRound = async (
     production_checkpoint_r2_prefix?: string | null;
     production_run_name?: string | null;
     production_epoch?: number | null;
+    production_preset?: string | null;
+    production_score?: number | null;
+    production_job_id?: string | null;
+    champion_checkpoint_r2_prefix?: string | null;
+    champion_run_name?: string | null;
+    champion_epoch?: number | null;
+    champion_preset?: string | null;
+    champion_score?: number | null;
+    champion_job_id?: string | null;
+    selected_checkpoint_r2_prefix?: string | null;
+    selected_run_name?: string | null;
+    selected_epoch?: number | null;
+    selected_preset?: string | null;
+    selected_score?: number | null;
+    selected_job_id?: string | null;
+    adoption_mode?: string | null;
     candidate_checkpoint_r2_prefix?: string | null;
     candidate_run_name?: string | null;
     candidate_epoch?: number | null;
@@ -1182,6 +1325,70 @@ export const updateTrainingRound = async (
   if (updates.production_epoch !== undefined) {
     fields.push("production_epoch = ?");
     bindings.push(updates.production_epoch);
+  }
+  if (updates.production_preset !== undefined) {
+    fields.push("production_preset = ?");
+    bindings.push(updates.production_preset);
+  }
+  if (updates.production_score !== undefined) {
+    fields.push("production_score = ?");
+    bindings.push(updates.production_score);
+  }
+  if (updates.production_job_id !== undefined) {
+    fields.push("production_job_id = ?");
+    bindings.push(updates.production_job_id);
+  }
+  if (updates.champion_checkpoint_r2_prefix !== undefined) {
+    fields.push("champion_checkpoint_r2_prefix = ?");
+    bindings.push(updates.champion_checkpoint_r2_prefix);
+  }
+  if (updates.champion_run_name !== undefined) {
+    fields.push("champion_run_name = ?");
+    bindings.push(updates.champion_run_name);
+  }
+  if (updates.champion_epoch !== undefined) {
+    fields.push("champion_epoch = ?");
+    bindings.push(updates.champion_epoch);
+  }
+  if (updates.champion_preset !== undefined) {
+    fields.push("champion_preset = ?");
+    bindings.push(updates.champion_preset);
+  }
+  if (updates.champion_score !== undefined) {
+    fields.push("champion_score = ?");
+    bindings.push(updates.champion_score);
+  }
+  if (updates.champion_job_id !== undefined) {
+    fields.push("champion_job_id = ?");
+    bindings.push(updates.champion_job_id);
+  }
+  if (updates.selected_checkpoint_r2_prefix !== undefined) {
+    fields.push("selected_checkpoint_r2_prefix = ?");
+    bindings.push(updates.selected_checkpoint_r2_prefix);
+  }
+  if (updates.selected_run_name !== undefined) {
+    fields.push("selected_run_name = ?");
+    bindings.push(updates.selected_run_name);
+  }
+  if (updates.selected_epoch !== undefined) {
+    fields.push("selected_epoch = ?");
+    bindings.push(updates.selected_epoch);
+  }
+  if (updates.selected_preset !== undefined) {
+    fields.push("selected_preset = ?");
+    bindings.push(updates.selected_preset);
+  }
+  if (updates.selected_score !== undefined) {
+    fields.push("selected_score = ?");
+    bindings.push(updates.selected_score);
+  }
+  if (updates.selected_job_id !== undefined) {
+    fields.push("selected_job_id = ?");
+    bindings.push(updates.selected_job_id);
+  }
+  if (updates.adoption_mode !== undefined) {
+    fields.push("adoption_mode = ?");
+    bindings.push(updates.adoption_mode);
   }
   if (updates.candidate_checkpoint_r2_prefix !== undefined) {
     fields.push("candidate_checkpoint_r2_prefix = ?");
@@ -1224,4 +1431,101 @@ export const updateTrainingRound = async (
     .prepare(`UPDATE training_rounds SET ${fields.join(", ")} WHERE round_id = ?`)
     .bind(...bindings)
     .run();
+};
+
+const mapTrainingCheckoutLedgerEntry = (
+  row: DbTrainingCheckoutLedgerRow
+): TrainingCheckoutLedgerEntry => ({
+  entry_id: row.entry_id,
+  round_id: row.round_id,
+  job_id: row.job_id,
+  voice_id: row.voice_id,
+  checkpoint_r2_prefix: row.checkpoint_r2_prefix,
+  run_name: row.run_name,
+  epoch: row.epoch,
+  preset: row.preset,
+  score: row.score,
+  ok: row.ok === null ? null : row.ok === 1,
+  passed_samples: row.passed_samples,
+  total_samples: row.total_samples,
+  message: row.message,
+  role: row.role,
+  source: row.source,
+  adoption_mode: row.adoption_mode,
+  created_at: row.created_at,
+  updated_at: row.updated_at,
+});
+
+export const listTrainingCheckoutLedger = async (
+  db: D1Database,
+  filters: { job_id?: string; round_id?: string; voice_id?: string; limit?: number } = {}
+): Promise<TrainingCheckoutLedgerEntry[]> => {
+  const conditions: string[] = [];
+  const bindings: Array<string | number> = [];
+
+  if (filters.job_id) {
+    conditions.push("job_id = ?");
+    bindings.push(filters.job_id);
+  }
+  if (filters.round_id) {
+    conditions.push("round_id = ?");
+    bindings.push(filters.round_id);
+  }
+  if (filters.voice_id) {
+    conditions.push("voice_id = ?");
+    bindings.push(filters.voice_id);
+  }
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const limit = Math.max(1, Math.min(filters.limit ?? 200, 1000));
+  const result = await db
+    .prepare(
+      `SELECT * FROM training_checkout_ledger ${whereClause}
+       ORDER BY created_at DESC, updated_at DESC
+       LIMIT ?`
+    )
+    .bind(...bindings, limit)
+    .all<DbTrainingCheckoutLedgerRow>();
+
+  return (result.results ?? []).map(mapTrainingCheckoutLedgerEntry);
+};
+
+export const replaceTrainingCheckoutLedgerForJob = async (
+  db: D1Database,
+  jobId: string,
+  entries: TrainingCheckoutLedgerEntry[]
+): Promise<void> => {
+  await db.prepare("DELETE FROM training_checkout_ledger WHERE job_id = ?").bind(jobId).run();
+
+  for (const entry of entries) {
+    await db
+      .prepare(
+        `INSERT INTO training_checkout_ledger (
+          entry_id, round_id, job_id, voice_id, checkpoint_r2_prefix, run_name, epoch, preset,
+          score, ok, passed_samples, total_samples, message, role, source, adoption_mode,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        entry.entry_id,
+        entry.round_id,
+        entry.job_id,
+        entry.voice_id,
+        entry.checkpoint_r2_prefix,
+        entry.run_name,
+        entry.epoch,
+        entry.preset,
+        entry.score,
+        entry.ok === null ? null : entry.ok ? 1 : 0,
+        entry.passed_samples,
+        entry.total_samples,
+        entry.message,
+        entry.role,
+        entry.source,
+        entry.adoption_mode,
+        entry.created_at,
+        entry.updated_at
+      )
+      .run();
+  }
 };

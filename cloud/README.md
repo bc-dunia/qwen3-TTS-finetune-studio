@@ -48,8 +48,8 @@ npx wrangler d1 create qwen-tts-db
 # Copy the database_id from output into wrangler.toml
 
 # Run database migrations
-npx wrangler d1 execute qwen-tts-db --file=schema.sql
-npx wrangler d1 execute qwen-tts-db --file=schema-v2.sql
+cd cloud/cloudflare/worker-api
+npm run db:migrate
 
 # Create KV namespace
 npx wrangler kv namespace create TTS_CACHE
@@ -71,6 +71,7 @@ npx wrangler secret put R2_SECRET_ACCESS_KEY # R2 S3-compatible secret key
 # - R2_ENDPOINT_URL (https://<account_id>.r2.cloudflarestorage.com)
 # - RUNPOD_ENDPOINT_ID (after creating RunPod endpoint)
 # - RUNPOD_TRAINING_TEMPLATE_ID (after creating RunPod template)
+# - TRAINING_MAX_ACTIVE_JOBS_PER_VOICE (default 3; controls per-voice parallel search fanout)
 
 # Deploy
 npx wrangler deploy

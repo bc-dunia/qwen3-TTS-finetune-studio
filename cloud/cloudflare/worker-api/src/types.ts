@@ -20,7 +20,9 @@ export interface Env {
   OPENAI_API_KEY?: string;
   OPENAI_TRANSCRIBE_MODEL?: string;
   OPENAI_REVIEW_MODEL?: string;
+  OPENAI_ADVISOR_MODEL?: string;
   WORKER_PUBLIC_URL?: string;
+  TRAINING_MAX_ACTIVE_JOBS_PER_VOICE?: string;
 }
 
 export interface VoiceSettings {
@@ -43,9 +45,13 @@ export interface Voice {
   checkpoint_r2_prefix: string | null;
   run_name: string | null;
   epoch: number | null;
+  checkpoint_preset: string | null;
+  checkpoint_score: number | null;
+  checkpoint_job_id: string | null;
   candidate_checkpoint_r2_prefix: string | null;
   candidate_run_name: string | null;
   candidate_epoch: number | null;
+  candidate_preset: string | null;
   candidate_score: number | null;
   candidate_job_id: string | null;
   active_round_id: string | null;
@@ -120,6 +126,7 @@ export interface TrainingAdvice {
   compareFirst: boolean;
   reviewDatasetFirst: boolean;
   primaryActionLabel?: string;
+  analysisProvider?: "heuristic" | "llm";
 }
 
 export interface TrainingProgress {
@@ -128,6 +135,56 @@ export interface TrainingProgress {
   loss?: number;
   eta?: string;
   [key: string]: unknown;
+}
+
+export type TrainingCheckoutAdoptionMode = "promote" | "candidate" | "keep_current";
+
+export type TrainingCheckoutSearchStatus =
+  | "pending"
+  | "validating"
+  | "promoted"
+  | "candidate_ready"
+  | "kept_current"
+  | "manual_promoted"
+  | "rejected"
+  | "failed";
+
+export interface TrainingCheckoutTarget {
+  prefix: string;
+  epoch: number | null;
+  preset: string | null;
+  score: number | null;
+  run_name: string | null;
+}
+
+export interface TrainingCheckoutEvaluation {
+  epoch: number;
+  prefix: string;
+  ok: boolean;
+  score: number;
+  message: string;
+  preset: string;
+  passed_samples: number;
+  total_samples: number;
+  run_name: string | null;
+  is_champion: boolean;
+  is_selected: boolean;
+}
+
+export interface TrainingCheckoutSearch {
+  status: TrainingCheckoutSearchStatus;
+  validation_checked: boolean;
+  validation_passed: boolean;
+  validation_in_progress: boolean;
+  has_candidates: boolean;
+  compare_ready: boolean;
+  adoption_mode: TrainingCheckoutAdoptionMode | null;
+  message: string | null;
+  last_message: string | null;
+  champion: TrainingCheckoutTarget | null;
+  selected: TrainingCheckoutTarget | null;
+  manual_promoted: TrainingCheckoutTarget | null;
+  evaluated: TrainingCheckoutEvaluation[];
 }
 
 export interface TrainingJob {
@@ -141,6 +198,7 @@ export interface TrainingJob {
   config: TrainingConfig;
   progress: TrainingProgress;
   summary: Record<string, unknown>;
+  checkout_search?: TrainingCheckoutSearch;
   metrics: Record<string, unknown>;
   supervisor: Record<string, unknown>;
   dataset_r2_prefix: string;
@@ -225,6 +283,22 @@ export interface TrainingRound {
   production_checkpoint_r2_prefix: string | null;
   production_run_name: string | null;
   production_epoch: number | null;
+  production_preset: string | null;
+  production_score: number | null;
+  production_job_id: string | null;
+  champion_checkpoint_r2_prefix: string | null;
+  champion_run_name: string | null;
+  champion_epoch: number | null;
+  champion_preset: string | null;
+  champion_score: number | null;
+  champion_job_id: string | null;
+  selected_checkpoint_r2_prefix: string | null;
+  selected_run_name: string | null;
+  selected_epoch: number | null;
+  selected_preset: string | null;
+  selected_score: number | null;
+  selected_job_id: string | null;
+  adoption_mode: string | null;
   candidate_checkpoint_r2_prefix: string | null;
   candidate_run_name: string | null;
   candidate_epoch: number | null;
