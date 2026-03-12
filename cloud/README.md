@@ -21,6 +21,15 @@ Cloud deployment architecture for Qwen3-TTS Studio. Splits the application acros
                Datasets)     Jobs)           Inference)
 ```
 
+## Current Stack (Mar 2026)
+
+- Worker API: `https://qwen-tts-api.brian-367.workers.dev`
+- Frontend (Pages): `https://qwen-tts-studio.pages.dev` (latest deploy preview example: `https://533693e8.qwen-tts-studio.pages.dev`)
+- Cloudflare Worker cron: `*/2 * * * *` (runs training supervisor sweep, including campaign progression)
+- D1 database: `qwen-tts-db`
+- R2 bucket: `qwen-tts-studio`
+- Worker compatibility: Wrangler v3 runtime (deployment via `wrangler deploy`)
+
 ## Quick Start
 
 ### Prerequisites
@@ -158,7 +167,71 @@ echo "VITE_API_URL=https://qwen-tts-api.YOUR_SUBDOMAIN.workers.dev" > .env
 npm run build
 
 # Deploy to Cloudflare Pages
-npx wrangler pages deploy dist --project-name qwen-tts-studio
+npx wrangler pages deploy dist --project-name qwen-tts-studio --branch main
+```
+
+## Training Modes (Current)
+
+### Single Training Job
+
+Launches one training job immediately with explicit config overrides.
+
+```bash
+curl -X POST "https://qwen-tts-api.brian-367.workers.dev/v1/training/start" \
+  -H "xi-api-key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "voice_id": "VOICE_ID",
+    "config": {
+      "model_size": "1.7B",
+      "batch_size": 2,
+      "learning_rate": 2e-5,
+      "num_epochs": 3,
+      "gradient_accumulation_steps": 4,
+      "save_every_n_epochs": 1,
+      "seed": 303,
+      "whisper_language": "ko"
+    }
+  }'
+```
+
+### Autopilot Campaign
+
+Creates multi-attempt training plans with campaign state tracked in D1 and progressed by sweep + endpoint calls.
+
+```bash
+curl -X POST "https://qwen-tts-api.brian-367.workers.dev/v1/training/campaigns" \
+  -H "xi-api-key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "voice_id": "VOICE_ID",
+    "attempt_count": 6,
+    "parallelism": 3,
+    "base_config_overrides": {
+      "model_size": "1.7B",
+      "batch_size": 2,
+      "learning_rate": 2e-5,
+      "num_epochs": 8,
+      "seed": 42,
+      "whisper_language": "ko"
+    },
+    "stop_rules": {
+      "max_asr_failures": 2,
+      "max_infra_failures": 2,
+      "min_score_improvement": 0.005,
+      "stagnation_window": 2
+    }
+  }'
+```
+
+Poll/cancel campaign:
+
+```bash
+curl "https://qwen-tts-api.brian-367.workers.dev/v1/training/campaigns/CAMPAIGN_ID" \
+  -H "xi-api-key: YOUR_API_KEY"
+
+curl -X POST "https://qwen-tts-api.brian-367.workers.dev/v1/training/campaigns/CAMPAIGN_ID/cancel" \
+  -H "xi-api-key: YOUR_API_KEY"
 ```
 
 ## API Usage
