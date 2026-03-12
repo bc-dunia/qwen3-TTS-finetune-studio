@@ -1,6 +1,9 @@
 import type {
   DatasetSnapshot,
   Generation,
+  TrainingCampaign,
+  TrainingCampaignStatus,
+  TrainingCampaignStopRules,
   TrainingConfig,
   TrainingJob,
   TrainingProgress,
@@ -42,6 +45,8 @@ type DbVoiceRow = {
 type DbTrainingRow = {
   job_id: string;
   voice_id: string;
+  campaign_id: string | null;
+  attempt_index: number | null;
   round_id: string | null;
   dataset_snapshot_id: string | null;
   runpod_pod_id: string | null;
@@ -60,6 +65,24 @@ type DbTrainingRow = {
   completed_at: number | null;
   created_at: number;
   updated_at: number;
+};
+
+type DbTrainingCampaignRow = {
+  campaign_id: string;
+  voice_id: string;
+  dataset_name: string | null;
+  dataset_r2_prefix: string | null;
+  dataset_snapshot_id: string | null;
+  attempt_count: number;
+  parallelism: number;
+  status: TrainingCampaignStatus;
+  base_config_json: string;
+  stop_rules_json: string;
+  planner_state_json: string;
+  summary_json: string;
+  created_at: number;
+  updated_at: number;
+  completed_at: number | null;
 };
 
 type DbTrainingLogChunkRow = {
@@ -248,6 +271,8 @@ const mapVoice = (row: DbVoiceRow): Voice => ({
 const mapTrainingJob = (row: DbTrainingRow): TrainingJob => ({
   job_id: row.job_id,
   voice_id: row.voice_id,
+  campaign_id: row.campaign_id,
+  attempt_index: row.attempt_index,
   round_id: row.round_id,
   dataset_snapshot_id: row.dataset_snapshot_id,
   runpod_pod_id: row.runpod_pod_id,
@@ -404,6 +429,24 @@ const mapTrainingRound = (row: DbTrainingRoundRow): TrainingRound => ({
   created_at: row.created_at,
   updated_at: row.updated_at,
   started_at: row.started_at,
+  completed_at: row.completed_at,
+});
+
+const mapTrainingCampaign = (row: DbTrainingCampaignRow): TrainingCampaign => ({
+  campaign_id: row.campaign_id,
+  voice_id: row.voice_id,
+  dataset_name: row.dataset_name,
+  dataset_r2_prefix: row.dataset_r2_prefix,
+  dataset_snapshot_id: row.dataset_snapshot_id,
+  attempt_count: row.attempt_count,
+  parallelism: row.parallelism,
+  status: row.status,
+  base_config: parseJson<TrainingConfig>(row.base_config_json, {}),
+  stop_rules: parseJson<TrainingCampaignStopRules>(row.stop_rules_json, {}),
+  planner_state: parseJson<Record<string, unknown>>(row.planner_state_json, {}),
+  summary: parseJson<Record<string, unknown>>(row.summary_json, {}),
+  created_at: row.created_at,
+  updated_at: row.updated_at,
   completed_at: row.completed_at,
 });
 
@@ -661,7 +704,7 @@ export const getTrainingJobByToken = async (
 
 export const listTrainingJobs = async (
   db: D1Database,
-  filters: { voice_id?: string; limit?: number } = {}
+  filters: { voice_id?: string; campaign_id?: string; limit?: number } = {}
 ): Promise<TrainingJob[]> => {
   const conditions: string[] = [];
   const bindings: Array<string | number> = [];
@@ -669,6 +712,10 @@ export const listTrainingJobs = async (
   if (filters.voice_id) {
     conditions.push("voice_id = ?");
     bindings.push(filters.voice_id);
+  }
+  if (filters.campaign_id) {
+    conditions.push("campaign_id = ?");
+    bindings.push(filters.campaign_id);
   }
 
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
@@ -684,14 +731,16 @@ export const createTrainingJob = async (db: D1Database, job: TrainingJob): Promi
   await db
     .prepare(
       `INSERT INTO training_jobs (
-        job_id, voice_id, round_id, dataset_snapshot_id, runpod_pod_id, job_token, status, config_json, progress_json,
+        job_id, voice_id, campaign_id, attempt_index, round_id, dataset_snapshot_id, runpod_pod_id, job_token, status, config_json, progress_json,
         summary_json, metrics_json, supervisor_json, dataset_r2_prefix, log_r2_prefix, error_message,
         last_heartbeat_at, started_at, completed_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       job.job_id,
       job.voice_id,
+      job.campaign_id ?? null,
+      job.attempt_index ?? null,
       job.round_id ?? null,
       job.dataset_snapshot_id ?? null,
       job.runpod_pod_id ?? null,
@@ -718,6 +767,8 @@ export const updateTrainingJob = async (
   db: D1Database,
   jobId: string,
   updates: {
+    campaign_id?: string | null;
+    attempt_index?: number | null;
     round_id?: string | null;
     dataset_snapshot_id?: string | null;
     runpod_pod_id?: string | null;
@@ -734,6 +785,7 @@ export const updateTrainingJob = async (
     started_at?: number | null;
     completed_at?: number | null;
     updated_at?: number;
+    expected_updated_at?: number;
   }
 ): Promise<void> => {
   const fields: string[] = [];
@@ -742,6 +794,14 @@ export const updateTrainingJob = async (
   if (updates.round_id !== undefined) {
     fields.push("round_id = ?");
     bindings.push(updates.round_id);
+  }
+  if (updates.campaign_id !== undefined) {
+    fields.push("campaign_id = ?");
+    bindings.push(updates.campaign_id);
+  }
+  if (updates.attempt_index !== undefined) {
+    fields.push("attempt_index = ?");
+    bindings.push(updates.attempt_index);
   }
   if (updates.dataset_snapshot_id !== undefined) {
     fields.push("dataset_snapshot_id = ?");
@@ -808,9 +868,180 @@ export const updateTrainingJob = async (
     return;
   }
 
+  if (updates.expected_updated_at !== undefined) {
+    bindings.push(jobId, updates.expected_updated_at);
+    const result = await db
+      .prepare(`UPDATE training_jobs SET ${fields.join(", ")} WHERE job_id = ? AND updated_at = ?`)
+      .bind(...bindings)
+      .run();
+    if ((result.meta?.changes ?? 0) === 0) {
+      throw new Error(`training_job_conflict:${jobId}`);
+    }
+    return;
+  }
+
   bindings.push(jobId);
   await db
     .prepare(`UPDATE training_jobs SET ${fields.join(", ")} WHERE job_id = ?`)
+    .bind(...bindings)
+    .run();
+};
+
+export const getTrainingCampaign = async (
+  db: D1Database,
+  campaignId: string
+): Promise<TrainingCampaign | null> => {
+  const row = await db
+    .prepare("SELECT * FROM training_campaigns WHERE campaign_id = ? LIMIT 1")
+    .bind(campaignId)
+    .first<DbTrainingCampaignRow>();
+
+  return row ? mapTrainingCampaign(row) : null;
+};
+
+export const listTrainingCampaigns = async (
+  db: D1Database,
+  filters: { voice_id?: string; status_in?: TrainingCampaignStatus[]; limit?: number } = {}
+): Promise<TrainingCampaign[]> => {
+  const conditions: string[] = [];
+  const bindings: Array<string | number> = [];
+
+  if (filters.voice_id) {
+    conditions.push("voice_id = ?");
+    bindings.push(filters.voice_id);
+  }
+  if (filters.status_in && filters.status_in.length > 0) {
+    conditions.push(`status IN (${filters.status_in.map(() => "?").join(", ")})`);
+    bindings.push(...filters.status_in);
+  }
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const limit = Math.max(1, Math.min(filters.limit ?? 20, 100));
+  const result = await db
+    .prepare(`SELECT * FROM training_campaigns ${whereClause} ORDER BY created_at DESC LIMIT ?`)
+    .bind(...bindings, limit)
+    .all<DbTrainingCampaignRow>();
+
+  return (result.results ?? []).map(mapTrainingCampaign);
+};
+
+export const createTrainingCampaign = async (
+  db: D1Database,
+  campaign: TrainingCampaign
+): Promise<void> => {
+  await db
+    .prepare(
+      `INSERT INTO training_campaigns (
+        campaign_id, voice_id, dataset_name, dataset_r2_prefix, dataset_snapshot_id,
+        attempt_count, parallelism, status, base_config_json, stop_rules_json,
+        planner_state_json, summary_json, created_at, updated_at, completed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      campaign.campaign_id,
+      campaign.voice_id,
+      campaign.dataset_name,
+      campaign.dataset_r2_prefix,
+      campaign.dataset_snapshot_id,
+      campaign.attempt_count,
+      campaign.parallelism,
+      campaign.status,
+      JSON.stringify(campaign.base_config),
+      JSON.stringify(campaign.stop_rules),
+      JSON.stringify(campaign.planner_state),
+      JSON.stringify(campaign.summary),
+      campaign.created_at,
+      campaign.updated_at,
+      campaign.completed_at
+    )
+    .run();
+};
+
+export const updateTrainingCampaign = async (
+  db: D1Database,
+  campaignId: string,
+  updates: {
+    dataset_name?: string | null;
+    dataset_r2_prefix?: string | null;
+    dataset_snapshot_id?: string | null;
+    attempt_count?: number;
+    parallelism?: number;
+    status?: TrainingCampaignStatus;
+    base_config?: TrainingConfig;
+    stop_rules?: TrainingCampaignStopRules;
+    planner_state?: Record<string, unknown>;
+    summary?: Record<string, unknown>;
+    completed_at?: number | null;
+    updated_at?: number;
+    expected_updated_at?: number;
+  }
+): Promise<void> => {
+  const fields: string[] = [];
+  const bindings: Array<string | number | null> = [];
+
+  if (updates.dataset_name !== undefined) {
+    fields.push("dataset_name = ?");
+    bindings.push(updates.dataset_name);
+  }
+  if (updates.dataset_r2_prefix !== undefined) {
+    fields.push("dataset_r2_prefix = ?");
+    bindings.push(updates.dataset_r2_prefix);
+  }
+  if (updates.dataset_snapshot_id !== undefined) {
+    fields.push("dataset_snapshot_id = ?");
+    bindings.push(updates.dataset_snapshot_id);
+  }
+  if (updates.attempt_count !== undefined) {
+    fields.push("attempt_count = ?");
+    bindings.push(updates.attempt_count);
+  }
+  if (updates.parallelism !== undefined) {
+    fields.push("parallelism = ?");
+    bindings.push(updates.parallelism);
+  }
+  if (updates.status !== undefined) {
+    fields.push("status = ?");
+    bindings.push(updates.status);
+  }
+  if (updates.base_config !== undefined) {
+    fields.push("base_config_json = ?");
+    bindings.push(JSON.stringify(updates.base_config));
+  }
+  if (updates.stop_rules !== undefined) {
+    fields.push("stop_rules_json = ?");
+    bindings.push(JSON.stringify(updates.stop_rules));
+  }
+  if (updates.planner_state !== undefined) {
+    fields.push("planner_state_json = ?");
+    bindings.push(JSON.stringify(updates.planner_state));
+  }
+  if (updates.summary !== undefined) {
+    fields.push("summary_json = ?");
+    bindings.push(JSON.stringify(updates.summary));
+  }
+  if (updates.completed_at !== undefined) {
+    fields.push("completed_at = ?");
+    bindings.push(updates.completed_at);
+  }
+
+  fields.push("updated_at = ?");
+  bindings.push(updates.updated_at ?? Date.now());
+
+  if (updates.expected_updated_at !== undefined) {
+    bindings.push(campaignId, updates.expected_updated_at);
+    const result = await db
+      .prepare(`UPDATE training_campaigns SET ${fields.join(", ")} WHERE campaign_id = ? AND updated_at = ?`)
+      .bind(...bindings)
+      .run();
+    if ((result.meta?.changes ?? 0) === 0) {
+      throw new Error(`training_campaign_conflict:${campaignId}`);
+    }
+    return;
+  }
+
+  bindings.push(campaignId);
+  await db
+    .prepare(`UPDATE training_campaigns SET ${fields.join(", ")} WHERE campaign_id = ?`)
     .bind(...bindings)
     .run();
 };

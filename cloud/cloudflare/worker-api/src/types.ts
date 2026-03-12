@@ -190,6 +190,8 @@ export interface TrainingCheckoutSearch {
 export interface TrainingJob {
   job_id: string;
   voice_id: string;
+  campaign_id?: string | null;
+  attempt_index?: number | null;
   round_id: string | null;
   dataset_snapshot_id: string | null;
   runpod_pod_id: string | null;
@@ -209,6 +211,40 @@ export interface TrainingJob {
   completed_at: number | null;
   created_at: number;
   updated_at: number;
+}
+
+export type TrainingCampaignStatus =
+  | "planning"
+  | "running"
+  | "completed"
+  | "failed"
+  | "blocked_dataset"
+  | "blocked_budget"
+  | "cancelled";
+
+export interface TrainingCampaignStopRules {
+  max_infra_failures?: number;
+  max_asr_failures?: number;
+  min_score_improvement?: number;
+  stagnation_window?: number;
+}
+
+export interface TrainingCampaign {
+  campaign_id: string;
+  voice_id: string;
+  dataset_name: string | null;
+  dataset_r2_prefix: string | null;
+  dataset_snapshot_id: string | null;
+  attempt_count: number;
+  parallelism: number;
+  status: TrainingCampaignStatus;
+  base_config: TrainingConfig;
+  stop_rules: TrainingCampaignStopRules;
+  planner_state: Record<string, unknown>;
+  summary: Record<string, unknown>;
+  created_at: number;
+  updated_at: number;
+  completed_at: number | null;
 }
 
 export interface TTSResponse {

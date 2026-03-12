@@ -62,7 +62,29 @@ function ensureColumn(tableName, columns, columnName, definition) {
   console.log(`Added ${tableName}.${columnName}`);
 }
 
-execFile("schema.sql");
+function applySchemaWithCompatibility() {
+  try {
+    execFile("schema.sql");
+    return;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const lower = message.toLowerCase();
+    const missingCampaignColumns =
+      lower.includes("campaign_id") || lower.includes("attempt_index") || lower.includes("training_jobs");
+
+    if (!missingCampaignColumns) {
+      throw error;
+    }
+
+    console.warn("schema.sql failed before backfill; attempting compatibility backfill for training_jobs campaign columns");
+    const compatibilityColumns = getColumns("training_jobs");
+    ensureColumn("training_jobs", compatibilityColumns, "campaign_id", "TEXT");
+    ensureColumn("training_jobs", compatibilityColumns, "attempt_index", "INTEGER");
+    execFile("schema.sql");
+  }
+}
+
+applySchemaWithCompatibility();
 
 const trainingJobColumns = getColumns("training_jobs");
 ensureColumn("training_jobs", trainingJobColumns, "last_heartbeat_at", "INTEGER");
@@ -73,6 +95,11 @@ ensureColumn("training_jobs", trainingJobColumns, "job_token", "TEXT");
 ensureColumn("training_jobs", trainingJobColumns, "round_id", "TEXT");
 ensureColumn("training_jobs", trainingJobColumns, "dataset_snapshot_id", "TEXT");
 ensureColumn("training_jobs", trainingJobColumns, "supervisor_json", "TEXT DEFAULT '{}'");
+ensureColumn("training_jobs", trainingJobColumns, "campaign_id", "TEXT");
+ensureColumn("training_jobs", trainingJobColumns, "attempt_index", "INTEGER");
+execute(
+  "CREATE UNIQUE INDEX IF NOT EXISTS idx_training_jobs_campaign_attempt_unique ON training_jobs(campaign_id, attempt_index) WHERE campaign_id IS NOT NULL AND attempt_index IS NOT NULL"
+);
 
 const voiceColumns = getColumns("voices");
 ensureColumn("voices", voiceColumns, "candidate_checkpoint_r2_prefix", "TEXT");

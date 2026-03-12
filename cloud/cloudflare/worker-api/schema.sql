@@ -49,6 +49,8 @@ CREATE INDEX IF NOT EXISTS idx_voices_active_round ON voices(active_round_id);
 CREATE TABLE IF NOT EXISTS training_jobs (
     job_id            TEXT PRIMARY KEY,           -- UUID
     voice_id          TEXT NOT NULL REFERENCES voices(voice_id),
+    campaign_id       TEXT,
+    attempt_index     INTEGER,
     round_id          TEXT,                       -- Training round grouping ID
     dataset_snapshot_id TEXT,                     -- Frozen dataset snapshot ID
     runpod_pod_id     TEXT,                       -- RunPod pod ID (set after pod creation)
@@ -79,6 +81,43 @@ CREATE INDEX IF NOT EXISTS idx_training_jobs_voice ON training_jobs(voice_id);
 CREATE INDEX IF NOT EXISTS idx_training_jobs_status ON training_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_training_jobs_round ON training_jobs(round_id);
 CREATE INDEX IF NOT EXISTS idx_training_jobs_snapshot ON training_jobs(dataset_snapshot_id);
+CREATE INDEX IF NOT EXISTS idx_training_jobs_campaign ON training_jobs(campaign_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_training_jobs_campaign_attempt_unique
+  ON training_jobs(campaign_id, attempt_index)
+  WHERE campaign_id IS NOT NULL AND attempt_index IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS training_log_chunks (
+    job_id      TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    r2_key      TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    bytes       INTEGER,
+    lines       INTEGER,
+    PRIMARY KEY (job_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_log_chunks_job ON training_log_chunks(job_id, seq);
+
+CREATE TABLE IF NOT EXISTS training_campaigns (
+    campaign_id         TEXT PRIMARY KEY,
+    voice_id            TEXT NOT NULL REFERENCES voices(voice_id),
+    dataset_name        TEXT,
+    dataset_r2_prefix   TEXT,
+    dataset_snapshot_id TEXT,
+    attempt_count       INTEGER NOT NULL,
+    parallelism         INTEGER NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'planning',
+    base_config_json    TEXT NOT NULL DEFAULT '{}',
+    stop_rules_json     TEXT NOT NULL DEFAULT '{}',
+    planner_state_json  TEXT NOT NULL DEFAULT '{}',
+    summary_json        TEXT NOT NULL DEFAULT '{}',
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL,
+    completed_at        INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_training_campaigns_voice ON training_campaigns(voice_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_training_campaigns_status ON training_campaigns(status, updated_at DESC);
 
 
 -- ── Dataset Snapshots ───────────────────────────────────────────────
