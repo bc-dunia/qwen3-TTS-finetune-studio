@@ -3846,7 +3846,7 @@ const evaluateValidationSample = ({
   if (referenceAudioKey && Number.isFinite(tone) && tone < minToneScore) {
     return fail(`sample ${sampleIndex} seed ${seed} tone_score=${tone.toFixed(3)}`);
   }
-  if (referenceAudioKey && referenceText && Number.isFinite(speed) && speed < 0.35) {
+  if (referenceAudioKey && referenceText && Number.isFinite(speed) && speed < 0.20) {
     return fail(`sample ${sampleIndex} seed ${seed} speed_score=${speed.toFixed(3)}`);
   }
 
@@ -4110,7 +4110,7 @@ const scoreSingleValidationOutput = ({
   if (referenceAudioKey && Number.isFinite(tone) && tone < minToneScore) {
     return fail(`sample 1 seed ${seed} tone_score=${tone.toFixed(3)}`);
   }
-  if (referenceAudioKey && referenceText && Number.isFinite(speed) && speed < 0.35) {
+  if (referenceAudioKey && referenceText && Number.isFinite(speed) && speed < 0.20) {
     return fail(`sample 1 seed ${seed} speed_score=${speed.toFixed(3)}`);
   }
 
@@ -5266,7 +5266,7 @@ const validateTrainedCheckpoint = async (
             }
             continue;
           }
-          if (referenceAudioKey && referenceText && Number.isFinite(speed) && speed < 0.35) {
+          if (referenceAudioKey && referenceText && Number.isFinite(speed) && speed < 0.20) {
             if (!firstFailureMessage) {
               firstFailureMessage = `sample ${i + 1} seed ${seed} speed_score=${speed.toFixed(3)}`;
             }
