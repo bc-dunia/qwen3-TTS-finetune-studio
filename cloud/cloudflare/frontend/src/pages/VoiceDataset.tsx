@@ -94,13 +94,12 @@ function chunkArray<T>(items: T[], size: number): T[][] {
 }
 
 function encodeTrainingQuery(voiceId: string, datasetName?: string): string {
-  const params = new URLSearchParams({
-    recommended: '1',
-  })
+  const params = new URLSearchParams()
   if (datasetName) {
     params.set('datasetName', datasetName)
   }
-  return `/voices/${voiceId}/training?${params.toString()}`
+  const query = params.toString()
+  return `/voices/${voiceId}/training${query ? `?${query}` : ''}`
 }
 
 export function VoiceDataset() {
@@ -775,10 +774,34 @@ export function VoiceDataset() {
 
           {rows.length === 0 ? (
             <div className="rounded-xl border border-dashed border-edge bg-surface px-4 py-12 text-center">
-              <div className="text-primary text-sm font-semibold">No raw uploads found</div>
-              <p className="mt-2 text-subtle text-sm">
-                Upload WAV files on the Voices page first, then return here to finalize the dataset.
-              </p>
+              {datasets.length > 0 || currentDatasetName ? (
+                <>
+                  <div className="text-primary text-sm font-semibold">No new raw uploads</div>
+                  <p className="mt-2 text-subtle text-sm">
+                    This voice already has {datasets.length > 0 ? `${datasets.length} finalized dataset${datasets.length > 1 ? 's' : ''}` : 'an active dataset'} (see left panel).
+                    To create a new dataset from fresh audio, upload files from the Voices page.
+                  </p>
+                  <button
+                    onClick={() => {
+                      const targetDataset = currentDatasetName ?? datasets[0]?.name
+                      if (targetDataset) navigate(encodeTrainingQuery(voice.voice_id, targetDataset))
+                    }}
+                    disabled={!currentDatasetName && datasets.length === 0}
+                    className="mt-4 inline-flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-void hover:bg-accent-light transition-colors"
+                    type="button"
+                  >
+                    Go to Training
+                    <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor"><path d="M12 4l-1.41 1.41L16.17 11H4v2h12.17l-5.58 5.59L12 20l8-8-8-8z" /></svg>
+                  </button>
+                </>
+              ) : (
+                <>
+                  <div className="text-primary text-sm font-semibold">No raw uploads found</div>
+                  <p className="mt-2 text-subtle text-sm">
+                    Upload WAV files on the Voices page first, then return here to finalize the dataset.
+                  </p>
+                </>
+              )}
             </div>
           ) : (
             <div className="space-y-3 max-h-[70vh] overflow-y-auto pr-1">

@@ -234,10 +234,7 @@ function CreateVoiceModal({
   }
 
   function buildTrainingTarget(voiceId: string): string {
-    const params = new URLSearchParams({
-      recommended: '1',
-    })
-    return `/voices/${voiceId}/training?${params.toString()}`
+    return `/voices/${voiceId}/training`
   }
 
   async function handleSubmit(e: React.FormEvent) {

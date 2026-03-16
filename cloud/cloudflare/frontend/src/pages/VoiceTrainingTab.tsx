@@ -85,11 +85,22 @@ export function VoiceTrainingTab() {
   const [campaignAttempts, setCampaignAttempts] = useState(6)
   const [campaignParallelism, setCampaignParallelism] = useState(1)
   const [campaignDirection, setCampaignDirection] = useState<CampaignDirection>('balanced')
+  const [directionSetByUser, setDirectionSetByUser] = useState(false)
+  const directionSetByUserRef = useRef(false)
   const [activeCampaignId, setActiveCampaignId] = useState<string | null>(null)
   const [activeCampaign, setActiveCampaign] = useState<TrainingCampaign | null>(null)
   const [startingCampaign, setStartingCampaign] = useState(false)
 
   const jobsRef = useRef<TrainingJob[]>([])
+
+  useEffect(() => {
+    directionSetByUserRef.current = directionSetByUser
+  }, [directionSetByUser])
+
+  useEffect(() => {
+    setDirectionSetByUser(false)
+    directionSetByUserRef.current = false
+  }, [voiceId])
 
   useEffect(() => {
     jobsRef.current = jobs
@@ -133,6 +144,11 @@ export function VoiceTrainingTab() {
         setSubtalkerLossWeight(preset.subtalker_loss_weight)
         setSaveEveryNEpochs(preset.save_every_n_epochs)
         setGpuTypeId(preset.gpu_type_id)
+
+        if (!directionSetByUserRef.current) {
+          const hasCheckpoint = Boolean(voiceData.run_name) || Boolean(voiceData.checkpoint_r2_prefix)
+          setCampaignDirection(hasCheckpoint ? 'conservative' : 'balanced')
+        }
       } catch (loadError) {
         if (!cancelled) {
           setError(loadError instanceof Error ? loadError.message : 'Failed to load training data')
@@ -207,6 +223,9 @@ export function VoiceTrainingTab() {
           response.campaign.status === 'cancelled'
         ) {
           setActiveCampaignId(null)
+          if (response.campaign.status === 'failed' && !directionSetByUserRef.current) {
+            setCampaignDirection('exploratory')
+          }
         }
       } catch {
         if (!cancelled) {
@@ -370,7 +389,8 @@ export function VoiceTrainingTab() {
     return <div className="rounded-xl border border-edge bg-raised p-6 text-sm text-muted">Loading training workspace...</div>
   }
 
-  const datasetReady = datasets.length > 0 || Boolean(linkedDatasetName)
+  const hasExistingCheckpoint = Boolean(voice?.run_name) || Boolean(voice?.checkpoint_r2_prefix)
+  const datasetReady = datasets.length > 0 || Boolean(linkedDatasetName) || hasExistingCheckpoint
 
   return (
     <div className="space-y-6">
@@ -385,7 +405,7 @@ export function VoiceTrainingTab() {
         campaign={activeCampaign}
         trainingAdvice={trainingAdvice}
         voice={voice}
-        onDirectionChange={setCampaignDirection}
+        onDirectionChange={(d) => { setCampaignDirection(d); setDirectionSetByUser(true) }}
         onAttemptsChange={setCampaignAttempts}
         onParallelismChange={setCampaignParallelism}
         onStart={() => { void handleStartCampaign() }}

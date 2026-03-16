@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import { Link } from 'react-router'
 import type {
   CampaignDirection,
@@ -19,21 +20,37 @@ const GOALS: Array<{
     value: 'first_checkpoint',
     label: 'Get first checkpoint',
     direction: 'balanced',
-    hint: 'Mix safe retries with moderate exploration.',
+    hint: 'Balanced mix of safe retries and exploration.',
   },
   {
     value: 'improve_score',
     label: 'Improve best score',
     direction: 'conservative',
-    hint: 'Favor proven presets and stable quality.',
+    hint: 'Refine around proven configs for higher quality.',
   },
   {
     value: 'fix_failed',
-    label: 'Fix failed campaign',
+    label: 'Recover from failures',
     direction: 'exploratory',
-    hint: 'Search aggressively for better checkpoints.',
+    hint: 'Search aggressively across different config regions.',
   },
 ]
+
+function detectBestGoal(
+  voice: Voice | null,
+  campaign: TrainingCampaign | null,
+): GoalKey {
+  const hasCheckpoint = Boolean(voice?.run_name) || Boolean(voice?.checkpoint_r2_prefix)
+  const campaignBadOutcome =
+    campaign?.status === 'failed' ||
+    campaign?.status === 'blocked_dataset' ||
+    campaign?.status === 'blocked_budget'
+
+  if (campaignBadOutcome && !hasCheckpoint) return 'fix_failed'
+  if (!hasCheckpoint) return 'first_checkpoint'
+  if (campaignBadOutcome) return 'fix_failed'
+  return 'improve_score'
+}
 
 function goalFromDirection(direction: CampaignDirection): GoalKey {
   const match = GOALS.find((g) => g.direction === direction)
@@ -91,7 +108,12 @@ export function AutopilotPanel({
   onApplyConfig,
 }: Props) {
   const running = isCampaignRunning(campaign)
+  const recommendedGoal = detectBestGoal(voice, campaign)
+  const recommendedMeta = GOALS.find((g) => g.value === recommendedGoal)!
   const selectedGoal = goalFromDirection(direction)
+  const isUsingRecommended = selectedGoal === recommendedGoal
+  const [showOverride, setShowOverride] = useState(false)
+  useEffect(() => { setShowOverride(false) }, [voiceId])
   const goalMeta = GOALS.find((g) => g.value === selectedGoal)
 
   const attemptsCreated = Number(campaign?.summary.attempts_created ?? 0)
@@ -143,7 +165,7 @@ export function AutopilotPanel({
           {datasetReady ? (
             <>
               <span className="font-semibold">Dataset:</span>{' '}
-              {datasetName ?? 'Linked dataset'} is ready.
+              {datasetName || (hasCheckpoint ? 'Previous training dataset' : 'Linked dataset')} is ready.
             </>
           ) : (
             <>
@@ -161,26 +183,56 @@ export function AutopilotPanel({
 
         {!running && (
           <div className="space-y-3">
-            <label htmlFor="autopilot-goal" className="text-xs font-medium text-subtle mb-1.5 block">
-              What&apos;s your goal?
-            </label>
-            <select
-              id="autopilot-goal"
-              value={selectedGoal}
-              onChange={(e) => handleGoalChange(e.target.value)}
-              className="w-full rounded-lg border border-edge bg-raised px-3 py-2.5 text-sm font-medium text-primary focus:border-accent transition-colors"
-            >
-              {GOALS.map((goal) => (
-                <option key={goal.value} value={goal.value}>
-                  {goal.label}
-                </option>
-              ))}
-            </select>
-            {goalMeta && (
-              <p className="text-[11px] text-muted">
-                {goalMeta.hint}
-              </p>
-            )}
+            <div className="rounded-lg border border-edge bg-raised px-4 py-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-xs font-semibold text-heading">
+                    {isUsingRecommended ? recommendedMeta.label : goalMeta?.label}
+                  </div>
+                  <p className="text-[11px] text-muted mt-0.5">
+                    {isUsingRecommended ? recommendedMeta.hint : goalMeta?.hint}
+                  </p>
+                </div>
+                {isUsingRecommended && (
+                  <span className="shrink-0 rounded-full bg-accent-dim px-2 py-0.5 text-[9px] font-mono uppercase tracking-wider text-accent">
+                    recommended
+                  </span>
+                )}
+              </div>
+              {!showOverride ? (
+                <button
+                  type="button"
+                  onClick={() => setShowOverride(true)}
+                  className="mt-2 text-[10px] text-muted hover:text-accent transition-colors"
+                >
+                  Change strategy...
+                </button>
+              ) : (
+                <div className="mt-3 space-y-1.5">
+                  {GOALS.map((goal) => (
+                    <button
+                      key={goal.value}
+                      type="button"
+                      onClick={() => {
+                        handleGoalChange(goal.value)
+                        setShowOverride(false)
+                      }}
+                      className={`w-full text-left rounded-lg border px-3 py-2 text-xs transition-colors ${
+                        selectedGoal === goal.value
+                          ? 'border-accent bg-accent-dim text-accent'
+                          : 'border-edge bg-surface text-subtle hover:border-accent/40 hover:text-primary'
+                      }`}
+                    >
+                      <span className="font-medium">{goal.label}</span>
+                      {goal.value === recommendedGoal && (
+                        <span className="ml-1.5 text-[9px] font-mono text-accent uppercase">best</span>
+                      )}
+                      <span className="block text-[10px] text-muted mt-0.5">{goal.hint}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
 
             <div className="grid gap-3 sm:grid-cols-2">
               <label className="text-xs text-subtle">
