@@ -50,6 +50,17 @@ import { buildTrainingCheckoutSearch } from "../lib/training-checkout";
 import { buildTrainingAdvice } from "../lib/training-advisor";
 import { buildLLMTrainingAdvice } from "../lib/training-advisor-llm";
 import {
+  readNumber as domainReadNumber,
+  readTimestamp as domainReadTimestamp,
+  stripSlashes as domainStripSlashes,
+  extractDatasetNameFromPrefix as domainExtractDatasetNameFromPrefix,
+  parseRunNameFromCheckpointPrefix as domainParseRunNameFromCheckpointPrefix,
+  getTrainingDefaults,
+  passesValidationGate,
+  VALIDATION_GATE_THRESHOLDS,
+  getJobPriority,
+} from "../lib/training-domain";
+import {
   planCampaignAttempts,
   buildLLMPlannerPrompt,
   parseLLMPlannerResponse,
@@ -262,7 +273,7 @@ const ACTIVE_STAGE_STALE_MS: Record<string, number> = {
 const MAX_STALL_RECOVERY_ATTEMPTS = 3;
 const DEFAULT_WORKER_PUBLIC_URL = "https://qwen-tts-api.brian-367.workers.dev";
 const TRAINING_SWEEP_LIMIT = 100;
-const DEFAULT_MAX_ACTIVE_TRAINING_JOBS_PER_VOICE = 3;
+const DEFAULT_MAX_ACTIVE_TRAINING_JOBS_PER_VOICE = 1;
 const DEFAULT_MAX_ACTIVE_TRAINING_JOBS_GLOBAL = 3;
 const DEFAULT_TRAINING_IMAGE_FALLBACKS = [
   "ghcr.io/bc-dunia/qwen3-tts-training@sha256:fd32cc16f8febc7ce23a08eea38b9b62beaa7819139895e241a8bdddb6bf2357",
@@ -285,7 +296,7 @@ const GENERATED_DATASET_FILENAMES = new Set([
   "preprocess_report.json",
 ]);
 
-const stripSlashes = (value: string): string => value.replace(/^\/+|\/+$/g, "");
+const stripSlashes = domainStripSlashes;
 
 const uniqueNonEmpty = (values: Array<string | null | undefined>): string[] => {
   const deduped = new Set<string>();
@@ -604,14 +615,7 @@ const resolveTrainingDatasetPrefix = (
   return extractDatasetPrefixFromRefAudioKey(voice) ?? `datasets/${voice.voice_id}`;
 };
 
-const extractDatasetNameFromPrefix = (datasetPrefix: string): string | null => {
-  const parts = stripSlashes(datasetPrefix).split("/");
-  if (parts.length < 3 || parts[0] !== "datasets") {
-    return null;
-  }
-  const name = parts.slice(2).join("/").trim();
-  return name || null;
-};
+const extractDatasetNameFromPrefix = domainExtractDatasetNameFromPrefix;
 
 const buildSyntheticDatasetSignature = (datasetPrefix: string): string =>
   `synthetic:${stripSlashes(datasetPrefix)}`;
@@ -872,13 +876,7 @@ const chooseCheckpointAdoption = async ({
   };
 };
 
-const parseRunNameFromCheckpointPrefix = (prefix: string): string | null => {
-  const parts = prefix.split("/");
-  if (parts.length < 4 || parts[0] !== "checkpoints") {
-    return null;
-  }
-  return parts[2] || null;
-};
+const parseRunNameFromCheckpointPrefix = domainParseRunNameFromCheckpointPrefix;
 
 type ManualPromotionCandidate = {
   prefix: string;
@@ -1272,41 +1270,7 @@ const MIN_PASS_RATE_17B = 5 / 6;
 const PROVISIONING_STALE_MS = 4 * 60 * 1000;
 const VALIDATION_RUN_STALE_MS = 6 * 60 * 1000;
 
-const getRecommendedTrainingDefaults = (modelSize: string): {
-  batch_size: number;
-  learning_rate: number;
-  num_epochs: number;
-  gradient_accumulation_steps: number;
-  subtalker_loss_weight: number;
-  save_every_n_epochs: number;
-  seed: number;
-  gpu_type_id: string;
-} => {
-  if (modelSize.includes("0.6")) {
-    return {
-      batch_size: 2,
-      // Keep 0.6B close to the official finetuning recipe; prior higher-LR/lower-subtalker runs were unstable.
-      learning_rate: 2.5e-6,
-      num_epochs: 12,
-      gradient_accumulation_steps: 4,
-      subtalker_loss_weight: 0.3,
-      save_every_n_epochs: 1,
-      seed: 303,
-      gpu_type_id: "NVIDIA L40S",
-    };
-  }
-
-  return {
-    batch_size: 2,
-    learning_rate: 2e-5,
-    num_epochs: 15,
-    gradient_accumulation_steps: 4,
-    subtalker_loss_weight: 0.3,
-    save_every_n_epochs: 5,
-    seed: 42,
-    gpu_type_id: "NVIDIA A100-SXM4-80GB",
-  };
-};
+const getRecommendedTrainingDefaults = getTrainingDefaults;
 const MAX_PROVISIONING_RECOVERY_ATTEMPTS = 2;
 
 const OVERALL_SCORE_ERROR_RE = /overall_score=([0-9.]+)/i;
@@ -1331,21 +1295,8 @@ const createSyntheticContext = (env: Env, workerOrigin: string): Context<AppCont
 const GHCR_INDEX_ACCEPT =
   "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json";
 
-const readNumber = (value: unknown): number | null => {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
-};
-
-const readTimestamp = (value: unknown): number | null => {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return value;
-  }
-  if (typeof value === "string" && value.trim()) {
-    const parsed = Date.parse(value);
-    return Number.isFinite(parsed) ? parsed : null;
-  }
-  return null;
-};
+const readNumber = domainReadNumber;
+const readTimestamp = domainReadTimestamp;
 
 const getValidationRunStartedAt = (
   persistedState: Record<string, unknown> | null,
@@ -1565,6 +1516,27 @@ const getMaxActiveTrainingJobsGlobal = (c: Context<AppContext>): number => {
 
 const countGlobalActiveTrainingJobs = async (c: Context<AppContext>): Promise<number> => {
   return countActiveTrainingJobs(c.env.DB, [...ACTIVE_JOB_STATUSES]);
+};
+
+const countQueuedTrainingJobsExcludingVoice = async (
+  c: Context<AppContext>,
+  excludeVoiceId: string,
+): Promise<number> => {
+  const result = await c.env.DB.prepare(
+    `SELECT COUNT(*) as cnt FROM training_jobs WHERE status IN ('queued', 'pending') AND voice_id != ?`
+  ).bind(excludeVoiceId).first<{ cnt: number }>();
+  return result?.cnt ?? 0;
+};
+
+const claimQueuedJob = async (
+  db: D1Database,
+  jobId: string,
+  expectedUpdatedAt: number,
+): Promise<boolean> => {
+  const result = await db.prepare(
+    `UPDATE training_jobs SET updated_at = ? WHERE job_id = ? AND status IN ('queued', 'pending') AND (updated_at = ? OR updated_at IS NULL)`
+  ).bind(Date.now(), jobId, expectedUpdatedAt).run();
+  return (result.meta.changes ?? 0) > 0;
 };
 
 const isGpuSupplyConstraintErrorMessage = (message: string | null | undefined): boolean => {
@@ -1806,29 +1778,45 @@ const launchQueuedTrainingJobsForVoice = async (
   c: Context<AppContext>,
   voiceId: string
 ): Promise<number> => {
-  const jobs = (await listTrainingJobs(c.env.DB, { voice_id: voiceId, limit: 100 })).sort(
-    (left, right) => left.created_at - right.created_at
-  );
+  const [jobsRaw, voice] = await Promise.all([
+    listTrainingJobs(c.env.DB, { voice_id: voiceId, limit: 100 }),
+    getVoice(c.env.DB, voiceId),
+  ]);
+  const voiceHasCheckpoint = Boolean(voice?.run_name) || Boolean(voice?.checkpoint_r2_prefix);
+  const jobs = jobsRaw.sort((left, right) => {
+    const leftPriority = getJobPriority(left, voiceHasCheckpoint);
+    const rightPriority = getJobPriority(right, voiceHasCheckpoint);
+    if (leftPriority !== rightPriority) return leftPriority - rightPriority;
+    return left.created_at - right.created_at;
+  });
   if (jobs.length === 0) {
     return 0;
   }
 
   const voiceActiveLimit = getMaxActiveTrainingJobsPerVoice(c);
   let voiceActiveCount = jobs.filter((job) => ACTIVE_JOB_STATUSES.has(job.status)).length;
-  if (voiceActiveCount >= voiceActiveLimit) {
+  const globalActiveLimit = getMaxActiveTrainingJobsGlobal(c);
+  let globalActiveCount = await countGlobalActiveTrainingJobs(c);
+
+  if (globalActiveCount >= globalActiveLimit) {
     return 0;
   }
 
-  const globalActiveLimit = getMaxActiveTrainingJobsGlobal(c);
-  let globalActiveCount = await countGlobalActiveTrainingJobs(c);
-  if (globalActiveCount >= globalActiveLimit) {
+  const otherVoicesHaveQueuedJobs = globalActiveCount > voiceActiveCount ||
+    (await countQueuedTrainingJobsExcludingVoice(c, voiceId)) > 0;
+
+  const effectiveVoiceLimit = otherVoicesHaveQueuedJobs
+    ? voiceActiveLimit
+    : globalActiveLimit;
+
+  if (voiceActiveCount >= effectiveVoiceLimit) {
     return 0;
   }
 
   let latestJobs = [...jobs];
   let launched = 0;
   for (const seedJob of jobs) {
-    if (voiceActiveCount >= voiceActiveLimit || globalActiveCount >= globalActiveLimit) {
+    if (voiceActiveCount >= effectiveVoiceLimit || globalActiveCount >= globalActiveLimit) {
       break;
     }
 
@@ -1837,6 +1825,11 @@ const launchQueuedTrainingJobsForVoice = async (
       continue;
     }
     if (!(job.status === "queued" || job.status === "pending")) {
+      continue;
+    }
+
+    const claimed = await claimQueuedJob(c.env.DB, job.job_id, job.updated_at ?? job.created_at);
+    if (!claimed) {
       continue;
     }
 
@@ -3325,10 +3318,10 @@ const getValidationPlan = (
     validationTexts,
     validationSeedOffsets,
     totalSamples: validationTexts.length * validationSeedOffsets.length,
-    minOverall: is06b ? 0.82 : 0.85,
+    minOverall: is06b ? 0.82 : VALIDATION_GATE_THRESHOLDS.overall_min,
     minPassRate: is06b ? MIN_PASS_RATE_06B : MIN_PASS_RATE_17B,
-    minAsrScore: 0.8,
-    minToneScore: is06b ? 0.40 : 0.55,
+    minAsrScore: VALIDATION_GATE_THRESHOLDS.asr_min,
+    minToneScore: is06b ? 0.40 : VALIDATION_GATE_THRESHOLDS.tone_min,
     maxCheckpointsToEval: is06b ? MAX_CHECKPOINTS_TO_EVAL_06B : MAX_CHECKPOINTS_TO_EVAL,
     prioritizeLatestPassingCheckpoint: is06b,
   };
@@ -5287,19 +5280,19 @@ const validateTrainedCheckpoint = async (
             }
             continue;
           }
-          if (referenceAudioKey && Number.isFinite(speaker) && speaker < 0.75) {
+          if (referenceAudioKey && Number.isFinite(speaker) && speaker < VALIDATION_GATE_THRESHOLDS.speaker_min) {
             if (!firstFailureMessage) {
               firstFailureMessage = `sample ${i + 1} seed ${seed} speaker_score=${speaker.toFixed(3)}`;
             }
             continue;
           }
-          if (referenceAudioKey && Number.isFinite(tone) && tone < (is06b ? 0.40 : 0.55)) {
+          if (referenceAudioKey && Number.isFinite(tone) && tone < (is06b ? 0.40 : VALIDATION_GATE_THRESHOLDS.tone_min)) {
             if (!firstFailureMessage) {
               firstFailureMessage = `sample ${i + 1} seed ${seed} tone_score=${tone.toFixed(3)}`;
             }
             continue;
           }
-          if (referenceAudioKey && referenceText && Number.isFinite(speed) && speed < 0.20) {
+          if (referenceAudioKey && referenceText && Number.isFinite(speed) && speed < VALIDATION_GATE_THRESHOLDS.speed_min) {
             if (!firstFailureMessage) {
               firstFailureMessage = `sample ${i + 1} seed ${seed} speed_score=${speed.toFixed(3)}`;
             }
@@ -6974,5 +6967,11 @@ app.post("/:job_id/cancel", async (c) => {
 
   return c.json({ status: "ok" });
 });
+
+export async function dispatchQueuedJobs(env: Env, voiceId: string): Promise<number> {
+  const workerOrigin = resolveWorkerPublicUrl(env);
+  const syntheticContext = createSyntheticContext(env, workerOrigin);
+  return launchQueuedTrainingJobsForVoice(syntheticContext, voiceId);
+}
 
 export default app;
