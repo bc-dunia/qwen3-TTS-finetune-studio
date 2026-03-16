@@ -222,6 +222,8 @@ export type TrainingCampaignStatus =
   | "blocked_budget"
   | "cancelled";
 
+export type CampaignDirection = "conservative" | "balanced" | "exploratory";
+
 export interface TrainingCampaignStopRules {
   max_infra_failures?: number;
   max_asr_failures?: number;
