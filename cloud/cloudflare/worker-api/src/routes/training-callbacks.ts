@@ -12,6 +12,8 @@ import {
   updateVoice,
 } from "../lib/d1";
 import type { AppContext, TrainingProgress } from "../types";
+import { stripSlashes, extractDatasetNameFromPrefix } from "../lib/training-domain";
+import { dispatchQueuedJobs } from "./training";
 
 const app = new Hono<AppContext>();
 
@@ -26,25 +28,6 @@ const parseBearerToken = (authorizationHeader: string | undefined): string | nul
     return null;
   }
   return token.trim() || null;
-};
-
-const parseRunNameFromCheckpointPrefix = (prefix: string): string | null => {
-  const parts = prefix.split("/");
-  if (parts.length < 4 || parts[0] !== "checkpoints") {
-    return null;
-  }
-  return parts[2] || null;
-};
-
-const stripSlashes = (value: string): string => value.replace(/^\/+|\/+$/g, "");
-
-const extractDatasetNameFromPrefix = (datasetPrefix: string): string | null => {
-  const parts = stripSlashes(datasetPrefix).split("/");
-  if (parts.length < 3 || parts[0] !== "datasets") {
-    return null;
-  }
-  const name = parts.slice(2).join("/").trim();
-  return name || null;
 };
 
 const loadAuthedJob = async (c: Context<AppContext>) => {
@@ -183,6 +166,13 @@ app.post("/:job_id/report", async (c) => {
         },
       });
     }
+  }
+
+  if (body.status === "completed" || body.status === "failed") {
+    const ctx = (c as unknown as { executionCtx?: ExecutionContext }).executionCtx;
+    ctx?.waitUntil(
+      dispatchQueuedJobs(c.env, auth.job.voice_id).catch(() => undefined)
+    );
   }
 
   return c.json({ status: "ok" });

@@ -5,6 +5,9 @@ import type {
   TrainingCheckoutTarget,
   TrainingJob,
 } from "../types";
+import { readText, readNumber, parseRunNameFromCheckpointPrefix } from "./training-domain";
+
+export { parseRunNameFromCheckpointPrefix } from "./training-domain";
 
 type RawCheckpointEvaluation = {
   epoch: number;
@@ -16,15 +19,6 @@ type RawCheckpointEvaluation = {
   passed_samples: number;
   total_samples: number;
 };
-
-function readText(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-function readNumber(value: unknown): number | null {
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? numeric : null;
-}
 
 function normalizeRawCheckpointEvaluation(value: unknown): RawCheckpointEvaluation | null {
   if (!value || typeof value !== "object") {
@@ -55,14 +49,6 @@ function normalizeRawCheckpointEvaluation(value: unknown): RawCheckpointEvaluati
     passed_samples: record.passed_samples,
     total_samples: record.total_samples,
   };
-}
-
-export function parseRunNameFromCheckpointPrefix(prefix: string): string | null {
-  const parts = prefix.split("/");
-  if (parts.length < 4 || parts[0] !== "checkpoints") {
-    return null;
-  }
-  return parts[2] || null;
 }
 
 function buildTarget(input: {
