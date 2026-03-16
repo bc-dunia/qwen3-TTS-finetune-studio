@@ -7,6 +7,7 @@ import {
 } from '../lib/api'
 import { shouldWatchTrainingJob } from '../lib/trainingCheckout'
 import { TrainingJobRow } from '../components/training/TrainingJobRow'
+import { MAX_CONCURRENT_PODS } from '../lib/training-domain'
 
 type QueueStats = {
   active_workers: number
@@ -14,6 +15,7 @@ type QueueStats = {
   active_jobs: number
   queued_jobs: number
   running_jobs: number
+  voices_active: number
 }
 
 export function QueuePage() {
@@ -40,7 +42,17 @@ export function QueuePage() {
         const activeStatuses = new Set(['running', 'provisioning', 'downloading', 'preprocessing', 'preparing', 'training', 'uploading'])
         const running = jobsResponse.jobs.filter((j) => activeStatuses.has(j.status)).length
         const queued = jobsResponse.jobs.filter((j) => j.status === 'queued' || j.status === 'pending').length
-        setStats({ active_workers: running, max_workers: Math.max(running, 3), active_jobs: running + queued, queued_jobs: queued, running_jobs: running })
+        const voicesWithActiveJobs = new Set(
+          jobsResponse.jobs.filter((j) => activeStatuses.has(j.status)).map((j) => j.voice_id)
+        ).size
+        setStats({
+          active_workers: running,
+          max_workers: MAX_CONCURRENT_PODS,
+          active_jobs: running + queued,
+          queued_jobs: queued,
+          running_jobs: running,
+          voices_active: voicesWithActiveJobs,
+        })
       } catch (loadError) {
         if (!cancelled) {
           setError(loadError instanceof Error ? loadError.message : 'Failed to load queue')
@@ -80,9 +92,21 @@ export function QueuePage() {
           <h1 className="text-heading text-2xl font-bold">Queue Monitor</h1>
           <p className="text-subtle text-sm mt-1">Global training throughput across all voices.</p>
         </div>
-        <div className="rounded-lg border border-edge bg-raised px-3 py-2 text-sm font-mono text-primary">
-          {stats ? `${stats.active_workers}/${stats.max_workers} workers active` : 'Loading capacity...'}
-        </div>
+        {stats && (
+          <div className="flex items-center gap-3">
+            <div className="rounded-lg border border-edge bg-raised px-3 py-2 text-sm font-mono text-primary">
+              {stats.active_workers}/{stats.max_workers} pods active
+            </div>
+            <div className="rounded-lg border border-edge bg-raised px-3 py-2 text-sm font-mono text-primary">
+              {stats.voices_active} voice{stats.voices_active !== 1 ? 's' : ''} training
+            </div>
+            {stats.queued_jobs > 0 && (
+              <div className="rounded-lg border border-warning/30 bg-warning-dim px-3 py-2 text-sm font-mono text-warning">
+                {stats.queued_jobs} queued
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {error && (

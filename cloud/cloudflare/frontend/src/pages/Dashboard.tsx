@@ -1,6 +1,7 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { Link } from 'react-router'
-import { fetchVoices, type Voice, type TrainingJob, formatDate, formatTime } from '../lib/api'
+import { fetchVoices, fetchAllTrainingJobs, type Voice, type TrainingJob, formatDate, formatTime } from '../lib/api'
+import { shouldWatchTrainingJob } from '../lib/trainingCheckout'
 
 interface GenerationRecord {
   id: string
@@ -28,18 +29,24 @@ export function Dashboard() {
     return []
   })
 
-  const [activeJobs] = useState<TrainingJob[]>([])
+  const [allJobs, setAllJobs] = useState<TrainingJob[]>([])
 
   useEffect(() => {
     let cancelled = false
 
     async function load() {
       try {
-        const data = await fetchVoices()
-        if (!cancelled) setVoices(data.voices)
+        const [voicesData, jobsData] = await Promise.all([
+          fetchVoices(),
+          fetchAllTrainingJobs(200),
+        ])
+        if (!cancelled) {
+          setVoices(voicesData.voices)
+          setAllJobs(jobsData.jobs)
+        }
       } catch (err) {
         if (!cancelled) {
-          setError(err instanceof Error ? err.message : 'Failed to load voices')
+          setError(err instanceof Error ? err.message : 'Failed to load dashboard data')
         }
       } finally {
         if (!cancelled) setLoading(false)
@@ -47,12 +54,17 @@ export function Dashboard() {
     }
 
     load()
-    return () => { cancelled = true }
+    const interval = setInterval(() => { void load() }, 10_000)
+    return () => { cancelled = true; clearInterval(interval) }
   }, [])
+
+  const activeJobs = useMemo(() => allJobs.filter((job) => shouldWatchTrainingJob(job)), [allJobs])
+  const queuedJobCount = useMemo(() => allJobs.filter((job) => job.status === 'queued' || job.status === 'pending').length, [allJobs])
 
   const readyCount = voices.filter((v) => v.status === 'ready').length
   const trainingCount = voices.filter((v) => v.status === 'training').length
   const createdCount = voices.filter((v) => v.status === 'created').length
+  const voiceNames = useMemo(() => new Map(voices.map((v) => [v.voice_id, v.name])), [voices])
 
   return (
     <div className="space-y-8">
@@ -75,7 +87,7 @@ export function Dashboard() {
       </div>
 
       {/* Stats */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
         <StatCard
           label="Total Voices"
           value={loading ? '—' : String(voices.length)}
@@ -94,8 +106,14 @@ export function Dashboard() {
           loading={loading}
         />
         <StatCard
-          label="Created"
-          value={loading ? '—' : String(createdCount)}
+          label="Active Jobs"
+          value={loading ? '—' : String(activeJobs.length)}
+          warning={activeJobs.length > 0}
+          loading={loading}
+        />
+        <StatCard
+          label="Queued"
+          value={loading ? '—' : String(queuedJobCount)}
           loading={loading}
         />
       </div>
@@ -184,7 +202,7 @@ export function Dashboard() {
                       <>
                   <div className="flex items-center justify-between mb-2">
                     <span className="text-primary text-xs font-medium">
-                      Job {job.job_id.slice(0, 8)}
+                      {voiceNames.get(job.voice_id) ?? job.voice_id.slice(0, 8)} · {job.job_id.slice(0, 8)}
                     </span>
                     <span className="text-warning text-[10px] font-mono uppercase">
                       {job.status}
