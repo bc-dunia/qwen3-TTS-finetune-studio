@@ -227,18 +227,33 @@ export function Statistics() {
   }, [filteredJobs])
 
   const scoreProgressionData = useMemo(() => {
+    function addRunningBest(rawValues: (number | null)[]): (number | null)[] {
+      let best: number | null = null
+      return rawValues.map((v) => {
+        if (v !== null && (best === null || v > best)) best = v
+        return best
+      })
+    }
+
     if (selectedVoice) {
-      const values = filteredJobs
+      const rawValues = filteredJobs
         .slice()
         .sort((a, b) => (a.attempt_index ?? a.created_at) - (b.attempt_index ?? b.created_at))
         .map((job) => jobScore(job))
       return {
         label: 'Attempt index',
-        series: [{
-          name: voicesById.get(selectedVoice)?.name ?? 'Selected voice',
-          color: 'var(--color-accent)',
-          values,
-        }],
+        series: [
+          {
+            name: voicesById.get(selectedVoice)?.name ?? 'Selected voice',
+            color: 'var(--color-muted)',
+            values: rawValues,
+          },
+          {
+            name: 'Best so far',
+            color: 'var(--color-accent)',
+            values: addRunningBest(rawValues),
+          },
+        ],
       }
     }
 
@@ -251,14 +266,20 @@ export function Statistics() {
 
     const series = Array.from(byVoice.entries())
       .sort((a, b) => a[0].localeCompare(b[0]))
-      .map(([voiceId, jobs], index) => ({
-        name: voicesById.get(voiceId)?.name ?? voiceId.slice(0, 8),
-        color: SERIES_COLORS[index % SERIES_COLORS.length],
-        values: jobs
+      .flatMap(([voiceId, jobs], index) => {
+        const rawValues = jobs
           .slice()
           .sort((a, b) => (a.attempt_index ?? a.created_at) - (b.attempt_index ?? b.created_at))
-          .map((job) => jobScore(job)),
-      }))
+          .map((job) => jobScore(job))
+        const name = voicesById.get(voiceId)?.name ?? voiceId.slice(0, 8)
+        return [
+          {
+            name,
+            color: SERIES_COLORS[index % SERIES_COLORS.length],
+            values: addRunningBest(rawValues),
+          },
+        ]
+      })
 
     return {
       label: 'Attempt index',

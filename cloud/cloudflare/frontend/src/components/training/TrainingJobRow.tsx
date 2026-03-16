@@ -187,6 +187,16 @@ export function TrainingJobRow({
         </div>
       )}
 
+      {compact && typeof checkout.champion?.score === 'number' && (
+        <div className="mt-2 text-[11px] font-mono text-muted">
+          score <span className={checkout.champion.score >= 0.8 ? 'text-accent font-semibold' : checkout.champion.score >= 0.6 ? 'text-warning font-semibold' : 'text-error font-semibold'}>{checkout.champion.score.toFixed(3)}</span>
+          {checkout.champion.epoch != null && <span> · epoch {checkout.champion.epoch}</span>}
+          {checkout.status === 'promoted' && <span className="text-accent"> · promoted</span>}
+          {checkout.status === 'rejected' && <span className="text-muted"> · rejected</span>}
+          {checkout.status === 'candidate_ready' && <span className="text-warning"> · candidate</span>}
+        </div>
+      )}
+
       {!compact && (
         <>
           <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
