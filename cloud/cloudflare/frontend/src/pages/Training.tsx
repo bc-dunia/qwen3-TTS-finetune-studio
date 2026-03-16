@@ -786,89 +786,6 @@ export function Training() {
       <div className="grid lg:grid-cols-[380px_1fr] gap-6">
         {/* Start Training Form */}
         <div className="bg-raised border border-edge rounded-xl p-5">
-          <h2 className="text-heading font-semibold text-sm mb-5">Start Training</h2>
-
-          <div className="mb-4 rounded-lg border border-edge bg-surface px-3 py-2.5">
-            <p className="text-subtle text-xs">
-              Upload a real training set on the Voices page first. The defaults here are conservative and tuned for voice similarity over aggressive overfitting.
-            </p>
-            {selectedVoice && selectedPreset && (
-              <p className="text-muted text-[10px] font-mono mt-2">
-                model={selectedVoice.model_size} dataset={effectiveDatasetName || 'root-prefix-fallback'} batch={batchSize} epochs={epochs} lr={learningRate} seed={trainingSeed}
-              </p>
-            )}
-            {selectedVoice && !effectiveDatasetName && (
-              <p className="text-warning text-[10px] font-mono mt-2">
-                No finalized dataset linked on this voice. Training will fall back to the root dataset prefix.
-              </p>
-            )}
-            <Link
-              to="/voices"
-              className="inline-flex items-center gap-1 mt-2 text-accent text-xs font-medium hover:text-accent-light"
-            >
-              Go to Voices upload
-            </Link>
-          </div>
-
-          {selectedVoice && (
-            <div className="mb-4 rounded-lg border border-edge bg-surface px-3 py-3">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <div className="text-heading text-xs font-semibold">Workflow State</div>
-                  <p className="text-subtle text-[11px] mt-1">
-                    Production and candidate are now tracked separately. New runs attach to a round and a frozen dataset snapshot.
-                  </p>
-                </div>
-                {activeRound && (
-                  <span className="rounded-full bg-raised px-2 py-1 text-[10px] font-mono text-muted">
-                    round #{activeRound.round_index}
-                  </span>
-                )}
-              </div>
-              <div className="mt-3 flex flex-wrap gap-2 text-[10px] font-mono text-muted">
-                <span>production={selectedVoice.run_name ?? 'none'}</span>
-                <span>epoch={selectedVoice.epoch ?? 'n/a'}</span>
-                <span>candidate={selectedVoice.candidate_run_name ?? 'none'}</span>
-                <span>candidate_epoch={selectedVoice.candidate_epoch ?? 'n/a'}</span>
-                <span>active_round={selectedVoice.active_round_id?.slice(0, 8) ?? 'none'}</span>
-              </div>
-              <div className="mt-3 flex flex-wrap gap-2 text-[10px] font-mono text-muted">
-                <span>snapshot={selectedDatasetSnapshot?.status ?? 'not_frozen'}</span>
-                <span>dataset={selectedDatasetSnapshot?.dataset_name ?? (effectiveDatasetName || 'none')}</span>
-                <span>signature={selectedDatasetSnapshot?.dataset_signature?.slice(0, 10) ?? 'pending'}</span>
-                <span>segments={selectedDatasetSnapshot?.segments_accepted ?? 'n/a'}</span>
-              </div>
-              <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
-                <Metric label="Production" value={formatCheckpointMetric(productionEpoch, productionScore, productionPreset)} />
-                <Metric label="Champion" value={formatCheckpointMetric(activeRound?.champion_epoch, activeRound?.champion_score, activeRound?.champion_preset)} />
-                <Metric label="Selected" value={formatCheckpointMetric(activeRound?.selected_epoch, activeRound?.selected_score, activeRound?.selected_preset)} />
-                <Metric label="Candidate" value={formatCheckpointMetric(candidateEpoch, candidateScore, candidatePreset)} />
-              </div>
-              <div className="mt-3 flex flex-wrap gap-2 text-[10px] font-mono text-muted">
-                <span className="rounded-full bg-raised px-2 py-1">round_status={activeRound?.status ?? 'none'}</span>
-                <span className="rounded-full bg-raised px-2 py-1">adoption={activeRound?.adoption_mode ?? 'n/a'}</span>
-                <span className="rounded-full bg-raised px-2 py-1">production_job={activeRound?.production_job_id?.slice(0, 8) ?? 'n/a'}</span>
-                <span className="rounded-full bg-raised px-2 py-1">selected_job={activeRound?.selected_job_id?.slice(0, 8) ?? 'n/a'}</span>
-              </div>
-              {selectedVoice.candidate_checkpoint_r2_prefix && (
-                <p className="mt-3 text-[11px] text-warning">
-                  A validated candidate is waiting. It will not replace production until you promote it from Compare.
-                </p>
-              )}
-            </div>
-          )}
-
-          {selectedVoice && (
-            <div className="mb-4">
-              <TrainingAdviceCard
-                voiceId={selectedVoice.voice_id}
-                advice={trainingAdvice}
-                onApplyConfig={applySuggestedConfig}
-                showTrainingLink={false}
-              />
-            </div>
-          )}
-
           {voices.length === 0 && !loadingVoices && (
             <div className="mb-4 rounded-lg border border-warning/20 bg-warning-dim px-3 py-2 text-warning text-xs">
               No voices found yet. Create a voice and upload audio first.
@@ -947,10 +864,22 @@ export function Training() {
               </div>
             )}
 
+            {/* Compact Status Bar */}
+            {selectedVoice && (productionEpoch != null || candidateEpoch != null) && (
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-lg bg-surface border border-edge px-3 py-2 text-[10px] font-mono text-muted">
+                {productionEpoch != null && (
+                  <span>Production: {formatCheckpointMetric(productionEpoch, productionScore, productionPreset)}</span>
+                )}
+                {candidateEpoch != null && (
+                  <span>Candidate: {formatCheckpointMetric(candidateEpoch, candidateScore, candidatePreset)}</span>
+                )}
+              </div>
+            )}
+
             {/* Autopilot Campaign */}
-            <div className="rounded-xl border border-edge bg-surface overflow-hidden">
+            <div className="rounded-xl border-2 border-accent/30 bg-surface overflow-hidden">
               {/* Header */}
-              <div className="px-4 py-3 border-b border-edge bg-raised/50">
+              <div className="px-4 py-3 border-b border-accent/20 bg-accent-dim/30">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     <span className="text-heading text-sm font-semibold tracking-tight">Autopilot</span>
@@ -1128,13 +1057,53 @@ export function Training() {
               </div>
             </div>
 
+            {selectedVoice && trainingAdvice && (
+              <div className="rounded-lg border border-edge bg-surface px-3 py-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="shrink-0 rounded-full border border-edge bg-raised px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider text-muted">
+                      {trainingAdvice.mode}
+                    </span>
+                    <span className="text-xs text-primary truncate">{trainingAdvice.title}</span>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    {trainingAdvice.compareFirst && (
+                      <Link
+                        to={`/voices/${selectedVoice.voice_id}/compare`}
+                        className="rounded-lg border border-edge px-2 py-1 text-[10px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent"
+                      >
+                        Compare
+                      </Link>
+                    )}
+                    {trainingAdvice.reviewDatasetFirst && (
+                      <Link
+                        to={`/voices/${selectedVoice.voice_id}/dataset`}
+                        className="rounded-lg border border-edge px-2 py-1 text-[10px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent"
+                      >
+                        Review Dataset
+                      </Link>
+                    )}
+                    {trainingAdvice.suggestedConfig && !trainingAdvice.reviewDatasetFirst && (
+                      <button
+                        type="button"
+                        onClick={() => applySuggestedConfig(trainingAdvice.suggestedConfig!)}
+                        className="rounded-lg border border-edge px-2 py-1 text-[10px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent"
+                      >
+                        Apply
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
             <div className="rounded-lg border border-edge bg-surface px-3 py-2.5">
               <button
                 type="button"
                 onClick={() => setShowAdvancedConfig((previous) => !previous)}
                 className="flex w-full items-center justify-between text-left"
               >
-                <span className="text-muted text-[10px] font-semibold uppercase tracking-wide">Advanced</span>
+                <span className="text-muted text-[10px] font-semibold uppercase tracking-wide">Manual Training (Advanced)</span>
                 <span className="text-muted text-[10px] font-mono">{showAdvancedConfig ? '\u25B4' : '\u25BE'}</span>
               </button>
 
@@ -1238,18 +1207,16 @@ export function Training() {
                       />
                     </div>
                   </div>
+                  <button
+                    type="submit"
+                    disabled={!selectedVoiceId || starting || voices.length === 0}
+                    className="w-full bg-raised border border-edge hover:border-subtle text-primary font-semibold text-xs py-2.5 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                  >
+                    {starting ? 'Starting...' : 'Start Single Training'}
+                  </button>
                 </div>
               )}
             </div>
-
-            {/* Submit */}
-            <button
-              type="submit"
-              disabled={!selectedVoiceId || starting || voices.length === 0}
-              className="w-full bg-raised border border-edge hover:border-subtle text-primary font-semibold text-xs py-2.5 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-            >
-              {starting ? 'Starting...' : 'Start Single Training'}
-            </button>
           </form>
         </div>
 
