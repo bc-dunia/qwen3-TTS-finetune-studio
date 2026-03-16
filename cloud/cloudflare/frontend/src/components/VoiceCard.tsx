@@ -41,7 +41,14 @@ export function VoiceCard({ voice }: VoiceCardProps) {
   return (
     <button
       type="button"
-      onClick={() => navigate(`/voices/${voice.voice_id}`)}
+      onClick={(e) => {
+        const target = e.target as HTMLElement
+        if (target.closest('[data-train-shortcut]')) {
+          navigate(`/voices/${voice.voice_id}/training`)
+        } else {
+          navigate(`/voices/${voice.voice_id}`)
+        }
+      }}
       className="bg-raised border border-edge rounded-xl p-5 text-left hover:border-accent/30 hover:bg-elevated transition-all duration-150 group w-full"
     >
       {/* Header */}
@@ -74,6 +81,16 @@ export function VoiceCard({ voice }: VoiceCardProps) {
                 epoch {voice.epoch}
               </span>
             )}
+            <span
+              data-train-shortcut
+              className={`px-2 py-0.5 rounded shrink-0 cursor-pointer transition-colors ${
+                voice.status === 'ready'
+                  ? 'bg-surface text-muted hover:text-accent hover:bg-accent-dim'
+                  : 'bg-accent-dim text-accent hover:bg-accent hover:text-void'
+              }`}
+            >
+              {voice.status === 'created' ? 'Start Training' : 'Train'}
+            </span>
           </div>
           <span className="shrink-0">Updated {formatDate(lastUpdated)}</span>
         </div>

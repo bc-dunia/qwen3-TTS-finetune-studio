@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { NavLink, Outlet, useParams } from 'react-router'
+import { NavLink, Navigate, Outlet, useOutletContext, useParams } from 'react-router'
 import { fetchVoice, type Voice } from '../lib/api'
 
 const TABS = [
@@ -90,7 +90,24 @@ export function VoiceWorkspace() {
         </div>
       </div>
 
-      <Outlet context={{ voice }} />
+      <Outlet context={{ voice, loading }} />
     </div>
   )
+}
+
+export function VoiceDefaultRedirect() {
+  const { voice, loading } = useOutletContext<{ voice: Voice | null; loading: boolean }>()
+
+  if (loading) {
+    return (
+      <div className="rounded-xl border border-edge bg-raised p-6 text-sm text-muted">
+        Loading...
+      </div>
+    )
+  }
+
+  const hasCheckpoint =
+    Boolean(voice?.run_name) || Boolean(voice?.checkpoint_r2_prefix)
+
+  return <Navigate to={hasCheckpoint ? 'generate' : 'training'} replace />
 }

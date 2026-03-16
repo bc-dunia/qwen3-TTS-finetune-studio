@@ -21,38 +21,12 @@ import {
   type TrainingJob,
   type Voice,
 } from '../lib/api'
-import { TrainingAdviceCard } from '../components/TrainingAdviceCard'
-import { AutopilotCard } from '../components/training/AutopilotCard'
+import { AutopilotPanel } from '../components/training/AutopilotPanel'
 import { TrainingHistoryList } from '../components/training/TrainingHistoryList'
 import { TrainingJobRow } from '../components/training/TrainingJobRow'
 import { buildTrainingAdvice } from '../lib/trainingAdvisor'
 import { shouldWatchTrainingJob } from '../lib/trainingCheckout'
-
-function getRecommendedTrainingPreset(modelSize: string) {
-  if (modelSize.includes('0.6')) {
-    return {
-      batchSize: 2,
-      epochs: 12,
-      learningRate: 0.0000025,
-      gradientAccumulationSteps: 4,
-      subtalkerLossWeight: 0.3,
-      saveEveryNEpochs: 1,
-      seed: 303,
-      gpuTypeId: 'NVIDIA L40S',
-    }
-  }
-
-  return {
-    batchSize: 2,
-    epochs: 15,
-    learningRate: 0.00002,
-    gradientAccumulationSteps: 4,
-    subtalkerLossWeight: 0.3,
-    saveEveryNEpochs: 5,
-    seed: 42,
-    gpuTypeId: 'NVIDIA A100-SXM4-80GB',
-  }
-}
+import { getTrainingDefaults } from '../lib/training-domain'
 
 function inferDatasetNameFromRefAudioKey(refAudioKey: string | null | undefined): string | null {
   if (!refAudioKey || !/\/ref_audio\.[^/]+$/i.test(refAudioKey)) {
@@ -109,7 +83,7 @@ export function VoiceTrainingTab() {
   const [startingManual, setStartingManual] = useState(false)
 
   const [campaignAttempts, setCampaignAttempts] = useState(6)
-  const [campaignParallelism, setCampaignParallelism] = useState(3)
+  const [campaignParallelism, setCampaignParallelism] = useState(1)
   const [campaignDirection, setCampaignDirection] = useState<CampaignDirection>('balanced')
   const [activeCampaignId, setActiveCampaignId] = useState<string | null>(null)
   const [activeCampaign, setActiveCampaign] = useState<TrainingCampaign | null>(null)
@@ -150,15 +124,15 @@ export function VoiceTrainingTab() {
         const paramDataset = searchParams.get('datasetName')
         setSelectedDatasetName(paramDataset ?? linked ?? datasetsData.datasets[0]?.name ?? '')
         setTrainingLanguage(voiceData.labels.language ?? 'ko')
-        const preset = getRecommendedTrainingPreset(voiceData.model_size)
-        setBatchSize(preset.batchSize)
-        setEpochs(preset.epochs)
-        setLearningRate(preset.learningRate)
+        const preset = getTrainingDefaults(voiceData.model_size)
+        setBatchSize(preset.batch_size)
+        setEpochs(preset.num_epochs)
+        setLearningRate(preset.learning_rate)
         setTrainingSeed(preset.seed)
-        setGradientAccumulationSteps(preset.gradientAccumulationSteps)
-        setSubtalkerLossWeight(preset.subtalkerLossWeight)
-        setSaveEveryNEpochs(preset.saveEveryNEpochs)
-        setGpuTypeId(preset.gpuTypeId)
+        setGradientAccumulationSteps(preset.gradient_accumulation_steps)
+        setSubtalkerLossWeight(preset.subtalker_loss_weight)
+        setSaveEveryNEpochs(preset.save_every_n_epochs)
+        setGpuTypeId(preset.gpu_type_id)
       } catch (loadError) {
         if (!cancelled) {
           setError(loadError instanceof Error ? loadError.message : 'Failed to load training data')
@@ -400,7 +374,8 @@ export function VoiceTrainingTab() {
 
   return (
     <div className="space-y-6">
-      <AutopilotCard
+      <AutopilotPanel
+        voiceId={voiceId}
         datasetReady={datasetReady}
         datasetName={effectiveDatasetName || null}
         direction={campaignDirection}
@@ -408,57 +383,26 @@ export function VoiceTrainingTab() {
         parallelism={campaignParallelism}
         starting={startingCampaign}
         campaign={activeCampaign}
+        trainingAdvice={trainingAdvice}
+        voice={voice}
         onDirectionChange={setCampaignDirection}
         onAttemptsChange={setCampaignAttempts}
         onParallelismChange={setCampaignParallelism}
         onStart={() => { void handleStartCampaign() }}
         onStop={() => { void handleStopCampaign() }}
+        onApplyConfig={(config: TrainingConfig) => {
+          const fallback = getTrainingDefaults(config.model_size ?? voice?.model_size ?? '0.6B')
+          setBatchSize(config.batch_size ?? fallback.batch_size)
+          setEpochs(config.num_epochs ?? fallback.num_epochs)
+          setLearningRate(config.learning_rate ?? fallback.learning_rate)
+          setTrainingSeed(config.seed ?? fallback.seed)
+          setGradientAccumulationSteps(config.gradient_accumulation_steps ?? fallback.gradient_accumulation_steps)
+          setSubtalkerLossWeight(config.subtalker_loss_weight ?? fallback.subtalker_loss_weight)
+          setSaveEveryNEpochs(config.save_every_n_epochs ?? fallback.save_every_n_epochs)
+          setTrainingLanguage(config.whisper_language ?? trainingLanguage)
+          setGpuTypeId(config.gpu_type_id ?? fallback.gpu_type_id)
+        }}
       />
-
-      {activeCampaign && (
-        <section className="rounded-xl border border-edge bg-raised p-4">
-          <h3 className="text-heading text-sm font-semibold">Current Campaign Status</h3>
-          <div className="mt-3 grid gap-3 sm:grid-cols-3">
-            <div className="rounded-lg border border-edge bg-surface px-3 py-2">
-              <p className="text-[10px] font-mono text-muted">STATUS</p>
-              <p className="text-sm font-semibold text-primary">{activeCampaign.status}</p>
-            </div>
-            <div className="rounded-lg border border-edge bg-surface px-3 py-2">
-              <p className="text-[10px] font-mono text-muted">BEST SCORE</p>
-              <p className="text-sm font-semibold text-accent">
-                {typeof activeCampaign.planner_state.best_score === 'number'
-                  ? activeCampaign.planner_state.best_score.toFixed(3)
-                  : 'n/a'}
-              </p>
-            </div>
-            <div className="rounded-lg border border-edge bg-surface px-3 py-2">
-              <p className="text-[10px] font-mono text-muted">ATTEMPTS</p>
-              <p className="text-sm font-semibold text-primary">
-                {Number(activeCampaign.summary.attempts_created ?? 0)}/{activeCampaign.attempt_count}
-              </p>
-            </div>
-          </div>
-        </section>
-      )}
-
-      {voice && trainingAdvice && (
-        <TrainingAdviceCard
-          voiceId={voice.voice_id}
-          advice={trainingAdvice}
-          onApplyConfig={(config) => {
-            const fallback = getRecommendedTrainingPreset(config.model_size ?? voice.model_size)
-            setBatchSize(config.batch_size ?? fallback.batchSize)
-            setEpochs(config.num_epochs ?? fallback.epochs)
-            setLearningRate(config.learning_rate ?? fallback.learningRate)
-            setTrainingSeed(config.seed ?? fallback.seed)
-            setGradientAccumulationSteps(config.gradient_accumulation_steps ?? fallback.gradientAccumulationSteps)
-            setSubtalkerLossWeight(config.subtalker_loss_weight ?? fallback.subtalkerLossWeight)
-            setSaveEveryNEpochs(config.save_every_n_epochs ?? fallback.saveEveryNEpochs)
-            setTrainingLanguage(config.whisper_language ?? trainingLanguage)
-            setGpuTypeId(config.gpu_type_id ?? fallback.gpuTypeId)
-          }}
-        />
-      )}
 
       <section className="rounded-xl border border-edge bg-raised p-4">
         <div className="mb-3 flex items-center justify-between">
