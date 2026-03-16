@@ -9,8 +9,10 @@ import {
   formatDurationMs,
 } from '../lib/api'
 import { formatScore, scoreColor } from '../lib/voiceScoreUi'
+import { computeNiceDomain } from '../components/charts/chartDomain'
 import { LineChart } from '../components/charts/LineChart'
 import { BarChart } from '../components/charts/BarChart'
+import { DotChart } from '../components/charts/DotChart'
 import { MiniSparkline } from '../components/charts/MiniSparkline'
 
 type SortKey = 'name' | 'score' | 'delta' | 'jobs' | 'duration' | 'last'
@@ -419,7 +421,9 @@ export function Statistics() {
 
   const scatterDomain = useMemo(() => {
     const xMax = Math.max(30, ...scoreVsDurationPoints.map((point) => point.durationMin))
-    return { xMin: 0, xMax, yMin: 0, yMax: 1 }
+    const yValues = scoreVsDurationPoints.map((point) => point.score)
+    const yDomain = computeNiceDomain(yValues, { clampMin: 0, clampMax: 1 })
+    return { xMin: 0, xMax, yMin: yDomain.min, yMax: yDomain.max, yTicks: yDomain.ticks }
   }, [scoreVsDurationPoints])
 
   const handleSort = (key: SortKey) => {
@@ -504,11 +508,10 @@ export function Statistics() {
               <>
                 <LineChart
                   data={scoreProgressionData}
-                  yMin={0}
-                  yMax={1}
                   yLabel="score"
                   xLabel="attempt"
                   height={260}
+                  domainOptions={{ clampMin: 0, clampMax: 1 }}
                 />
                 {!selectedVoice && scoreProgressionData.series.length > 1 && (
                   <div className="flex flex-wrap gap-x-4 gap-y-1 pt-1">
@@ -528,7 +531,7 @@ export function Statistics() {
             {checkpointPassRateData.length === 0 ? (
               <EmptyChart message="No checkpoint evaluations yet" />
             ) : (
-              <BarChart data={checkpointPassRateData} yLabel="pass rate" height={260} />
+              <DotChart data={checkpointPassRateData} yLabel="pass rate" height={260} domainOptions={{ clampMin: 0, clampMax: 1 }} />
             )}
           </div>
         </div>
@@ -555,14 +558,13 @@ export function Statistics() {
               <svg viewBox="0 0 760 250" className="w-full h-auto" role="img" aria-label="Score versus duration scatter plot">
                 <line x1="42" y1="18" x2="42" y2="216" stroke="var(--color-edge)" />
                 <line x1="42" y1="216" x2="744" y2="216" stroke="var(--color-edge)" />
-                {Array.from({ length: 5 }).map((_, tick) => {
-                  const ratio = tick / 4
-                  const y = 18 + ratio * 198
-                  const value = (1 - ratio).toFixed(2)
+                {scatterDomain.yTicks.map((value) => {
+                  const yRatio = (value - scatterDomain.yMin) / Math.max(0.0001, scatterDomain.yMax - scatterDomain.yMin)
+                  const y = 216 - yRatio * 198
                   return (
-                    <g key={`scatter-y-${value}`}>
+                    <g key={`scatter-y-${value.toFixed(4)}`}>
                       <line x1="42" y1={y} x2="744" y2={y} stroke="var(--color-edge)" strokeWidth="1" />
-                      <text x="36" y={y + 4} textAnchor="end" fontSize="10" fill="var(--color-muted)">{value}</text>
+                      <text x="36" y={y + 4} textAnchor="end" fontSize="10" fill="var(--color-muted)">{value.toFixed(2)}</text>
                     </g>
                   )
                 })}
