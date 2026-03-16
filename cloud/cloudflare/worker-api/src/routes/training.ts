@@ -905,6 +905,9 @@ const collectManualPromotionCandidates = (
       continue;
     }
     const record = value as Record<string, unknown>;
+    if (record.ok === false) {
+      continue;
+    }
     const prefix = typeof record.prefix === "string" ? record.prefix.trim() : "";
     register({
       prefix,

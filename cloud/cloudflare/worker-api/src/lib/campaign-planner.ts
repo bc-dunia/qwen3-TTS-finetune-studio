@@ -667,7 +667,6 @@ export function planCampaignAttempts(
 
     for (const used of usedConfigs) {
       if (!meetsMinDiversity(candidateNums, used)) {
-        // Force diversity by shifting
         candidateNums.lr *= 1.25;
         candidateNums.epochs += 2;
         candidateNums.subtalker = Math.max(0.08, candidateNums.subtalker - 0.04);
@@ -683,6 +682,26 @@ export function planCampaignAttempts(
         );
         candidate.reasoning += " (diversified from parallel run)";
       }
+    }
+
+    const finalFk = configFamilyKey(
+      readNum(candidate.config.learning_rate) ?? 0,
+      readNum(candidate.config.num_epochs) ?? 0,
+      readNum(candidate.config.subtalker_loss_weight) ?? 0,
+    );
+    if (blockedFamilies.has(finalFk)) {
+      const is06b = voice.model_size.includes("0.6");
+      const escapeLr = (readNum(candidate.config.learning_rate) ?? (is06b ? 3e-6 : 5e-6)) * 0.7;
+      const escapeEp = Math.max(is06b ? 5 : 4, (readNum(candidate.config.num_epochs) ?? 6) - 2);
+      const escapeSub = Math.max(is06b ? 0.1 : 0.08, (readNum(candidate.config.subtalker_loss_weight) ?? 0.26) - 0.06);
+      candidate.config = sanitizeConfig(
+        { ...candidate.config, learning_rate: escapeLr, num_epochs: escapeEp, subtalker_loss_weight: escapeSub },
+        voice.model_size, voice.labels?.language,
+      );
+      candidateNums.lr = escapeLr;
+      candidateNums.epochs = escapeEp;
+      candidateNums.subtalker = escapeSub;
+      candidate.reasoning += " (escape hatch: all nearby families blocked)";
     }
 
     usedConfigs.push(candidateNums);
