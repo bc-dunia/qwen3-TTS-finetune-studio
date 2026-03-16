@@ -240,6 +240,57 @@ function rotateAwayFromActiveConfigs(
   }
 }
 
+function toActiveFamilyKey(config: TrainingConfig): string {
+  const lr = (readNumber(config.learning_rate) ?? 0).toFixed(7);
+  const epochs = readNumber(config.num_epochs) ?? 0;
+  const sub = (readNumber(config.subtalker_loss_weight) ?? 0).toFixed(2);
+  return `${lr}|${epochs}|${sub}`;
+}
+
+function shiftAwayFromActiveFamilies(
+  config: TrainingConfig,
+  activeFamilies: Set<string>,
+  modelSize: string,
+): TrainingConfig {
+  const is06b = modelSize.includes("0.6");
+  const baseLr = readNumber(config.learning_rate) ?? (is06b ? 3e-6 : 5e-6);
+  const baseEpochs = readNumber(config.num_epochs) ?? (is06b ? 10 : 8);
+  const baseSub = readNumber(config.subtalker_loss_weight) ?? (is06b ? 0.25 : 0.22);
+
+  const shifts = [
+    { lrMul: 0.85, epochsDelta: -1, subDelta: -0.02 },
+    { lrMul: 0.92, epochsDelta: -2, subDelta: 0.0 },
+    { lrMul: 1.10, epochsDelta: -1, subDelta: 0.02 },
+    { lrMul: 0.78, epochsDelta: 0, subDelta: -0.04 },
+    { lrMul: 1.15, epochsDelta: 1, subDelta: -0.02 },
+  ];
+
+  for (const shift of shifts) {
+    const candidate: TrainingConfig = {
+      ...config,
+      learning_rate: baseLr * shift.lrMul,
+      num_epochs: Math.max(is06b ? 5 : 4, baseEpochs + shift.epochsDelta),
+      subtalker_loss_weight: clamp(baseSub + shift.subDelta, is06b ? 0.1 : 0.08, is06b ? 0.4 : 0.35),
+      seed: pickAlternateSeed(readNumber(config.seed) ?? 0, modelSize),
+    };
+    const lang = readText(config.whisper_language) ?? undefined;
+    const sanitized = sanitizeConfig(candidate, modelSize, lang);
+    const fk = toActiveFamilyKey(sanitized);
+    if (!activeFamilies.has(fk)) {
+      return sanitized;
+    }
+  }
+
+  const lang = readText(config.whisper_language) ?? undefined;
+  return sanitizeConfig({
+    ...config,
+    learning_rate: baseLr * 0.75,
+    num_epochs: Math.max(is06b ? 5 : 4, baseEpochs - 2),
+    subtalker_loss_weight: clamp(baseSub - 0.04, is06b ? 0.1 : 0.08, is06b ? 0.4 : 0.35),
+    seed: pickAlternateSeed(readNumber(config.seed) ?? 0, modelSize),
+  }, modelSize, lang);
+}
+
 export function diversifyAdviceForActiveRuns(
   advice: TrainingAdvice,
   voice: Voice,
@@ -249,6 +300,11 @@ export function diversifyAdviceForActiveRuns(
     return advice;
   }
 
+  const activeFamilies = new Set(
+    activeJobs.map((job) =>
+      toActiveFamilyKey(sanitizeConfig(job.config, voice.model_size, voice.labels?.language))
+    )
+  );
   const activeKeys = new Set(
     activeJobs.map((job) =>
       toAdviceConfigKey(sanitizeConfig(job.config, voice.model_size, voice.labels?.language))
@@ -261,6 +317,19 @@ export function diversifyAdviceForActiveRuns(
     return advice;
   }
 
+  const baseFk = toActiveFamilyKey(baseSuggestion);
+  if (activeFamilies.has(baseFk)) {
+    const shifted = shiftAwayFromActiveFamilies(baseSuggestion, activeFamilies, voice.model_size);
+    return {
+      ...advice,
+      suggestedConfig: shifted,
+      reasons: [
+        ...advice.reasons,
+        "A run with matching hyperparameters is already active, so this suggestion shifts LR/epochs/subtalker to avoid the seed-only rotation trap.",
+      ],
+    };
+  }
+
   const rotatedSuggestion = rotateAwayFromActiveConfigs(baseSuggestion, activeKeys, voice.model_size);
   if (rotatedSuggestion) {
     return {
@@ -268,7 +337,7 @@ export function diversifyAdviceForActiveRuns(
       suggestedConfig: rotatedSuggestion,
       reasons: [
         ...advice.reasons,
-        "A run with matching knobs is already active, so this suggestion rotates seed to test a different lane.",
+        "An identical config is already active, so this suggestion rotates seed.",
       ],
     };
   }
@@ -277,20 +346,13 @@ export function diversifyAdviceForActiveRuns(
     return advice;
   }
 
-  const shiftedBase =
-    advice.mode === "stability-reset"
-      ? tuneForTone(baseSuggestion, voice.model_size)
-      : tuneForStability(baseSuggestion, voice.model_size);
-  const shiftedSuggestion = sanitizeConfig(shiftedBase, voice.model_size, voice.labels?.language);
-  const shiftedNonDuplicate =
-    rotateAwayFromActiveConfigs(shiftedSuggestion, activeKeys, voice.model_size) ?? shiftedSuggestion;
-
+  const shifted = shiftAwayFromActiveFamilies(baseSuggestion, activeFamilies, voice.model_size);
   return {
     ...advice,
-    suggestedConfig: shiftedNonDuplicate,
+    suggestedConfig: shifted,
     reasons: [
       ...advice.reasons,
-      "A run with matching knobs is already active, so this suggestion shifts to a different strategy lane.",
+      "Active runs cover this config family, so this suggestion shifts to a structurally different configuration.",
     ],
   };
 }
