@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo } from 'react'
 import { Link } from 'react-router'
 import { fetchVoices, fetchAllTrainingJobs, type Voice, type TrainingJob, formatDate, formatTime } from '../lib/api'
 import { shouldWatchTrainingJob } from '../lib/trainingCheckout'
+import { formatScore, scoreColor } from '../lib/voiceScoreUi'
 
 interface GenerationRecord {
   id: string
@@ -125,6 +126,11 @@ export function Dashboard() {
         </div>
       )}
 
+      {/* Voice Overview */}
+      {!loading && voices.length > 0 && (
+        <VoiceOverviewTable voices={voices} />
+      )}
+
       <div className="grid lg:grid-cols-2 gap-6">
         {/* Recent Generations */}
         <div className="bg-raised border border-edge rounded-xl p-5">
@@ -244,6 +250,138 @@ export function Dashboard() {
 }
 
 // ── Sub-components ─────────────────────────────────────────────────────────────
+
+function sortVoicesForOverview(voices: Voice[]): Voice[] {
+  const statusOrder: Record<string, number> = { training: 0, ready: 1, created: 2 }
+  return [...voices].sort((a, b) => {
+    const oa = statusOrder[a.status] ?? 3
+    const ob = statusOrder[b.status] ?? 3
+    if (oa !== ob) return oa - ob
+    const sa = a.checkpoint_score ?? -1
+    const sb = b.checkpoint_score ?? -1
+    return sb - sa
+  })
+}
+
+function VoiceOverviewTable({ voices }: { voices: Voice[] }) {
+  const sorted = sortVoicesForOverview(voices)
+  const statusDot: Record<string, string> = {
+    ready: 'bg-accent',
+    training: 'bg-warning animate-pulse',
+    created: 'bg-muted',
+  }
+
+  return (
+    <div className="bg-raised border border-edge rounded-xl p-5">
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="text-heading font-semibold text-sm">Voice Overview</h2>
+        <Link to="/voices" className="text-accent text-xs hover:text-accent-light">
+          Manage →
+        </Link>
+      </div>
+
+      {/* Desktop table */}
+      <div className="hidden sm:block">
+        <div className="grid grid-cols-[1fr_60px_70px_56px_80px_90px] gap-x-3 px-3 pb-2 text-[10px] font-mono text-muted uppercase tracking-widest border-b border-edge">
+          <span>Name</span>
+          <span>Model</span>
+          <span className="text-right">Score</span>
+          <span className="text-right">Epoch</span>
+          <span>Status</span>
+          <span className="text-right">Action</span>
+        </div>
+        <div className="divide-y divide-edge/50">
+          {sorted.map((v) => {
+            const isImproving =
+              v.candidate_score != null &&
+              v.checkpoint_score != null &&
+              Number.isFinite(v.candidate_score) &&
+              Number.isFinite(v.checkpoint_score) &&
+              v.candidate_score > v.checkpoint_score
+
+            const href = v.status === 'ready'
+              ? `/voices/${v.voice_id}/generate`
+              : `/voices/${v.voice_id}/training`
+
+            return (
+              <Link
+                key={v.voice_id}
+                to={href}
+                className="grid grid-cols-[1fr_60px_70px_56px_80px_90px] gap-x-3 px-3 py-2.5 items-center hover:bg-surface transition-colors rounded"
+              >
+                <span className="text-primary text-xs font-medium truncate">{v.name}</span>
+                <span className="text-muted text-[11px] font-mono">{v.model_size || '—'}</span>
+                <span className={`text-right text-xs font-mono font-bold ${scoreColor(v.checkpoint_score)}`}>
+                  {formatScore(v.checkpoint_score)}
+                  {isImproving && (
+                    <span className="text-accent text-[9px] ml-0.5">+</span>
+                  )}
+                </span>
+                <span className="text-right text-muted text-[11px] font-mono">
+                  {typeof v.epoch === 'number' ? v.epoch : '—'}
+                </span>
+                <span className="flex items-center gap-1.5 text-[11px] font-mono text-muted">
+                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${statusDot[v.status] ?? 'bg-muted'}`} />
+                  {v.status}
+                </span>
+                <span className="text-right text-accent text-[11px] font-mono hover:text-accent-light">
+                  {v.status === 'ready' ? 'Generate →' : v.status === 'training' ? 'View →' : 'Train →'}
+                </span>
+              </Link>
+            )
+          })}
+        </div>
+      </div>
+
+      {/* Mobile cards */}
+      <div className="sm:hidden space-y-2">
+        {sorted.map((v) => {
+          const isImproving =
+            v.candidate_score != null &&
+            v.checkpoint_score != null &&
+            Number.isFinite(v.candidate_score) &&
+            Number.isFinite(v.checkpoint_score) &&
+            v.candidate_score > v.checkpoint_score
+
+          const mobileHref = v.status === 'ready'
+            ? `/voices/${v.voice_id}/generate`
+            : `/voices/${v.voice_id}/training`
+
+          return (
+            <Link
+              key={v.voice_id}
+              to={mobileHref}
+              className="block px-3 py-3 rounded-lg bg-surface hover:bg-elevated transition-colors"
+            >
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-primary text-xs font-medium truncate">{v.name}</span>
+                <span className="flex items-center gap-1.5 text-[10px] font-mono text-muted">
+                  <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${statusDot[v.status] ?? 'bg-muted'}`} />
+                  {v.status}
+                </span>
+              </div>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3 text-[11px] font-mono text-muted">
+                  <span>{v.model_size || '—'}</span>
+                  {typeof v.epoch === 'number' && <span>ep {v.epoch}</span>}
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className={`text-sm font-bold font-mono ${scoreColor(v.checkpoint_score)}`}>
+                    {formatScore(v.checkpoint_score)}
+                    {isImproving && <span className="text-accent text-[9px] ml-0.5">+</span>}
+                  </span>
+                  <span className="text-accent text-[10px] font-mono">
+                    {v.status === 'ready' ? 'Generate →' : v.status === 'training' ? 'View →' : 'Train →'}
+                  </span>
+                </div>
+              </div>
+            </Link>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
 
 function StatCard({
   label,

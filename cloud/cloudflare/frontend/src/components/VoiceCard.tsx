@@ -1,6 +1,7 @@
 import { useNavigate } from 'react-router'
 import type { Voice } from '../lib/api'
 import { DEFAULT_VOICE_SETTINGS, formatDate } from '../lib/api'
+import { formatScore, scoreColor, scoreBgColor } from '../lib/voiceScoreUi'
 
 interface VoiceCardProps {
   voice: Voice
@@ -38,66 +39,132 @@ export function VoiceCard({ voice }: VoiceCardProps) {
   }
   const settingSummary = `stab ${settings.stability.toFixed(2)} · sim ${settings.similarity_boost.toFixed(2)} · style ${settings.style.toFixed(2)} · speed ${settings.speed.toFixed(2)}`
 
+  const hasCheckpoint = voice.checkpoint_r2_prefix != null || voice.run_name != null
+  const isImproving =
+    voice.candidate_score != null &&
+    voice.checkpoint_score != null &&
+    Number.isFinite(voice.candidate_score) &&
+    Number.isFinite(voice.checkpoint_score) &&
+    voice.candidate_score > voice.checkpoint_score
+
   return (
-    <button
-      type="button"
-      onClick={(e) => {
-        const target = e.target as HTMLElement
-        if (target.closest('[data-train-shortcut]')) {
-          navigate(`/voices/${voice.voice_id}/training`)
-        } else {
-          navigate(`/voices/${voice.voice_id}`)
-        }
-      }}
-      className="bg-raised border border-edge rounded-xl p-5 text-left hover:border-accent/30 hover:bg-elevated transition-all duration-150 group w-full"
-    >
-      {/* Header */}
-      <div className="flex items-start justify-between gap-3 mb-3">
-        <h3 className="text-heading font-semibold text-sm truncate group-hover:text-accent transition-colors">
-          {voice.name}
-        </h3>
-        <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-mono uppercase tracking-wider shrink-0 ${status.bg} ${status.text}`}>
-          <span className={`w-1.5 h-1.5 rounded-full ${status.dot}`} />
-          {voice.status}
-        </span>
-      </div>
+    <div className="bg-raised border border-edge rounded-xl text-left hover:border-accent/30 hover:bg-elevated transition-all duration-150 group w-full flex flex-col">
+      {/* Clickable card body */}
+      <button
+        type="button"
+        onClick={() => navigate(
+          voice.status === 'created' || voice.status === 'training'
+            ? `/voices/${voice.voice_id}/training`
+            : `/voices/${voice.voice_id}`
+        )}
+        className="p-5 pb-3 text-left w-full flex-1"
+      >
+        {/* Header */}
+        <div className="flex items-start justify-between gap-3 mb-3">
+          <h3 className="text-heading font-semibold text-sm truncate group-hover:text-accent transition-colors">
+            {voice.name}
+          </h3>
+          <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-mono uppercase tracking-wider shrink-0 ${status.bg} ${status.text}`}>
+            <span className={`w-1.5 h-1.5 rounded-full ${status.dot}`} />
+            {voice.status}
+          </span>
+        </div>
 
-      {/* Description */}
-      {voice.description && (
-        <p className="text-subtle text-xs leading-relaxed line-clamp-2 mb-4">
-          {voice.description}
-        </p>
-      )}
+        {/* Description */}
+        {voice.description && (
+          <p className="text-subtle text-xs leading-relaxed line-clamp-2 mb-4">
+            {voice.description}
+          </p>
+        )}
 
-      {/* Footer */}
-      <div className="space-y-2 text-[11px] font-mono text-muted">
-        <div className="flex items-center justify-between gap-2">
-          <div className="flex items-center gap-2 min-w-0">
-            <span className="bg-surface px-2 py-0.5 rounded shrink-0">
-              {voice.model_size || 'base'}
-            </span>
-            {typeof voice.epoch === 'number' && (
-              <span className="bg-surface px-2 py-0.5 rounded shrink-0">
-                epoch {voice.epoch}
-              </span>
+        {/* Score + Metadata row */}
+        <div className="flex items-start gap-4 mb-3">
+          {/* Score badge */}
+          <div className={`rounded-lg px-3 py-2.5 text-center shrink-0 ${scoreBgColor(voice.checkpoint_score)}`}>
+            {hasCheckpoint && voice.checkpoint_score != null && Number.isFinite(voice.checkpoint_score) ? (
+              <>
+                <div className={`text-lg font-bold font-mono leading-none ${scoreColor(voice.checkpoint_score)}`}>
+                  {formatScore(voice.checkpoint_score)}
+                </div>
+                <div className="text-[9px] font-mono text-muted uppercase tracking-wider mt-1">score</div>
+              </>
+            ) : hasCheckpoint ? (
+              <>
+                <div className="text-xs font-mono text-muted leading-none">...</div>
+                <div className="text-[9px] font-mono text-muted uppercase tracking-wider mt-1">scoring</div>
+              </>
+            ) : (
+              <>
+                <div className="text-xs font-mono text-muted leading-none">—</div>
+                <div className="text-[9px] font-mono text-muted uppercase tracking-wider mt-1">no ckpt</div>
+              </>
             )}
-            <span
-              data-train-shortcut
-              className={`px-2 py-0.5 rounded shrink-0 cursor-pointer transition-colors ${
-                voice.status === 'ready'
-                  ? 'bg-surface text-muted hover:text-accent hover:bg-accent-dim'
-                  : 'bg-accent-dim text-accent hover:bg-accent hover:text-void'
-              }`}
-            >
-              {voice.status === 'created' ? 'Start Training' : 'Train'}
-            </span>
           </div>
-          <span className="shrink-0">Updated {formatDate(lastUpdated)}</span>
+
+          {/* Metadata column */}
+          <div className="space-y-1.5 text-[11px] font-mono text-muted min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <span className="bg-surface px-2 py-0.5 rounded shrink-0">
+                {voice.model_size || 'base'}
+              </span>
+              {typeof voice.epoch === 'number' && (
+                <span className="bg-surface px-2 py-0.5 rounded shrink-0">
+                  epoch {voice.epoch}
+                </span>
+              )}
+              {isImproving && (
+                <span className="text-accent text-[10px] flex items-center gap-0.5 shrink-0">
+                  <svg className="w-3 h-3" viewBox="0 0 24 24" fill="currentColor">
+                    <title>Score improving</title>
+                    <path d="M12 4l-1.41 1.41L16.17 11H4v2h12.17l-5.58 5.59L12 20l8-8-8-8z" />
+                  </svg>
+                  improving
+                </span>
+              )}
+            </div>
+            <div className="truncate">Updated {formatDate(lastUpdated)}</div>
+            <div className="text-[10px] text-subtle truncate">{settingSummary}</div>
+          </div>
         </div>
-        <div className="text-[10px] leading-relaxed text-subtle">
-          {settingSummary}
-        </div>
+      </button>
+
+      {/* Training CTA — separate click target */}
+      <div className="px-5 pb-4 pt-1">
+        {voice.status === 'created' ? (
+          <button
+            type="button"
+            onClick={() => navigate(`/voices/${voice.voice_id}/training`)}
+            className="w-full flex items-center justify-center gap-2 bg-accent hover:bg-accent-light text-void font-semibold text-xs py-2.5 rounded-lg transition-colors"
+          >
+            Start Training
+            <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
+              <title>Start training</title>
+              <path d="M12 4l-1.41 1.41L16.17 11H4v2h12.17l-5.58 5.59L12 20l8-8-8-8z" />
+            </svg>
+          </button>
+        ) : voice.status === 'training' ? (
+          <button
+            type="button"
+            onClick={() => navigate(`/voices/${voice.voice_id}/training`)}
+            className="w-full flex items-center justify-center gap-2 bg-warning-dim hover:bg-warning/20 text-warning font-mono text-[11px] py-2.5 rounded-lg transition-colors cursor-pointer"
+          >
+            <span className="w-1.5 h-1.5 rounded-full bg-warning animate-pulse" />
+            View Training Progress
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={() => navigate(`/voices/${voice.voice_id}/training`)}
+            className="w-full flex items-center justify-center gap-2 bg-surface hover:bg-elevated text-muted hover:text-accent font-mono text-[11px] py-2 rounded-lg transition-colors"
+          >
+            Continue Training
+            <svg className="w-3 h-3" viewBox="0 0 24 24" fill="currentColor">
+              <title>Continue training</title>
+              <path d="M12 4l-1.41 1.41L16.17 11H4v2h12.17l-5.58 5.59L12 20l8-8-8-8z" />
+            </svg>
+          </button>
+        )}
       </div>
-    </button>
+    </div>
   )
 }
