@@ -180,7 +180,7 @@ export function Playground() {
               >
                 {voices.map((v) => (
                   <option key={v.voice_id} value={v.voice_id}>
-                    {v.name} — {v.model_size || 'base'}{typeof v.epoch === 'number' ? ` · epoch ${v.epoch}` : ''}
+                    {v.name} — {v.model_size || 'base'}{typeof v.epoch === 'number' ? ` · epoch ${v.epoch}` : ''}{typeof v.checkpoint_score === 'number' ? ` · score ${v.checkpoint_score.toFixed(3)}` : ''}
                   </option>
                 ))}
               </select>
@@ -196,6 +196,12 @@ export function Playground() {
             <textarea
               value={text}
               onChange={(e) => setText(e.target.value)}
+              onKeyDown={(e) => {
+                if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && selectedVoiceId && text.trim() && !generating) {
+                  e.preventDefault()
+                  handleGenerate()
+                }
+              }}
               placeholder="Enter the text you want to convert to speech..."
               rows={6}
               className="w-full bg-surface border border-edge rounded-lg px-3 py-2.5 text-sm text-primary placeholder:text-muted focus:border-accent transition-colors resize-none leading-relaxed"
@@ -222,6 +228,7 @@ export function Playground() {
                   <path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l11.24-7.36a1 1 0 0 0 0-1.72L9.5 4.28A1 1 0 0 0 8 5.14z" />
                 </svg>
                 Generate Speech
+                <kbd className="hidden sm:inline-block ml-1 text-[10px] opacity-50 font-mono">{'\u2318'}↵</kbd>
               </>
             )}
           </button>
@@ -270,7 +277,7 @@ export function Playground() {
                     </div>
                     <div className="flex-1 min-w-0">
                       <p className="text-primary text-xs leading-relaxed line-clamp-2">{entry.text}</p>
-                      <p className="text-muted text-[10px] font-mono mt-1">
+                      <p className="text-muted text-[10px] font-mono mt-1" title={new Date(entry.createdAt).toLocaleString()}>
                         {entry.voiceName} · {new Date(entry.createdAt).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}
                       </p>
                     </div>
@@ -300,7 +307,7 @@ export function Playground() {
               <div className="mb-5 pb-4 border-b border-edge">
                 <div className="text-primary text-xs font-medium">{selectedVoice.name}</div>
                 <div className="text-muted text-[10px] font-mono mt-0.5">
-                  {selectedVoice.model_size || 'base'} · {selectedVoice.voice_id.slice(0, 8)}
+                  {selectedVoice.model_size || 'base'} · {selectedVoice.voice_id.slice(0, 8)}{typeof selectedVoice.checkpoint_score === 'number' ? ` · score ${selectedVoice.checkpoint_score.toFixed(3)}` : ''}
                 </div>
               </div>
             )}

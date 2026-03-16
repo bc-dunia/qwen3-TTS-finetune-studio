@@ -394,6 +394,12 @@ export function VoiceTrainingTab() {
 
   return (
     <div className="space-y-6">
+      {error && (
+        <div className="rounded-lg border border-error/20 bg-error-dim px-3 py-2 text-sm text-error">
+          {error}
+        </div>
+      )}
+
       <AutopilotPanel
         voiceId={voiceId}
         datasetReady={datasetReady}
@@ -545,11 +551,6 @@ export function VoiceTrainingTab() {
         )}
       </section>
 
-      {error && (
-        <div className="rounded-lg border border-error/20 bg-error-dim px-3 py-2 text-sm text-error">
-          {error}
-        </div>
-      )}
     </div>
   )
 }

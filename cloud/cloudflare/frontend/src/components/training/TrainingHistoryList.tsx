@@ -37,7 +37,9 @@ export function TrainingHistoryList({
         className="flex w-full items-center justify-between text-left"
       >
         <h3 className="text-heading text-sm font-semibold">Training History</h3>
-        <span className="text-muted text-xs font-mono">{collapsed ? `show (${historyJobs.length})` : 'hide'}</span>
+        <span className="text-muted text-xs font-mono">
+          {collapsed ? `show (${historyJobs.length})` : 'hide'}
+        </span>
       </button>
 
       {!collapsed && (

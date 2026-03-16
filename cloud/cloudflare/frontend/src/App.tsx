@@ -9,6 +9,7 @@ import { Playground } from './pages/Playground'
 import { VoiceWorkspace, VoiceDefaultRedirect } from './pages/VoiceWorkspace'
 import { VoiceTrainingTab } from './pages/VoiceTrainingTab'
 import { QueuePage } from './pages/QueuePage'
+import { Statistics } from './pages/Statistics'
 
 export function App() {
   return (
@@ -25,6 +26,7 @@ export function App() {
         </Route>
         <Route path="playground" element={<Playground />} />
         <Route path="queue" element={<QueuePage />} />
+        <Route path="statistics" element={<Statistics />} />
         <Route path="training" element={<Navigate to="/queue" replace />} />
       </Route>
     </Routes>

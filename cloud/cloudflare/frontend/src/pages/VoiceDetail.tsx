@@ -1,7 +1,6 @@
-import { useState, useEffect } from 'react'
-import { useParams, useNavigate } from 'react-router'
+import { useState, useEffect, useRef } from 'react'
+import { useParams, useNavigate, useOutletContext } from 'react-router'
 import {
-  fetchVoice,
   deleteVoice,
   pollSpeechGeneration,
   startSpeechGenerationAsync,
@@ -26,15 +25,11 @@ function normalizeVoiceSettings(value: Partial<VoiceSettings> | null | undefined
 export function VoiceDetail() {
   const { voiceId = '' } = useParams()
   const navigate = useNavigate()
+  const { voice, loading } = useOutletContext<{ voice: Voice | null; loading: boolean }>()
 
-  const [voice, setVoice] = useState<Voice | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState('')
-
-  // Settings
   const [settings, setSettings] = useState<VoiceSettings>(DEFAULT_VOICE_SETTINGS)
+  const lastInitVoiceId = useRef('')
 
-  // Quick generate
   const [text, setText] = useState('')
   const [stylePrompt, setStylePrompt] = useState('')
   const [instruct, setInstruct] = useState('')
@@ -43,35 +38,15 @@ export function VoiceDetail() {
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null)
   const [genError, setGenError] = useState('')
 
-  // Delete
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [deleting, setDeleting] = useState(false)
+  const [error, setError] = useState('')
 
   useEffect(() => {
-    if (!voiceId) return
-    let cancelled = false
-
-    async function load() {
-      try {
-        const data = await fetchVoice(voiceId)
-        if (!cancelled) {
-          setVoice(data)
-          setSettings(normalizeVoiceSettings(data.settings))
-        }
-      } catch (err) {
-        if (!cancelled) {
-          setError(err instanceof Error ? err.message : 'Failed to load voice')
-        }
-      } finally {
-        if (!cancelled) setLoading(false)
-      }
-    }
-
-    load()
-    return () => {
-      cancelled = true
-    }
-  }, [voiceId])
+    if (!voice || voice.voice_id === lastInitVoiceId.current) return
+    setSettings(normalizeVoiceSettings(voice.settings))
+    lastInitVoiceId.current = voice.voice_id
+  }, [voice])
 
   async function handleGenerate() {
     if (!voiceId || !text.trim()) return
@@ -118,12 +93,9 @@ export function VoiceDetail() {
     setSettings((prev) => ({ ...prev, [key]: value }))
   }
 
-  // Loading state
   if (loading) {
     return (
       <div className="space-y-6 animate-pulse">
-        <div className="h-8 bg-raised rounded w-1/3" />
-        <div className="h-4 bg-raised rounded w-1/2" />
         <div className="grid lg:grid-cols-2 gap-6">
           <div className="h-64 bg-raised rounded-xl" />
           <div className="h-64 bg-raised rounded-xl" />
@@ -132,82 +104,32 @@ export function VoiceDetail() {
     )
   }
 
-  // Error state
-  if (error && !voice) {
+  if (!voice) {
     return (
-      <div className="text-center py-16">
-        <div className="text-error text-sm mb-4">{error}</div>
-        <button
-          onClick={() => navigate('/voices')}
-          className="text-accent text-sm hover:text-accent-light"
-          type="button"
-        >
-          ← Back to Voices
-        </button>
+      <div className="rounded-lg border border-dashed border-edge bg-surface px-4 py-8 text-center text-sm text-muted">
+        Voice not found or failed to load.
       </div>
     )
   }
-
-  if (!voice) return null
   const supportsPromptControls = Boolean(voice.model_size?.includes('1.7'))
 
-  const statusStyles: Record<string, string> = {
-    ready: 'bg-accent-dim text-accent',
-    training: 'bg-warning-dim text-warning',
-    created: 'bg-raised text-muted',
-  }
-
   return (
-    <div className="space-y-8">
-      {/* Back link */}
-      <button
-        onClick={() => navigate('/voices')}
-        className="text-subtle text-sm hover:text-accent transition-colors inline-flex items-center gap-1"
-        type="button"
-      >
-        <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-          <polyline points="15 18 9 12 15 6" />
-        </svg>
-        Back to Voices
-      </button>
-
-      {/* Voice Header */}
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <div className="flex items-center gap-3 mb-2">
-            <h1 className="text-heading text-2xl font-bold">{voice.name}</h1>
-            <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-mono uppercase tracking-wider ${statusStyles[voice.status] ?? statusStyles.created}`}>
-              {voice.status}
-            </span>
-          </div>
-          {voice.description && (
-            <p className="text-subtle text-sm max-w-xl">{voice.description}</p>
-          )}
-          <div className="flex items-center gap-4 mt-3 text-muted text-xs font-mono">
-            <span>Model: {voice.model_size || 'base'}</span>
-            <span>Updated: {formatDate(voice.updated_at ?? voice.created_at)}</span>
-            {typeof voice.epoch === 'number' && <span>Epoch: {voice.epoch}</span>}
-            {voice.run_name && <span>Run: {voice.run_name}</span>}
-            <span>ID: {voice.voice_id.slice(0, 12)}...</span>
-          </div>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <button
-            onClick={() => navigate(`/voices/${voice.voice_id}/dataset`)}
-            className="inline-flex items-center rounded-lg border border-edge px-3 py-2 text-[11px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent"
-            type="button"
-          >
-            Dataset Studio
-          </button>
-          <button
-            onClick={() => navigate(`/voices/${voice.voice_id}/compare`)}
-            className="inline-flex items-center rounded-lg border border-edge px-3 py-2 text-[11px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent"
-            type="button"
-          >
-            Compare Checkpoints
-          </button>
-        </div>
+    <div className="space-y-6">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-muted text-xs font-mono">
+        <span>{voice.model_size || 'base'}</span>
+        {typeof voice.epoch === 'number' && <span>epoch {voice.epoch}</span>}
+        {voice.run_name && <span>run {voice.run_name}</span>}
+        <span>updated {formatDate(voice.updated_at ?? voice.created_at)}</span>
+        <button type="button" className="cursor-pointer hover:text-accent transition-colors" title={`Click to copy: ${voice.voice_id}`} onClick={() => { void navigator.clipboard.writeText(voice.voice_id) }}>{voice.voice_id.slice(0, 12)}</button>
       </div>
+
+      {voice.description && (
+        <p className="text-subtle text-sm max-w-xl -mt-3">{voice.description}</p>
+      )}
+
+      {error && (
+        <div className="bg-error-dim border border-error/20 rounded-lg px-3 py-2 text-error text-xs">{error}</div>
+      )}
 
       <div className="grid lg:grid-cols-2 gap-6">
         {/* Voice Settings */}
@@ -295,11 +217,20 @@ export function VoiceDetail() {
 
         {/* Quick Generate */}
         <div className="bg-raised border border-edge rounded-xl p-5">
-          <h2 className="text-heading font-semibold text-sm mb-4">Generate Speech</h2>
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-heading font-semibold text-sm">Generate Speech</h2>
+            {text.length > 0 && <span className="text-muted text-[10px] font-mono">{text.length} chars</span>}
+          </div>
 
           <textarea
             value={text}
             onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => {
+              if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && text.trim() && !generating && voice.status === 'ready') {
+                e.preventDefault()
+                handleGenerate()
+              }
+            }}
             placeholder="Enter text to generate speech..."
             rows={4}
             className="w-full bg-surface border border-edge rounded-lg px-3 py-2.5 text-sm text-primary placeholder:text-muted focus:border-accent transition-colors resize-none mb-4"
@@ -311,7 +242,7 @@ export function VoiceDetail() {
             className="w-full bg-accent hover:bg-accent-light text-void font-semibold text-sm py-2.5 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed transition-colors mb-4"
             type="button"
           >
-            {generating ? (generateStatus ? `Generating (${generateStatus})...` : 'Generating...') : 'Generate'}
+            {generating ? (generateStatus ? `Generating (${generateStatus})...` : 'Generating...') : (<>Generate Speech <kbd className="hidden sm:inline-block ml-1 text-[10px] opacity-50 font-mono">{'\u2318'}↵</kbd></>)}
           </button>
 
           {genError && (
@@ -324,7 +255,6 @@ export function VoiceDetail() {
         </div>
       </div>
 
-      {/* Danger Zone */}
       <div className="bg-raised border border-error/20 rounded-xl p-5">
         <h2 className="text-error font-semibold text-sm mb-2">Danger Zone</h2>
         <p className="text-subtle text-xs mb-4">

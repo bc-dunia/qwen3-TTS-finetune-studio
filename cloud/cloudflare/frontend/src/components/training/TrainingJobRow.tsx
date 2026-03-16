@@ -157,7 +157,7 @@ export function TrainingJobRow({
     <article className={`rounded-lg border border-edge bg-surface ${compact ? 'p-3' : 'p-4'}`}>
       <div className="flex items-start justify-between gap-3">
         <div>
-          <div className="text-primary text-sm font-semibold">{voiceName ?? job.voice_id}</div>
+          <Link to={`/voices/${job.voice_id}/training`} className="text-primary text-sm font-semibold hover:text-accent transition-colors">{voiceName ?? job.voice_id}</Link>
           <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[10px] font-mono text-muted">
             <span>{job.job_id.slice(0, 12)}</span>
             <span>created={formatDateTime(job.created_at)}</span>

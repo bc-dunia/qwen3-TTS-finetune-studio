@@ -14,6 +14,7 @@ const NAV_ITEMS: NavItem[] = [
   { path: '/voices', label: 'Voices', icon: 'mic' },
   { path: '/playground', label: 'Playground', icon: 'play' },
   { path: '/queue', label: 'Queue', icon: 'queue' },
+  { path: '/statistics', label: 'Statistics', icon: 'chart' },
 ]
 
 export function Layout() {
@@ -195,6 +196,14 @@ function NavIcon({ name }: { name: string }) {
           <circle cx="4" cy="6" r="1" fill="currentColor" stroke="none" />
           <circle cx="4" cy="12" r="1" fill="currentColor" stroke="none" />
           <circle cx="4" cy="18" r="1" fill="currentColor" stroke="none" />
+        </svg>
+      )
+    case 'chart':
+      return (
+        <svg className={cls} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <rect x="3" y="12" width="4" height="9" rx="1" />
+          <rect x="10" y="7" width="4" height="14" rx="1" />
+          <rect x="17" y="3" width="4" height="18" rx="1" />
         </svg>
       )
     default:

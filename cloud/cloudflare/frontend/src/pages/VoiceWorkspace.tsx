@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from 'react'
-import { NavLink, Navigate, Outlet, useOutletContext, useParams } from 'react-router'
+import { useEffect, useState } from 'react'
+import { Link, NavLink, Navigate, Outlet, useOutletContext, useParams } from 'react-router'
 import { fetchVoice, type Voice } from '../lib/api'
+import { formatScore, scoreColor } from '../lib/voiceScoreUi'
 
 const TABS = [
   { to: 'generate', label: 'Generate' },
@@ -48,28 +49,44 @@ export function VoiceWorkspace() {
     }
   }, [voiceId])
 
-  const statusText = useMemo(() => {
-    if (!voice) return 'unknown'
-    return voice.status
-  }, [voice])
+  const statusText = voice?.status ?? 'unknown'
 
   return (
     <div className="space-y-5">
       <div className="rounded-xl border border-edge bg-raised px-5 py-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <p className="text-muted text-xs font-mono uppercase tracking-wider">Voice Workspace</p>
+            <Link to="/voices" className="text-muted text-xs font-mono uppercase tracking-wider hover:text-accent transition-colors">Voices</Link>
             <h1 className="mt-1 text-heading text-xl font-bold">
               {loading ? 'Loading voice...' : (voice?.name ?? 'Voice not found')}
             </h1>
           </div>
-          <span
-            className={`inline-flex items-center rounded-full px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider ${
-              getStatusClass(voice?.status ?? 'created')
-            }`}
-          >
-            {statusText}
-          </span>
+          <div className="flex flex-wrap items-center gap-2">
+            {voice?.model_size && (
+              <span className="rounded-full bg-surface px-2 py-0.5 text-[10px] font-mono text-muted">
+                {voice.model_size}
+              </span>
+            )}
+            {voice && typeof voice.checkpoint_score === 'number' && (
+              <span className={`text-sm font-bold font-mono ${scoreColor(voice.checkpoint_score)}`}>
+                {formatScore(voice.checkpoint_score)}
+                {voice.candidate_score != null &&
+                  Number.isFinite(voice.candidate_score) &&
+                  voice.checkpoint_score != null &&
+                  Number.isFinite(voice.checkpoint_score) &&
+                  voice.candidate_score > voice.checkpoint_score && (
+                  <span className="text-accent text-[9px] ml-0.5">+</span>
+                )}
+              </span>
+            )}
+            <span
+              className={`inline-flex items-center rounded-full px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider ${
+                getStatusClass(voice?.status ?? 'created')
+              }`}
+            >
+              {statusText}
+            </span>
+          </div>
         </div>
         <div className="mt-4 flex flex-wrap gap-2 border-t border-edge pt-4">
           {TABS.map((tab) => (

@@ -64,7 +64,6 @@ export function Dashboard() {
 
   const readyCount = voices.filter((v) => v.status === 'ready').length
   const trainingCount = voices.filter((v) => v.status === 'training').length
-  const createdCount = voices.filter((v) => v.status === 'created').length
   const voiceNames = useMemo(() => new Map(voices.map((v) => [v.voice_id, v.name])), [voices])
 
   return (
@@ -93,29 +92,34 @@ export function Dashboard() {
           label="Total Voices"
           value={loading ? '—' : String(voices.length)}
           loading={loading}
+          to="/voices"
         />
         <StatCard
           label="Ready"
           value={loading ? '—' : String(readyCount)}
           accent
           loading={loading}
+          to="/voices"
         />
         <StatCard
           label="Training"
           value={loading ? '—' : String(trainingCount)}
           warning={trainingCount > 0}
           loading={loading}
+          to="/queue"
         />
         <StatCard
           label="Active Jobs"
           value={loading ? '—' : String(activeJobs.length)}
           warning={activeJobs.length > 0}
           loading={loading}
+          to="/queue"
         />
         <StatCard
           label="Queued"
           value={loading ? '—' : String(queuedJobCount)}
           loading={loading}
+          to="/queue"
         />
       </div>
 
@@ -207,9 +211,9 @@ export function Dashboard() {
                     return (
                       <>
                   <div className="flex items-center justify-between mb-2">
-                    <span className="text-primary text-xs font-medium">
+                    <Link to={`/voices/${job.voice_id}/training`} className="text-primary text-xs font-medium hover:text-accent transition-colors">
                       {voiceNames.get(job.voice_id) ?? job.voice_id.slice(0, 8)} · {job.job_id.slice(0, 8)}
-                    </span>
+                    </Link>
                     <span className="text-warning text-[10px] font-mono uppercase">
                       {job.status}
                     </span>
@@ -243,7 +247,7 @@ export function Dashboard() {
         <QuickLink to="/voices" label="Manage Voices" icon="mic" />
         <QuickLink to="/playground" label="TTS Playground" icon="play" />
         <QuickLink to="/queue" label="Training Queue" icon="training" />
-        <QuickLink to="/voices" label="Create Voice" icon="plus" />
+        <QuickLink to="/statistics" label="Statistics" icon="chart" />
       </div>
     </div>
   )
@@ -389,23 +393,39 @@ function StatCard({
   accent,
   warning,
   loading,
+  to,
 }: {
   label: string
   value: string
   accent?: boolean
   warning?: boolean
   loading?: boolean
+  to?: string
 }) {
   let valueColor = 'text-heading'
   if (accent) valueColor = 'text-accent'
   if (warning) valueColor = 'text-warning'
 
-  return (
-    <div className="bg-raised border border-edge rounded-xl p-4">
+  const inner = (
+    <>
       <p className="text-muted text-[10px] font-mono uppercase tracking-widest mb-2">{label}</p>
       <p className={`text-3xl font-bold font-mono ${valueColor} ${loading ? 'animate-pulse' : ''}`}>
         {value}
       </p>
+    </>
+  )
+
+  if (to) {
+    return (
+      <Link to={to} className="bg-raised border border-edge rounded-xl p-4 hover:border-accent/30 transition-colors">
+        {inner}
+      </Link>
+    )
+  }
+
+  return (
+    <div className="bg-raised border border-edge rounded-xl p-4">
+      {inner}
     </div>
   )
 }
@@ -447,12 +467,13 @@ function QuickIcon({ name }: { name: string }) {
           <polyline points="22,12 18,12 15,21 9,3 6,12 2,12" />
         </svg>
       )
-    case 'plus':
+    case 'chart':
       return (
-        <svg className={cls} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-          <title>Add</title>
-          <line x1="12" y1="5" x2="12" y2="19" />
-          <line x1="5" y1="12" x2="19" y2="12" />
+        <svg className={cls} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <title>Statistics</title>
+          <rect x="3" y="12" width="4" height="9" rx="1" />
+          <rect x="10" y="7" width="4" height="14" rx="1" />
+          <rect x="17" y="3" width="4" height="18" rx="1" />
         </svg>
       )
     default:

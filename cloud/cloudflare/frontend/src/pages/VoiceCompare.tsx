@@ -720,7 +720,7 @@ export function VoiceCompare() {
     )
   }
 
-  if (error || !voice) {
+  if (!voice) {
     return (
       <div className="text-center py-16 space-y-4">
         <div className="text-error text-sm">{error || 'Voice not found'}</div>
@@ -737,40 +737,31 @@ export function VoiceCompare() {
 
   return (
     <div className="space-y-8">
-      <button
-        onClick={() => navigate(`/voices/${voice.voice_id}`)}
-        className="text-subtle text-sm hover:text-accent transition-colors inline-flex items-center gap-1"
-        type="button"
-      >
-        <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-          <polyline points="15 18 9 12 15 6" />
-        </svg>
-        Back to Voice
-      </button>
+      {error && (
+        <div className="rounded-lg border border-error/20 bg-error-dim px-3 py-2 text-sm text-error">{error}</div>
+      )}
 
-      <div className="flex flex-col gap-2">
-        <h1 className="text-heading text-2xl font-bold">Checkpoint Compare</h1>
-        <p className="text-subtle text-sm">
-          {voice.name} · listen to trusted, recommended, and rejected checkpoints side by side before accepting a new version.
-        </p>
-        <div className="flex flex-wrap gap-3 text-[11px] font-mono text-muted">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] font-mono text-muted">
           <span>trusted={voice.run_name ?? 'none'}</span>
           <span>epoch={typeof voice.epoch === 'number' ? voice.epoch : 'none'}</span>
           <span>cycle_runs={runSummaries.length}</span>
-          <span>candidate_checkpoints={candidates.length}</span>
-          {refreshing && <span>refreshing=on</span>}
-          {trainingResetAt !== null && <span>fresh_cycle=on</span>}
+          <span>checkpoints={candidates.length}</span>
+          {refreshing && <span>refreshing</span>}
+          {trainingResetAt !== null && <span>fresh_cycle</span>}
         </div>
-        <div className="pt-1">
-          <button
-            onClick={() => void loadData({ silent: true })}
-            className="inline-flex items-center rounded-lg border border-edge px-3 py-2 text-[11px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent"
-            type="button"
-          >
-            Refresh Compare Data
-          </button>
-        </div>
+        <button
+          onClick={() => void loadData({ silent: true })}
+          className="inline-flex items-center rounded-lg border border-edge px-3 py-1.5 text-[11px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent"
+          type="button"
+        >
+          Refresh
+        </button>
       </div>
+
+      <p className="text-subtle text-sm -mt-5">
+        Listen to trusted, recommended, and rejected checkpoints side by side before accepting a new version.
+      </p>
 
       {actionMessage && (
         <div className="rounded-lg border border-accent/20 bg-accent-dim px-4 py-3 text-accent text-sm">

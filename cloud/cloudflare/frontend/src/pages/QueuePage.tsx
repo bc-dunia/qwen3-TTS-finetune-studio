@@ -80,7 +80,10 @@ export function QueuePage() {
   const queuedJobs = useMemo(() => jobs.filter((job) => job.status === 'queued' || job.status === 'pending'), [jobs])
   const recentCompletedJobs = useMemo(() => (
     [...jobs]
-      .filter((job) => job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled')
+      .filter((job) =>
+        (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled') &&
+        !shouldWatchTrainingJob(job),
+      )
       .sort((a, b) => (b.updated_at ?? b.created_at) - (a.updated_at ?? a.created_at))
       .slice(0, 12)
   ), [jobs])
@@ -93,7 +96,7 @@ export function QueuePage() {
           <p className="text-subtle text-sm mt-1">Global training throughput across all voices.</p>
         </div>
         {stats && (
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-2">
             <div className="rounded-lg border border-edge bg-raised px-3 py-2 text-sm font-mono text-primary">
               {stats.active_workers}/{stats.max_workers} pods active
             </div>

@@ -537,29 +537,18 @@ export function VoiceDataset() {
 
   return (
     <div className="space-y-8">
-      <button
-        onClick={() => navigate(`/voices/${voice.voice_id}`)}
-        className="text-subtle text-sm hover:text-accent transition-colors inline-flex items-center gap-1"
-        type="button"
-      >
-        <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-          <polyline points="15 18 9 12 15 6" />
-        </svg>
-        Back to Voice
-      </button>
-
-      <div className="flex flex-col gap-2">
-        <h1 className="text-heading text-2xl font-bold">Dataset Studio</h1>
-        <p className="text-subtle text-sm">
-          {voice.name} · review raw uploads, clean transcripts, choose a reference clip, and create the finalized dataset used for training.
-        </p>
-        <div className="flex flex-wrap gap-3 text-[11px] font-mono text-muted">
+      <div className="flex flex-wrap items-center justify-between gap-3 -mt-2">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] font-mono text-muted">
           <span>raw_files={rows.length}</span>
           <span>selected={selectedRows.length}</span>
           <span>finalized={datasets.length}</span>
           <span>active_dataset={currentDatasetName ?? 'none'}</span>
         </div>
       </div>
+
+      <p className="text-subtle text-sm -mt-5">
+        Review raw uploads, clean transcripts, choose a reference clip, and create the finalized dataset used for training.
+      </p>
 
       {error && (
         <div className="rounded-lg border border-error/20 bg-error-dim px-4 py-3 text-error text-sm">

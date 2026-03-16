@@ -62,6 +62,7 @@ export function Voices() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [showCreate, setShowCreate] = useState(false)
+  const [filter, setFilter] = useState('')
 
   async function loadVoices() {
     setLoading(true)
@@ -133,13 +134,26 @@ export function Voices() {
         </div>
       )}
 
-      {/* Voice Grid */}
       {!loading && voices.length > 0 && (
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {voices.map((voice) => (
-            <VoiceCard key={voice.voice_id} voice={voice} />
-          ))}
-        </div>
+        <>
+          {voices.length > 5 && (
+            <div className="-mt-2">
+              <input
+                value={filter}
+                onChange={(e) => setFilter(e.target.value)}
+                placeholder="Filter voices by name..."
+                className="w-full max-w-xs rounded-lg border border-edge bg-surface px-3 py-2 text-sm text-primary placeholder:text-muted focus:border-accent transition-colors"
+              />
+            </div>
+          )}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {voices
+              .filter((voice) => voices.length <= 5 || !filter.trim() || voice.name.toLowerCase().includes(filter.trim().toLowerCase()))
+              .map((voice) => (
+                <VoiceCard key={voice.voice_id} voice={voice} />
+              ))}
+          </div>
+        </>
       )}
 
       {/* Empty State */}
