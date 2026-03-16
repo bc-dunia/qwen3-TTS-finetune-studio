@@ -5,6 +5,7 @@ import type {
   TrainingCheckoutTarget,
   TrainingJob,
 } from './api'
+import { readText, readNumber, parseRunNameFromCheckpointPrefix } from './training-domain'
 
 const ACTIVE_TRAINING_JOB_STATUSES = new Set([
   'queued',
@@ -17,23 +18,6 @@ const ACTIVE_TRAINING_JOB_STATUSES = new Set([
   'training',
   'uploading',
 ])
-
-function readText(value: unknown): string | null {
-  return typeof value === 'string' && value.trim() ? value.trim() : null
-}
-
-function readNumber(value: unknown): number | null {
-  const numeric = Number(value)
-  return Number.isFinite(numeric) ? numeric : null
-}
-
-function parseRunNameFromCheckpointPrefix(prefix: string): string | null {
-  const parts = prefix.split('/')
-  if (parts.length < 4 || parts[0] !== 'checkpoints') {
-    return null
-  }
-  return parts[2] || null
-}
 
 function buildTarget(input: {
   prefix: string | null

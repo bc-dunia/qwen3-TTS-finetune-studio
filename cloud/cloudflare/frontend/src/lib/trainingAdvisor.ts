@@ -1,5 +1,13 @@
 import type { TrainingAdvice, TrainingConfig, TrainingJob, Voice } from './api'
 import { getTrainingCheckoutSearch } from './trainingCheckout'
+import {
+  readNumber,
+  readText,
+  clamp,
+  getDefaultTrainingConfig,
+  sanitizeConfig,
+  pickAlternateSeed,
+} from './training-domain'
 
 type EvaluatedCheckpoint = {
   epoch: number
@@ -8,78 +16,8 @@ type EvaluatedCheckpoint = {
   message: string | null
 }
 
-function readNumber(value: unknown): number | null {
-  const numeric = Number(value)
-  return Number.isFinite(numeric) ? numeric : null
-}
-
-function readText(value: unknown): string | null {
-  return typeof value === 'string' && value.trim() ? value.trim() : null
-}
-
 function getCheckout(job: TrainingJob) {
   return getTrainingCheckoutSearch(job)
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value))
-}
-
-function getDefaultTrainingConfig(modelSize: string, language: string | undefined): TrainingConfig {
-  const whisperLanguage = (language ?? 'ko').trim() || 'ko'
-  if (modelSize.includes('0.6')) {
-    return {
-      model_size: '0.6B',
-      batch_size: 2,
-      num_epochs: 12,
-      learning_rate: 0.0000025,
-      gradient_accumulation_steps: 4,
-      subtalker_loss_weight: 0.3,
-      save_every_n_epochs: 1,
-      seed: 303,
-      whisper_language: whisperLanguage,
-      gpu_type_id: 'NVIDIA L40S',
-    }
-  }
-
-  return {
-    model_size: '1.7B',
-    batch_size: 2,
-    num_epochs: 15,
-    learning_rate: 0.00002,
-    gradient_accumulation_steps: 4,
-    subtalker_loss_weight: 0.3,
-    save_every_n_epochs: 5,
-    seed: 42,
-    whisper_language: whisperLanguage,
-    gpu_type_id: 'NVIDIA A100-SXM4-80GB',
-  }
-}
-
-function pickAlternateSeed(seed: number, modelSize: string): number {
-  const sequence = modelSize.includes('0.6') ? [303, 202, 77] : [808, 202, 42, 303]
-  const currentIndex = sequence.indexOf(seed)
-  if (currentIndex === -1) return sequence[0]
-  return sequence[(currentIndex + 1) % sequence.length]
-}
-
-function sanitizeConfig(source: Partial<TrainingConfig>, modelSize: string, language: string | undefined): TrainingConfig {
-  const defaults = getDefaultTrainingConfig(modelSize, language)
-  return {
-    model_size: modelSize,
-    batch_size: readNumber(source.batch_size) ?? defaults.batch_size,
-    num_epochs: readNumber(source.num_epochs) ?? defaults.num_epochs,
-    learning_rate: readNumber(source.learning_rate) ?? defaults.learning_rate,
-    gradient_accumulation_steps:
-      readNumber(source.gradient_accumulation_steps) ?? defaults.gradient_accumulation_steps,
-    subtalker_loss_weight:
-      readNumber(source.subtalker_loss_weight) ?? defaults.subtalker_loss_weight,
-    save_every_n_epochs:
-      readNumber(source.save_every_n_epochs) ?? defaults.save_every_n_epochs,
-    seed: readNumber(source.seed) ?? defaults.seed,
-    whisper_language: readText(source.whisper_language) ?? defaults.whisper_language,
-    gpu_type_id: defaults.gpu_type_id,
-  }
 }
 
 function getSelectedScore(job: TrainingJob): number | null {
