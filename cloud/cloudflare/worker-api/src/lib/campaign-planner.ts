@@ -63,6 +63,16 @@ interface SuccessAnchor {
   job_id: string;
 }
 
+interface NearMissSignal {
+  lr: number;
+  epochs: number;
+  subtalker: number;
+  seed: number;
+  bestSubScore: string;
+  bestSubValue: number;
+  failedGate: string;
+}
+
 // ---------------------------------------------------------------------------
 // Direction → Lane weight mapping
 // ---------------------------------------------------------------------------
@@ -107,6 +117,123 @@ function getFailureReason(job: TrainingJob): FailureCluster["reason"] {
   if (msg.includes("overall_score") || msg.includes("quality threshold")) return "overall";
   if (msg.includes("no audio") || msg.includes("stalled") || msg.includes("supply_constraint") || msg.includes("recovery")) return "infra";
   return "unknown";
+}
+
+function parseMessageKeyValues(message: string | null | undefined): Record<string, number> {
+  if (!message) return {};
+  const values: Record<string, number> = {};
+  const kvPattern = /([a-zA-Z_][a-zA-Z0-9_]*)=([^\s]+)/g;
+  for (const match of message.matchAll(kvPattern)) {
+    const key = match[1].toLowerCase();
+    const raw = match[2].replace(/[;,)]$/, "").trim();
+    const num = Number(raw);
+    if (Number.isFinite(num)) {
+      values[key] = num;
+    }
+  }
+  return values;
+}
+
+function metricGateThreshold(metric: string): number | null {
+  const key = metric.toLowerCase();
+  if (key === "speed" || key === "speed_score") return 0.2;
+  if (key === "asr" || key === "asr_score") return 0.8;
+  if (key === "tone" || key === "tone_score") return 0.4;
+  if (key === "overall" || key === "overall_score" || key === "score") return 0.85;
+  if (key === "speaker" || key === "speaker_score") return 0.75;
+  if (key === "health" || key === "health_score") return 0.72;
+  if (key === "duration" || key === "duration_score") return 0.45;
+  return null;
+}
+
+function normalizeMetricName(metric: string): string {
+  const key = metric.toLowerCase();
+  if (key.endsWith("_score")) return key.slice(0, -6);
+  return key;
+}
+
+function detectFailedGate(
+  message: string | null | undefined,
+  parsedValues: Record<string, number>,
+): string {
+  const msg = (message ?? "").toLowerCase();
+  const explicit = ["speed_score", "asr_score", "tone_score", "overall_score"].find((k) => msg.includes(k));
+  if (explicit) return normalizeMetricName(explicit);
+
+  const failed = Object.entries(parsedValues)
+    .map(([k, v]) => ({ key: normalizeMetricName(k), value: v, threshold: metricGateThreshold(k) }))
+    .filter((item) => item.threshold !== null && item.value < (item.threshold as number))
+    .sort((a, b) => a.value - b.value);
+  if (failed.length > 0) {
+    return failed[0].key;
+  }
+
+  if (msg.includes("speed")) return "speed";
+  if (msg.includes("asr")) return "asr";
+  if (msg.includes("tone")) return "tone";
+  if (msg.includes("overall") || msg.includes("quality")) return "overall";
+  return "unknown";
+}
+
+function pickBestSubScore(
+  parsedValues: Record<string, number>,
+  failedGate: string,
+): { metric: string; value: number } | null {
+  let best: { metric: string; value: number; margin: number } | null = null;
+  for (const [k, v] of Object.entries(parsedValues)) {
+    const threshold = metricGateThreshold(k);
+    if (threshold === null) continue;
+    const metric = normalizeMetricName(k);
+    if (metric === failedGate) continue;
+    const margin = v - threshold;
+    if (margin >= 0 && (!best || margin > best.margin)) {
+      best = { metric, value: v, margin };
+    }
+  }
+  return best ? { metric: best.metric, value: best.value } : null;
+}
+
+function summarizeCheckpointEvaluation(evaluation: { epoch: number; ok: boolean; score: number; message: string }): string {
+  if (evaluation.ok) {
+    return `e${evaluation.epoch}=${evaluation.score.toFixed(3)}✓`;
+  }
+  const parsed = parseMessageKeyValues(evaluation.message);
+  const failedGate = detectFailedGate(evaluation.message, parsed);
+  const metricCandidates = [
+    failedGate,
+    `${failedGate}_score`,
+    "speed_score",
+    "asr_score",
+    "tone_score",
+    "overall_score",
+    "speed",
+    "asr",
+    "tone",
+    "overall",
+    "score",
+  ];
+  let metricValue: number | null = null;
+  let metricLabel = failedGate;
+  for (const key of metricCandidates) {
+    if (typeof parsed[key] === "number") {
+      metricValue = parsed[key];
+      metricLabel = normalizeMetricName(key);
+      break;
+    }
+  }
+  if (metricValue !== null && metricLabel !== "unknown") {
+    return `e${evaluation.epoch}=${metricLabel}:${metricValue.toFixed(3)}✗`;
+  }
+  return `e${evaluation.epoch}=${evaluation.score.toFixed(3)}✗`;
+}
+
+function parseFamilyKey(familyKey: string): { lr: number; epochs: number; subtalker: number } | null {
+  const [lrRaw, epochsRaw, subtalkerRaw] = familyKey.split("|");
+  const lr = Number(lrRaw);
+  const epochs = Number(epochsRaw);
+  const subtalker = Number(subtalkerRaw);
+  if (!Number.isFinite(lr) || !Number.isFinite(epochs) || !Number.isFinite(subtalker)) return null;
+  return { lr, epochs, subtalker };
 }
 
 function configDistance(a: { lr: number; epochs: number; subtalker: number }, b: { lr: number; epochs: number; subtalker: number }): { lr_pct: number; epochs_abs: number; subtalker_abs: number } {
@@ -173,6 +300,7 @@ function analyzeHistory(voice: Voice, allVoiceJobs: TrainingJob[]): {
   phase: CampaignPhase;
   familyStats: Map<string, { completed: number; active: number; passes: number; failures: number }>;
   blockedFamilies: Set<string>;
+  nearMissSignals: NearMissSignal[];
 } {
   const is06b = voice.model_size.includes("0.6");
   const passThreshold = is06b ? 0.82 : 0.85;
@@ -188,6 +316,7 @@ function analyzeHistory(voice: Voice, allVoiceJobs: TrainingJob[]): {
 
   const successAnchors: SuccessAnchor[] = [];
   const nearPassAnchors: SuccessAnchor[] = [];
+  const nearMissSignals: NearMissSignal[] = [];
   const failureMap = new Map<FailureCluster["reason"], FailureCluster>();
   const familyStats = new Map<string, { completed: number; active: number; passes: number; failures: number }>();
 
@@ -234,8 +363,27 @@ function analyzeHistory(voice: Voice, allVoiceJobs: TrainingJob[]): {
       cluster.count++;
       cluster.configs.push({ lr, epochs, subtalker, seed });
       family.failures++;
+
+      for (const evaluation of cs.evaluated) {
+        if (evaluation.ok) continue;
+        const parsed = parseMessageKeyValues(evaluation.message);
+        const failedGate = detectFailedGate(evaluation.message, parsed);
+        const bestSub = pickBestSubScore(parsed, failedGate);
+        if (!bestSub) continue;
+        nearMissSignals.push({
+          lr,
+          epochs,
+          subtalker,
+          seed,
+          bestSubScore: bestSub.metric,
+          bestSubValue: bestSub.value,
+          failedGate,
+        });
+      }
     }
   }
+
+  nearMissSignals.sort((a, b) => b.bestSubValue - a.bestSubValue);
 
   successAnchors.sort((a, b) => b.score - a.score);
   nearPassAnchors.sort((a, b) => b.score - a.score);
@@ -283,7 +431,7 @@ function analyzeHistory(voice: Voice, allVoiceJobs: TrainingJob[]): {
     phase = "bootstrap";
   }
 
-  return { successAnchors, nearPassAnchors, failureClusters: failureMap, dominantFailure, bestScore, phase, familyStats, blockedFamilies };
+  return { successAnchors, nearPassAnchors, failureClusters: failureMap, dominantFailure, bestScore, phase, familyStats, blockedFamilies, nearMissSignals };
 }
 
 // ---------------------------------------------------------------------------
@@ -582,7 +730,7 @@ export function planCampaignAttempts(
   const direction: CampaignDirection =
     (campaign.planner_state?.direction as CampaignDirection) ?? "balanced";
 
-  const { successAnchors, nearPassAnchors, failureClusters, dominantFailure, bestScore, phase, familyStats, blockedFamilies } =
+  const { successAnchors, nearPassAnchors, failureClusters, dominantFailure, bestScore, phase, familyStats, blockedFamilies, nearMissSignals } =
     analyzeHistory(voice, allVoiceJobs);
 
   // Infeasibility stop for 0.6B
@@ -729,6 +877,7 @@ export function planCampaignAttempts(
       family_stats: Object.fromEntries(
         [...familyStats.entries()].map(([k, v]) => [k, v]),
       ),
+      near_miss_signals: nearMissSignals,
       updated_at: Date.now(),
     },
   };
@@ -759,6 +908,29 @@ export function buildLLMPlannerPrompt(input: LLMPlannerInput): string {
   const completedJobs = allVoiceJobs
     .filter((j) => j.status === "completed" || j.status === "failed" || j.status === "cancelled")
     .sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+  const activeJobs = allVoiceJobs
+    .filter((j) => j.status !== "completed" && j.status !== "failed" && j.status !== "cancelled")
+    .sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+
+  const blockedFamilies = Array.isArray(heuristicResult.state_patch.blocked_families)
+    ? heuristicResult.state_patch.blocked_families.filter((value): value is string => typeof value === "string")
+    : [];
+  const familyStatsRecord = (heuristicResult.state_patch.family_stats && typeof heuristicResult.state_patch.family_stats === "object")
+    ? (heuristicResult.state_patch.family_stats as Record<string, { failures?: number }>)
+    : {};
+  const nearMissSignals = Array.isArray(heuristicResult.state_patch.near_miss_signals)
+    ? heuristicResult.state_patch.near_miss_signals.filter((value): value is NearMissSignal => {
+      if (!value || typeof value !== "object") return false;
+      const entry = value as Record<string, unknown>;
+      return typeof entry.lr === "number"
+        && typeof entry.epochs === "number"
+        && typeof entry.subtalker === "number"
+        && typeof entry.seed === "number"
+        && typeof entry.bestSubScore === "string"
+        && typeof entry.bestSubValue === "number"
+        && typeof entry.failedGate === "string";
+    })
+    : [];
 
   const lines: string[] = [];
 
@@ -807,6 +979,17 @@ export function buildLLMPlannerPrompt(input: LLMPlannerInput): string {
   }
   lines.push("");
 
+  lines.push("## Active Runs (do NOT suggest similar configs)");
+  if (activeJobs.length === 0) {
+    lines.push("None.");
+  } else {
+    for (const j of activeJobs.slice(0, 10)) {
+      const c = j.config;
+      lines.push(`  lr=${c.learning_rate} ep=${c.num_epochs} sub=${c.subtalker_loss_weight} seed=${c.seed} (${j.status})`);
+    }
+  }
+  lines.push("");
+
   // Failure clusters
   lines.push("## Failure Clusters (grouped by reason)");
   const failMap = new Map<string, number>();
@@ -820,20 +1003,74 @@ export function buildLLMPlannerPrompt(input: LLMPlannerInput): string {
   lines.push(`Dominant failure: ${anchors.dominant_failure ?? "none"}`);
   lines.push("");
 
+  lines.push("## Blocked Config Families (>=3 failures, 0 passes — DO NOT USE)");
+  if (blockedFamilies.length === 0) {
+    lines.push("None.");
+  } else {
+    const familyFailureReasonCounts = new Map<string, Map<string, number>>();
+    for (const j of completedJobs.filter((job) => getCheckout(job).status === "rejected" || job.status === "failed")) {
+      const c = j.config;
+      const fk = configFamilyKey(
+        readNum(c.learning_rate) ?? 0,
+        readNum(c.num_epochs) ?? 0,
+        readNum(c.subtalker_loss_weight) ?? 0,
+      );
+      if (!blockedFamilies.includes(fk)) continue;
+      if (!familyFailureReasonCounts.has(fk)) {
+        familyFailureReasonCounts.set(fk, new Map<string, number>());
+      }
+      const reason = getFailureReason(j);
+      const reasonMap = familyFailureReasonCounts.get(fk)!;
+      reasonMap.set(reason, (reasonMap.get(reason) ?? 0) + 1);
+    }
+
+    for (const familyKey of blockedFamilies.slice(0, 5)) {
+      const parsed = parseFamilyKey(familyKey);
+      if (!parsed) continue;
+      const failCount = familyStatsRecord[familyKey]?.failures ?? 0;
+      const reasonMap = familyFailureReasonCounts.get(familyKey);
+      const reasonParts = reasonMap
+        ? [...reasonMap.entries()]
+          .sort(([, a], [, b]) => b - a)
+          .map(([reason, count]) => `${reason}=${count}`)
+          .join(", ")
+        : "unknown=0";
+      lines.push(`  lr=${parsed.lr.toExponential(2)} ep=${parsed.epochs} sub=${parsed.subtalker.toFixed(2)}: ${failCount} failures (${reasonParts})`);
+    }
+  }
+  lines.push("");
+
+  lines.push("## Near-Miss Signals (interesting sub-components from failed runs)");
+  if (nearMissSignals.length === 0) {
+    lines.push("None.");
+  } else {
+    for (const [idx, signal] of nearMissSignals.slice(0, 12).entries()) {
+      lines.push(`  #${idx + 1} lr=${signal.lr.toExponential(2)} ep=${signal.epochs} sub=${signal.subtalker.toFixed(2)} seed=${signal.seed}: ${signal.bestSubScore}=${signal.bestSubValue.toFixed(3)} (passed gate), but ${signal.failedGate} failed`);
+    }
+  }
+  lines.push("");
+
   // Recent 10 runs (detailed)
   lines.push("## Recent 10 Runs (most recent first)");
   for (const j of completedJobs.slice(0, 10)) {
     const c = j.config;
     const cs = getCheckout(j);
     const score = getScore(j);
-    const reason = cs.status === "rejected" ? getFailureReason(j) : null;
+    const reason = cs.validation_passed ? "none" : getFailureReason(j);
     const bestEpoch = cs.selected?.epoch ?? cs.champion?.epoch ?? null;
     const maxEpoch = cs.evaluated.length > 0 ? Math.max(...cs.evaluated.map((e) => e.epoch)) : null;
     const peakTiming = bestEpoch !== null && maxEpoch !== null
       ? bestEpoch <= maxEpoch * 0.4 ? "early" : bestEpoch <= maxEpoch * 0.7 ? "mid" : "late"
       : null;
 
-    lines.push(`  [${cs.validation_passed ? "PASS" : cs.status === "rejected" ? "REJECT" : "FAIL"}] score=${score?.toFixed(3) ?? "n/a"} lr=${c.learning_rate} ep=${c.num_epochs} sub=${c.subtalker_loss_weight} seed=${c.seed}${reason ? ` fail=${reason}` : ""}${peakTiming ? ` peak=${peakTiming}` : ""}`);
+    lines.push(`  [${cs.validation_passed ? "PASS" : cs.status === "rejected" ? "REJECT" : "FAIL"}] score=${score?.toFixed(3) ?? "n/a"} lr=${c.learning_rate} ep=${c.num_epochs} sub=${c.subtalker_loss_weight} seed=${c.seed} fail=${reason}${peakTiming ? ` peak=${peakTiming}` : ""}`);
+    if (cs.evaluated.length > 0) {
+      const checkpoints = [...cs.evaluated]
+        .sort((a, b) => a.epoch - b.epoch)
+        .map((evaluation) => summarizeCheckpointEvaluation(evaluation))
+        .join(" ");
+      lines.push(`    checkpoints: ${checkpoints}`);
+    }
   }
   lines.push("");
 
@@ -869,9 +1106,10 @@ Your job: analyze ALL training history and generate the next batch of hyperparam
 
 ## Speed Failures (most common)
 Speed failures mean the model drifts from the speaker's natural pace. Fix with:
-- Step 1: LR ×0.75, subtalker −0.04
-- Step 2: LR ×0.65, subtalker −0.08
-- Step 3: LR ×0.55, subtalker −0.12
+- Step 1: epochs −1, LR ×1.00, subtalker unchanged (shorter training)
+- Step 2: epochs −1, LR ×0.92, subtalker −0.02
+- Step 3: epochs −2, LR ×0.85, subtalker −0.02
+- Step 4: epochs −2, LR ×0.78, subtalker −0.04
 
 ## Response Format (STRICT JSON)
 {
