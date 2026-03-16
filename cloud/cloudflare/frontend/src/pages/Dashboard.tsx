@@ -156,7 +156,7 @@ export function Dashboard() {
         <div className="bg-raised border border-edge rounded-xl p-5">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-heading font-semibold text-sm">Active Training</h2>
-            <Link to="/training" className="text-accent text-xs hover:text-accent-light">
+            <Link to="/queue" className="text-accent text-xs hover:text-accent-light">
               Manage →
             </Link>
           </div>
@@ -165,10 +165,10 @@ export function Dashboard() {
             <div className="text-center py-8">
               <div className="text-muted text-sm">No active training jobs</div>
               <Link
-                to="/training"
+                to="/queue"
                 className="text-accent text-xs mt-2 inline-block hover:text-accent-light"
               >
-                Start Training →
+                View Queue →
               </Link>
             </div>
           ) : (
@@ -218,7 +218,7 @@ export function Dashboard() {
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
         <QuickLink to="/voices" label="Manage Voices" icon="mic" />
         <QuickLink to="/playground" label="TTS Playground" icon="play" />
-        <QuickLink to="/training" label="Training Jobs" icon="training" />
+        <QuickLink to="/queue" label="Training Queue" icon="training" />
         <QuickLink to="/voices" label="Create Voice" icon="plus" />
       </div>
     </div>

@@ -790,6 +790,42 @@ export async function fetchTrainingJobs(
   return request<{ jobs: TrainingJob[] }>(path)
 }
 
+export async function fetchAllTrainingJobs(limit = 100): Promise<{ jobs: TrainingJob[] }> {
+  return fetchTrainingJobs(undefined, limit)
+}
+
+export async function fetchQueueStats(): Promise<{
+  active_workers: number
+  max_workers: number
+  active_jobs: number
+  queued_jobs: number
+  running_jobs: number
+}> {
+  const jobsResponse = await fetchAllTrainingJobs(200)
+  const activeStatuses = new Set([
+    'pending',
+    'running',
+    'provisioning',
+    'downloading',
+    'preprocessing',
+    'preparing',
+    'training',
+    'uploading',
+  ])
+  const runningJobs = jobsResponse.jobs.filter((job) => activeStatuses.has(job.status)).length
+  const queuedJobs = jobsResponse.jobs.filter((job) => job.status === 'queued').length
+  const activeWorkers = runningJobs
+  const maxWorkers = Math.max(activeWorkers, 3)
+
+  return {
+    active_workers: activeWorkers,
+    max_workers: maxWorkers,
+    active_jobs: runningJobs + queuedJobs,
+    queued_jobs: queuedJobs,
+    running_jobs: runningJobs,
+  }
+}
+
 export async function fetchTrainingRounds(
   voiceId?: string,
   limit = 20,

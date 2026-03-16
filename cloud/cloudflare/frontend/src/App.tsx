@@ -1,4 +1,4 @@
-import { Routes, Route } from 'react-router'
+import { Routes, Route, Navigate } from 'react-router'
 import { Layout } from './components/Layout'
 import { Dashboard } from './pages/Dashboard'
 import { Voices } from './pages/Voices'
@@ -6,7 +6,9 @@ import { VoiceDetail } from './pages/VoiceDetail'
 import { VoiceCompare } from './pages/VoiceCompare'
 import { VoiceDataset } from './pages/VoiceDataset'
 import { Playground } from './pages/Playground'
-import { Training } from './pages/Training'
+import { VoiceWorkspace } from './pages/VoiceWorkspace'
+import { VoiceTrainingTab } from './pages/VoiceTrainingTab'
+import { QueuePage } from './pages/QueuePage'
 
 export function App() {
   return (
@@ -14,11 +16,16 @@ export function App() {
       <Route element={<Layout />}>
         <Route index element={<Dashboard />} />
         <Route path="voices" element={<Voices />} />
-        <Route path="voices/:voiceId" element={<VoiceDetail />} />
-        <Route path="voices/:voiceId/dataset" element={<VoiceDataset />} />
-        <Route path="voices/:voiceId/compare" element={<VoiceCompare />} />
+        <Route path="voices/:voiceId" element={<VoiceWorkspace />}>
+          <Route index element={<Navigate to="generate" replace />} />
+          <Route path="generate" element={<VoiceDetail />} />
+          <Route path="training" element={<VoiceTrainingTab />} />
+          <Route path="dataset" element={<VoiceDataset />} />
+          <Route path="compare" element={<VoiceCompare />} />
+        </Route>
         <Route path="playground" element={<Playground />} />
-        <Route path="training" element={<Training />} />
+        <Route path="queue" element={<QueuePage />} />
+        <Route path="training" element={<Navigate to="/queue" replace />} />
       </Route>
     </Routes>
   )

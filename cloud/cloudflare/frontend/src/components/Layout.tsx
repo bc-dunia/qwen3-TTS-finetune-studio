@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { Outlet, NavLink, useLocation } from 'react-router'
+import { useTheme } from '../hooks/useTheme'
 
 interface NavItem {
   path: string
@@ -12,12 +13,13 @@ const NAV_ITEMS: NavItem[] = [
   { path: '/', label: 'Dashboard', icon: 'dashboard', end: true },
   { path: '/voices', label: 'Voices', icon: 'mic' },
   { path: '/playground', label: 'Playground', icon: 'play' },
-  { path: '/training', label: 'Training', icon: 'training' },
+  { path: '/queue', label: 'Queue', icon: 'queue' },
 ]
 
 export function Layout() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const location = useLocation()
+  const { theme, effectiveTheme, toggleTheme } = useTheme()
 
   useEffect(() => {
     setSidebarOpen(false)
@@ -90,15 +92,33 @@ export function Layout() {
         </nav>
 
         {/* Deployment status */}
-        <div className="px-4 py-4 border-t border-edge">
-          <label className="text-muted text-[10px] font-mono uppercase tracking-widest mb-2 block">
-            Access
-          </label>
-          <div className="mt-2.5 flex items-center gap-2">
-            <div className="w-1.5 h-1.5 rounded-full bg-accent shadow-[0_0_6px_rgba(16,185,129,0.5)]" />
-            <span className="text-muted text-[10px] font-mono tracking-wider">
-              PUBLIC MODE
+        <div className="px-4 py-4 border-t border-edge space-y-3">
+          <button
+            type="button"
+            onClick={toggleTheme}
+            className="w-full inline-flex items-center justify-between rounded-lg border border-edge bg-raised px-3 py-2 text-xs font-semibold text-primary hover:border-accent hover:text-accent"
+            title={`Theme: ${theme}`}
+          >
+            <span className="inline-flex items-center gap-2">
+              {effectiveTheme === 'light' ? (
+                <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <circle cx="12" cy="12" r="4" />
+                  <path d="M12 2v2m0 16v2m10-10h-2M4 12H2m16.95 6.95-1.4-1.4M6.45 6.45l-1.4-1.4m0 13.9 1.4-1.4m11.1-11.1 1.4-1.4" />
+                </svg>
+              ) : (
+                <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M21 12.79A9 9 0 1 1 11.21 3c0 0 0 0 0 0a7 7 0 1 0 9.79 9.79z" />
+                </svg>
+              )}
+              <span>Theme</span>
             </span>
+            <span className="text-[10px] font-mono uppercase tracking-wider text-muted">{theme}</span>
+          </button>
+
+          <label className="text-muted text-[10px] font-mono uppercase tracking-widest mb-2 block">Access</label>
+          <div className="mt-2.5 flex items-center gap-2">
+            <div className="w-1.5 h-1.5 rounded-full bg-accent" />
+            <span className="text-muted text-[10px] font-mono tracking-wider">PUBLIC MODE</span>
           </div>
           <p className="mt-2 text-[11px] text-subtle">
             This deployment no longer requires entering an API key in the UI.
@@ -166,10 +186,15 @@ function NavIcon({ name }: { name: string }) {
           <path d="M8 5.14v14.72a1 1 0 0 0 1.5.86l11.24-7.36a1 1 0 0 0 0-1.72L9.5 4.28A1 1 0 0 0 8 5.14z" />
         </svg>
       )
-    case 'training':
+    case 'queue':
       return (
         <svg className={cls} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <polyline points="22,12 18,12 15,21 9,3 6,12 2,12" />
+          <line x1="8" y1="6" x2="21" y2="6" />
+          <line x1="8" y1="12" x2="21" y2="12" />
+          <line x1="8" y1="18" x2="21" y2="18" />
+          <circle cx="4" cy="6" r="1" fill="currentColor" stroke="none" />
+          <circle cx="4" cy="12" r="1" fill="currentColor" stroke="none" />
+          <circle cx="4" cy="18" r="1" fill="currentColor" stroke="none" />
         </svg>
       )
     default:

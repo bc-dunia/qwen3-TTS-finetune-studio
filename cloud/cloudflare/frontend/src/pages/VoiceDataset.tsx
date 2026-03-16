@@ -95,13 +95,12 @@ function chunkArray<T>(items: T[], size: number): T[][] {
 
 function encodeTrainingQuery(voiceId: string, datasetName?: string): string {
   const params = new URLSearchParams({
-    voiceId,
     recommended: '1',
   })
   if (datasetName) {
     params.set('datasetName', datasetName)
   }
-  return `/training?${params.toString()}`
+  return `/voices/${voiceId}/training?${params.toString()}`
 }
 
 export function VoiceDataset() {

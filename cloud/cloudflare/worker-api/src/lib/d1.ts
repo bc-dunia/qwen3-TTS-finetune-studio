@@ -727,6 +727,17 @@ export const listTrainingJobs = async (
   return (result.results ?? []).map(mapTrainingJob);
 };
 
+export const countActiveTrainingJobs = async (
+  db: D1Database,
+  statusList: string[]
+): Promise<number> => {
+  if (statusList.length === 0) return 0;
+  const placeholders = statusList.map(() => "?").join(", ");
+  const sql = `SELECT COUNT(*) as cnt FROM training_jobs WHERE status IN (${placeholders})`;
+  const result = await db.prepare(sql).bind(...statusList).first<{ cnt: number }>();
+  return result?.cnt ?? 0;
+};
+
 export const createTrainingJob = async (db: D1Database, job: TrainingJob): Promise<void> => {
   await db
     .prepare(

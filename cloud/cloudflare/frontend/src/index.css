@@ -1,21 +1,68 @@
 @import "tailwindcss";
 
+:root {
+  --app-color-void: #0a0a0f;
+  --app-color-surface: #12121a;
+  --app-color-raised: #1a1a26;
+  --app-color-elevated: #22222e;
+  --app-color-edge: #2a2a38;
+  --app-color-muted: #6b6b80;
+  --app-color-subtle: #9b9bab;
+  --app-color-primary: #e4e4ed;
+  --app-color-heading: #f0f0f6;
+  --app-color-accent: #10b981;
+  --app-color-accent-light: #34d399;
+  --app-color-accent-dim: #10b98126;
+}
+
+[data-theme="light"] {
+  --app-color-void: #f8f9fa;
+  --app-color-surface: #ffffff;
+  --app-color-raised: #f1f3f5;
+  --app-color-elevated: #e9ecef;
+  --app-color-edge: #dee2e6;
+  --app-color-muted: #868e96;
+  --app-color-subtle: #495057;
+  --app-color-primary: #212529;
+  --app-color-heading: #000000;
+  --app-color-accent: #059669;
+  --app-color-accent-light: #10b981;
+  --app-color-accent-dim: #05966926;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --app-color-void: #f8f9fa;
+    --app-color-surface: #ffffff;
+    --app-color-raised: #f1f3f5;
+    --app-color-elevated: #e9ecef;
+    --app-color-edge: #dee2e6;
+    --app-color-muted: #868e96;
+    --app-color-subtle: #495057;
+    --app-color-primary: #212529;
+    --app-color-heading: #000000;
+    --app-color-accent: #059669;
+    --app-color-accent-light: #10b981;
+    --app-color-accent-dim: #05966926;
+  }
+}
+
 @theme {
   --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, monospace;
 
-  --color-void: #0a0a0f;
-  --color-surface: #12121a;
-  --color-raised: #1a1a26;
-  --color-elevated: #22222e;
-  --color-edge: #2a2a38;
-  --color-muted: #6b6b80;
-  --color-subtle: #9b9bab;
-  --color-primary: #e4e4ed;
-  --color-heading: #f0f0f6;
-  --color-accent: #10b981;
-  --color-accent-light: #34d399;
-  --color-accent-dim: #10b98126;
+  --color-void: var(--app-color-void);
+  --color-surface: var(--app-color-surface);
+  --color-raised: var(--app-color-raised);
+  --color-elevated: var(--app-color-elevated);
+  --color-edge: var(--app-color-edge);
+  --color-muted: var(--app-color-muted);
+  --color-subtle: var(--app-color-subtle);
+  --color-primary: var(--app-color-primary);
+  --color-heading: var(--app-color-heading);
+  --color-accent: var(--app-color-accent);
+  --color-accent-light: var(--app-color-accent-light);
+  --color-accent-dim: var(--app-color-accent-dim);
   --color-warning: #f59e0b;
   --color-warning-dim: #f59e0b20;
   --color-error: #ef4444;

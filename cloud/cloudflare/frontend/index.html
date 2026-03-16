@@ -13,6 +13,9 @@
     />
   </head>
   <body>
+    <script>
+      (function(){var t=localStorage.getItem('theme-preference');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t})()
+    </script>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

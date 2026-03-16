@@ -19,6 +19,7 @@ import {
   getTrainingRound,
   getVoice,
   listTrainingJobs,
+  countActiveTrainingJobs,
   listTrainingCampaigns,
   listTrainingLogChunks,
   listTrainingCheckoutLedger,
@@ -262,6 +263,7 @@ const MAX_STALL_RECOVERY_ATTEMPTS = 3;
 const DEFAULT_WORKER_PUBLIC_URL = "https://qwen-tts-api.brian-367.workers.dev";
 const TRAINING_SWEEP_LIMIT = 100;
 const DEFAULT_MAX_ACTIVE_TRAINING_JOBS_PER_VOICE = 3;
+const DEFAULT_MAX_ACTIVE_TRAINING_JOBS_GLOBAL = 3;
 const DEFAULT_TRAINING_IMAGE_FALLBACKS = [
   "ghcr.io/bc-dunia/qwen3-tts-training@sha256:fd32cc16f8febc7ce23a08eea38b9b62beaa7819139895e241a8bdddb6bf2357",
 ];
@@ -1553,6 +1555,18 @@ const getMaxActiveTrainingJobsPerVoice = (c: Context<AppContext>): number => {
   return Math.max(1, Math.min(Math.trunc(raw), 6));
 };
 
+const getMaxActiveTrainingJobsGlobal = (c: Context<AppContext>): number => {
+  const raw = Number((c.env as unknown as Record<string, unknown>).TRAINING_MAX_ACTIVE_JOBS_GLOBAL ?? DEFAULT_MAX_ACTIVE_TRAINING_JOBS_GLOBAL);
+  if (!Number.isFinite(raw)) {
+    return DEFAULT_MAX_ACTIVE_TRAINING_JOBS_GLOBAL;
+  }
+  return Math.max(1, Math.min(Math.trunc(raw), 10));
+};
+
+const countGlobalActiveTrainingJobs = async (c: Context<AppContext>): Promise<number> => {
+  return countActiveTrainingJobs(c.env.DB, [...ACTIVE_JOB_STATUSES]);
+};
+
 const isGpuSupplyConstraintErrorMessage = (message: string | null | undefined): boolean => {
   const normalized = String(message ?? "").toLowerCase();
   return normalized.includes("no longer any instances available") || normalized.includes("supply_constraint");
@@ -1799,16 +1813,22 @@ const launchQueuedTrainingJobsForVoice = async (
     return 0;
   }
 
-  const activeLimit = getMaxActiveTrainingJobsPerVoice(c);
-  let activeCount = jobs.filter((job) => ACTIVE_JOB_STATUSES.has(job.status)).length;
-  if (activeCount >= activeLimit) {
+  const voiceActiveLimit = getMaxActiveTrainingJobsPerVoice(c);
+  let voiceActiveCount = jobs.filter((job) => ACTIVE_JOB_STATUSES.has(job.status)).length;
+  if (voiceActiveCount >= voiceActiveLimit) {
+    return 0;
+  }
+
+  const globalActiveLimit = getMaxActiveTrainingJobsGlobal(c);
+  let globalActiveCount = await countGlobalActiveTrainingJobs(c);
+  if (globalActiveCount >= globalActiveLimit) {
     return 0;
   }
 
   let latestJobs = [...jobs];
   let launched = 0;
   for (const seedJob of jobs) {
-    if (activeCount >= activeLimit) {
+    if (voiceActiveCount >= voiceActiveLimit || globalActiveCount >= globalActiveLimit) {
       break;
     }
 
@@ -1837,7 +1857,8 @@ const launchQueuedTrainingJobsForVoice = async (
     const updated = await launchTrainingJob(c, job);
     if (ACTIVE_JOB_STATUSES.has(updated.status)) {
       launched += 1;
-      activeCount += 1;
+      voiceActiveCount += 1;
+      globalActiveCount += 1;
     }
 
     latestJobs = latestJobs.map((candidate) =>
@@ -2408,13 +2429,16 @@ const advanceTrainingCampaign = async (
   }
 
   const perVoiceActiveLimit = getMaxActiveTrainingJobsPerVoice(c);
+  const globalActiveLimit = getMaxActiveTrainingJobsGlobal(c);
   const parallelism = Math.max(1, Math.min(campaign.parallelism, perVoiceActiveLimit));
   const voiceJobs = await listTrainingJobs(c.env.DB, { voice_id: voice.voice_id, limit: 100 });
   const voiceActiveCount = voiceJobs.filter((job) => ACTIVE_JOB_STATUSES.has(job.status)).length;
+  const globalActiveCount = await countGlobalActiveTrainingJobs(c);
   const campaignOpenSlots = Math.max(0, parallelism - inflightJobs.length);
   const voiceOpenSlots = Math.max(0, perVoiceActiveLimit - voiceActiveCount);
+  const globalOpenSlots = Math.max(0, globalActiveLimit - globalActiveCount);
   const remainingAttempts = Math.max(0, campaign.attempt_count - createdAttempts);
-  const attemptsToCreate = Math.min(campaignOpenSlots, voiceOpenSlots, remainingAttempts);
+  const attemptsToCreate = Math.min(campaignOpenSlots, voiceOpenSlots, globalOpenSlots, remainingAttempts);
 
   let nextAttemptIndex = createdAttempts + 1;
 
