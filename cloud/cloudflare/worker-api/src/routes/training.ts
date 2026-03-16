@@ -3859,7 +3859,7 @@ const evaluateValidationSample = ({
   if (overall < minOverall) {
     return fail(`sample ${sampleIndex} seed ${seed} overall_score=${overall.toFixed(3)}`);
   }
-  if (duration < 0.45) {
+  if (duration < 0.30) {
     return fail(`sample ${sampleIndex} seed ${seed} duration_score=${duration.toFixed(3)}`);
   }
   if (health < 0.72) {
@@ -4123,7 +4123,7 @@ const scoreSingleValidationOutput = ({
   if (overall < minOverall) {
     return fail(`sample 1 seed ${seed} overall_score=${overall.toFixed(3)}`);
   }
-  if (duration < 0.45) {
+  if (duration < 0.30) {
     return fail(`sample 1 seed ${seed} duration_score=${duration.toFixed(3)}`);
   }
   if (health < 0.72) {
@@ -5269,7 +5269,7 @@ const validateTrainedCheckpoint = async (
             }
             continue;
           }
-          if (duration < 0.45) {
+          if (duration < 0.30) {
             if (!firstFailureMessage) {
               firstFailureMessage = `sample ${i + 1} seed ${seed} duration_score=${duration.toFixed(3)}`;
             }

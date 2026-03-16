@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
   fetchAllTrainingJobs,
-  fetchQueueStats,
   fetchVoices,
   type TrainingJob,
   type Voice,
@@ -31,15 +30,17 @@ export function QueuePage() {
       setLoading(true)
       setError('')
       try {
-        const [jobsResponse, voicesResponse, queueStats] = await Promise.all([
+        const [jobsResponse, voicesResponse] = await Promise.all([
           fetchAllTrainingJobs(200),
           fetchVoices(),
-          fetchQueueStats(),
         ])
         if (cancelled) return
         setJobs(jobsResponse.jobs)
         setVoices(voicesResponse.voices)
-        setStats(queueStats)
+        const activeStatuses = new Set(['running', 'provisioning', 'downloading', 'preprocessing', 'preparing', 'training', 'uploading'])
+        const running = jobsResponse.jobs.filter((j) => activeStatuses.has(j.status)).length
+        const queued = jobsResponse.jobs.filter((j) => j.status === 'queued' || j.status === 'pending').length
+        setStats({ active_workers: running, max_workers: Math.max(running, 3), active_jobs: running + queued, queued_jobs: queued, running_jobs: running })
       } catch (loadError) {
         if (!cancelled) {
           setError(loadError instanceof Error ? loadError.message : 'Failed to load queue')

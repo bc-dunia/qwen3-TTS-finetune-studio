@@ -433,7 +433,7 @@ function analyzeHistory(voice: Voice, allVoiceJobs: TrainingJob[]): {
   }
 
   const allAttemptedConfigs: Array<{ lr: number; epochs: number; subtalker: number }> = [];
-  for (const job of [...completedJobs, ...activeJobs]) {
+  for (const job of [...completedJobs, ...activeJobs].sort((a, b) => (a.created_at || 0) - (b.created_at || 0))) {
     const cfg = job.config;
     const lr = readNum(cfg.learning_rate) ?? 0;
     const epochs = readNum(cfg.num_epochs) ?? 0;
