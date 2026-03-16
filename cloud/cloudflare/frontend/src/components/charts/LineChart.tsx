@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import { computeNiceDomain, precisionForStep, type NiceDomainOptions } from './chartDomain'
 
 interface LineChartProps {
   data: { label: string; series: { name: string; color: string; values: (number | null)[] }[] }
@@ -7,6 +8,7 @@ interface LineChartProps {
   yMax?: number
   yLabel?: string
   xLabel?: string
+  domainOptions?: NiceDomainOptions
 }
 
 type Point = { x: number; y: number; value: number; index: number }
@@ -15,8 +17,9 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value))
 }
 
-function formatTick(value: number): string {
+function formatTick(value: number, precision?: number): string {
   if (!Number.isFinite(value)) return '0'
+  if (precision !== undefined) return value.toFixed(precision)
   if (Math.abs(value) >= 10 || Number.isInteger(value)) return value.toFixed(0)
   return value.toFixed(2)
 }
@@ -36,7 +39,7 @@ function pointsToPath(points: Point[]): string {
   return points.map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`).join(' ')
 }
 
-export function LineChart({ data, height = 260, yMin, yMax, yLabel, xLabel }: LineChartProps) {
+export function LineChart({ data, height = 260, yMin, yMax, yLabel, xLabel, domainOptions }: LineChartProps) {
   const width = 760
   const margin = { top: 14, right: 16, bottom: 34, left: 42 }
   const chartWidth = width - margin.left - margin.right
@@ -52,8 +55,24 @@ export function LineChart({ data, height = 260, yMin, yMax, yLabel, xLabel }: Li
     return data.series.flatMap((series) => series.values).filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
   }, [data.series])
 
-  const resolvedMin = yMin ?? (numericValues.length > 0 ? Math.min(...numericValues) : 0)
-  const resolvedMax = yMax ?? (numericValues.length > 0 ? Math.max(...numericValues) : 1)
+  const domain = useMemo(() => {
+    if (yMin !== undefined && yMax !== undefined) {
+      return { min: yMin, max: yMax, ticks: [] as number[], step: 0 }
+    }
+    const opts = { ...domainOptions }
+    if (yMin !== undefined) opts.clampMin = yMin
+    if (yMax !== undefined) opts.clampMax = yMax
+    const result = computeNiceDomain(numericValues, opts)
+    return {
+      min: yMin ?? result.min,
+      max: yMax ?? result.max,
+      ticks: result.ticks,
+      step: result.step,
+    }
+  }, [numericValues, yMin, yMax, domainOptions])
+
+  const resolvedMin = domain.min
+  const resolvedMax = domain.max
   const ySpan = resolvedMax - resolvedMin || 1
 
   const getX = (index: number): number => {
@@ -95,19 +114,21 @@ export function LineChart({ data, height = 260, yMin, yMax, yLabel, xLabel }: Li
         }}
         onMouseLeave={() => setHoverIndex(null)}
       >
-        {Array.from({ length: 5 }).map((_, tickIndex) => {
-          const ratio = tickIndex / 4
-          const y = margin.top + ratio * chartHeight
-          const value = resolvedMax - ratio * ySpan
-          return (
-            <g key={`y-${value.toFixed(4)}`}>
-              <line x1={margin.left} y1={y} x2={width - margin.right} y2={y} stroke="var(--color-edge)" strokeWidth="1" />
-              <text x={margin.left - 6} y={y + 4} textAnchor="end" fontSize="10" fill="var(--color-muted)">
-                {formatTick(value)}
-              </text>
-            </g>
-          )
-        })}
+        {(() => {
+          const ticks = domain.ticks.length > 0 ? domain.ticks : Array.from({ length: 5 }, (_, i) => resolvedMax - (i / 4) * ySpan)
+          const precision = domain.step > 0 ? precisionForStep(domain.step) : undefined
+          return ticks.map((value) => {
+            const y = getY(value)
+            return (
+              <g key={`y-${value.toFixed(4)}`}>
+                <line x1={margin.left} y1={y} x2={width - margin.right} y2={y} stroke="var(--color-edge)" strokeWidth="1" />
+                <text x={margin.left - 6} y={y + 4} textAnchor="end" fontSize="10" fill="var(--color-muted)">
+                  {formatTick(value, precision)}
+                </text>
+              </g>
+            )
+          })
+        })()}
 
         <line x1={margin.left} y1={margin.top + chartHeight} x2={width - margin.right} y2={margin.top + chartHeight} stroke="var(--color-edge)" />
         <line x1={margin.left} y1={margin.top} x2={margin.left} y2={margin.top + chartHeight} stroke="var(--color-edge)" />
@@ -118,7 +139,8 @@ export function LineChart({ data, height = 260, yMin, yMax, yLabel, xLabel }: Li
             return null
           }
           const linePath = pointsToPath(points)
-          const areaPath = `${linePath} L ${points[points.length - 1].x.toFixed(2)} ${(margin.top + chartHeight).toFixed(2)} L ${points[0].x.toFixed(2)} ${(margin.top + chartHeight).toFixed(2)} Z`
+          const areaBottom = getY(resolvedMin).toFixed(2)
+          const areaPath = `${linePath} L ${points[points.length - 1].x.toFixed(2)} ${areaBottom} L ${points[0].x.toFixed(2)} ${areaBottom} Z`
           return (
             <g key={series.name}>
               <path d={areaPath} fill={series.color} fillOpacity="0.1" />
