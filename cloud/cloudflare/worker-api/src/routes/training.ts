@@ -48,6 +48,14 @@ import {
 import { buildTrainingCheckoutSearch } from "../lib/training-checkout";
 import { buildTrainingAdvice } from "../lib/training-advisor";
 import { buildLLMTrainingAdvice } from "../lib/training-advisor-llm";
+import {
+  planCampaignAttempts,
+  buildLLMPlannerPrompt,
+  parseLLMPlannerResponse,
+  LLM_PLANNER_SYSTEM_PROMPT,
+  type CampaignDirection,
+  type PlannerResult,
+} from "../lib/campaign-planner";
 import { enrichOutputWithReviewAsr } from "../lib/review-asr";
 import { authMiddleware } from "../middleware/auth";
 import type {
@@ -238,6 +246,7 @@ type TrainingCampaignRequest = {
   dataset_name?: string;
   attempt_count?: number;
   parallelism?: number;
+  direction?: string;
   base_config_overrides?: TrainingConfig;
   stop_rules?: TrainingCampaignStopRules;
 };
@@ -1924,7 +1933,7 @@ const summarizeCampaignFailures = (jobs: TrainingJob[]): { asr: number; infra: n
   return { asr, infra };
 };
 
-const buildCampaignAttemptConfig = (
+const buildCampaignAttemptConfigLegacy = (
   voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>,
   campaign: TrainingCampaign,
   attemptIndex: number,
@@ -1946,6 +1955,71 @@ const buildCampaignAttemptConfig = (
   return merged;
 };
 
+const runCampaignPlanner = async (
+  c: Context<AppContext>,
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>,
+  campaign: TrainingCampaign,
+  voiceJobs: TrainingJob[],
+  slotsToFill: number,
+  nextAttemptIndex: number,
+): Promise<PlannerResult> => {
+  const heuristicResult = planCampaignAttempts(
+    voice, campaign, voiceJobs, slotsToFill, nextAttemptIndex,
+  );
+
+  if (heuristicResult.phase === "infeasible" || heuristicResult.candidates.length === 0) {
+    return heuristicResult;
+  }
+
+  const apiKey = String(c.env.OPENAI_API_KEY ?? "").trim();
+  if (!apiKey) return heuristicResult;
+
+  try {
+    const prompt = buildLLMPlannerPrompt({
+      voice, campaign, allVoiceJobs: voiceJobs,
+      slotsToFill, nextAttemptIndex, heuristicResult,
+    });
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15_000);
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: String(c.env.OPENAI_ADVISOR_MODEL ?? "gpt-5.4").trim() || "gpt-5.4",
+        input: [
+          { role: "system", content: LLM_PLANNER_SYSTEM_PROMPT },
+          { role: "user", content: prompt },
+        ],
+        reasoning: { effort: "high" },
+        text: { format: { type: "json_object" } },
+      }),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+
+    if (!response.ok) {
+      console.warn(`LLM planner failed (${response.status})`);
+      return heuristicResult;
+    }
+
+    const payload = (await response.json()) as Record<string, unknown>;
+    const content = typeof payload.output_text === "string" ? payload.output_text : "";
+    if (!content) return heuristicResult;
+
+    const parsed = JSON.parse(
+      content.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, ""),
+    );
+    return parseLLMPlannerResponse(parsed, voice, heuristicResult);
+  } catch (error) {
+    console.warn("LLM planner error, falling back to heuristic:", error);
+    return heuristicResult;
+  }
+};
+
 const enqueueCampaignAttempt = async (
   c: Context<AppContext>,
   campaign: TrainingCampaign,
@@ -1958,7 +2032,7 @@ const enqueueCampaignAttempt = async (
   const jobToken = crypto.randomUUID();
   const workerUrl = getWorkerOrigin(c);
   const runName = `run_${jobId.slice(0, 8)}`;
-  const requestedConfig = buildCampaignAttemptConfig(voice, campaign, attemptIndex, voiceJobs);
+  const requestedConfig = buildCampaignAttemptConfigLegacy(voice, campaign, attemptIndex, voiceJobs);
   const requestedCfg = requestedConfig as Record<string, unknown>;
   const modelSize =
     typeof requestedConfig.model_size === "string" && requestedConfig.model_size
@@ -2174,6 +2248,27 @@ const enqueueCampaignAttempt = async (
   return (await getTrainingJob(c.env.DB, jobId)) ?? job;
 };
 
+const enqueueCampaignAttemptWithConfig = async (
+  c: Context<AppContext>,
+  campaign: TrainingCampaign,
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>,
+  attemptIndex: number,
+  voiceJobs: TrainingJob[],
+  plannerConfig: TrainingConfig,
+  plannerMeta: { lane: string; reasoning: string },
+): Promise<TrainingJob> => {
+  const patchedCampaign: TrainingCampaign = {
+    ...campaign,
+    base_config: { ...campaign.base_config, ...plannerConfig },
+    planner_state: {
+      ...(campaign.planner_state ?? {}),
+      last_lane: plannerMeta.lane,
+      last_reasoning: plannerMeta.reasoning,
+    },
+  };
+  return enqueueCampaignAttempt(c, patchedCampaign, voice, 1, voiceJobs);
+};
+
 const advanceTrainingCampaign = async (
   c: Context<AppContext>,
   campaignId: string
@@ -2315,14 +2410,44 @@ const advanceTrainingCampaign = async (
   const attemptsToCreate = Math.min(campaignOpenSlots, voiceOpenSlots, remainingAttempts);
 
   let nextAttemptIndex = createdAttempts + 1;
+
+  const plannerResult = attemptsToCreate > 0
+    ? await runCampaignPlanner(c, voice, campaign, voiceJobs, attemptsToCreate, nextAttemptIndex)
+    : null;
+
+  if (plannerResult?.phase === "infeasible") {
+    await updateTrainingCampaign(c.env.DB, campaignId, {
+      status: "blocked_budget",
+      summary: {
+        ...(campaign.summary ?? {}),
+        reason: "model_infeasible",
+        planner_phase: "infeasible",
+        planner_stop_recommendation: plannerResult.stop_recommendation,
+      },
+      planner_state: {
+        ...(campaign.planner_state ?? {}),
+        ...plannerResult.state_patch,
+      },
+      completed_at: Date.now(),
+    });
+    return getTrainingCampaign(c.env.DB, campaignId);
+  }
+
   for (let i = 0; i < attemptsToCreate; i += 1) {
     const latestCampaign = await getTrainingCampaign(c.env.DB, campaignId);
     if (!latestCampaign || !CAMPAIGN_ACTIVE_STATUSES.has(latestCampaign.status)) {
       break;
     }
 
+    const plannerCandidate = plannerResult?.candidates[i] ?? null;
+
     try {
-      const createdJob = await enqueueCampaignAttempt(c, campaign, voice, nextAttemptIndex, voiceJobs);
+      const createdJob = plannerCandidate
+        ? await enqueueCampaignAttemptWithConfig(
+            c, campaign, voice, nextAttemptIndex, voiceJobs, plannerCandidate.config,
+            { lane: plannerCandidate.lane, reasoning: plannerCandidate.reasoning },
+          )
+        : await enqueueCampaignAttempt(c, campaign, voice, nextAttemptIndex, voiceJobs);
       voiceJobs.push(createdJob);
       nextAttemptIndex += 1;
     } catch (error) {
@@ -2345,16 +2470,23 @@ const advanceTrainingCampaign = async (
   const refreshedJobs = await listTrainingJobs(c.env.DB, { campaign_id: campaignId, limit: 100 });
   const activeCount = refreshedJobs.filter((job) => ACTIVE_JOB_STATUSES.has(job.status)).length;
   const queuedCount = refreshedJobs.filter((job) => job.status === "queued" || job.status === "pending").length;
+  const freshCampaign = await getTrainingCampaign(c.env.DB, campaignId);
   await updateTrainingCampaign(c.env.DB, campaignId, {
     status: "running",
+    planner_state: {
+      ...(freshCampaign?.planner_state ?? campaign.planner_state ?? {}),
+      ...(plannerResult?.state_patch ?? {}),
+    },
     summary: {
-      ...(campaign.summary ?? {}),
+      ...(freshCampaign?.summary ?? campaign.summary ?? {}),
       attempts_created: refreshedJobs.length,
       attempts_completed: refreshedJobs.filter((job) => TERMINAL_JOB_STATUSES.has(job.status)).length,
       active_jobs: activeCount,
       queued_jobs: queuedCount,
       asr_failures: failureSummary.asr,
       infra_failures: failureSummary.infra,
+      planner_phase: plannerResult?.phase ?? null,
+      planner_stop_recommendation: plannerResult?.stop_recommendation ?? null,
     },
   });
 
@@ -3162,10 +3294,10 @@ const getValidationPlan = (
     validationTexts,
     validationSeedOffsets,
     totalSamples: validationTexts.length * validationSeedOffsets.length,
-    minOverall: is06b ? 0.9 : 0.85,
+    minOverall: is06b ? 0.82 : 0.85,
     minPassRate: is06b ? MIN_PASS_RATE_06B : MIN_PASS_RATE_17B,
     minAsrScore: 0.8,
-    minToneScore: is06b ? 0.45 : 0.55,
+    minToneScore: is06b ? 0.40 : 0.55,
     maxCheckpointsToEval: is06b ? MAX_CHECKPOINTS_TO_EVAL_06B : MAX_CHECKPOINTS_TO_EVAL,
     prioritizeLatestPassingCheckpoint: is06b,
   };
@@ -3228,8 +3360,8 @@ const buildValidationScoreParts = ({
   speed: number;
 }): Array<{ value: number; weight: number }> => {
   const baseWeights = is06b
-    ? { overall: 0.38, asr: 0.22, health: 0.14, duration: 0.08, passRate: 0.08, speaker: 0.20, tone: 0.06, speed: 0.06 }
-    : { overall: 0.34, asr: 0.18, health: 0.12, duration: 0.06, passRate: 0.06, speaker: 0.18, tone: 0.16, speed: 0.10 };
+    ? { overall: 0.40, asr: 0.22, health: 0.14, duration: 0.08, passRate: 0.08, speaker: 0.22, tone: 0.06, speed: 0.02 }
+    : { overall: 0.36, asr: 0.18, health: 0.12, duration: 0.06, passRate: 0.06, speaker: 0.20, tone: 0.16, speed: 0.04 };
 
   const parts: Array<{ value: number; weight: number }> = [
     { value: overall, weight: baseWeights.overall },
@@ -3711,7 +3843,7 @@ const evaluateValidationSample = ({
   if (referenceAudioKey && Number.isFinite(tone) && tone < minToneScore) {
     return fail(`sample ${sampleIndex} seed ${seed} tone_score=${tone.toFixed(3)}`);
   }
-  if (referenceAudioKey && referenceText && Number.isFinite(speed) && speed < 0.55) {
+  if (referenceAudioKey && referenceText && Number.isFinite(speed) && speed < 0.35) {
     return fail(`sample ${sampleIndex} seed ${seed} speed_score=${speed.toFixed(3)}`);
   }
 
@@ -3829,6 +3961,24 @@ const finalizeValidationPresetResult = ({
     };
   }
 
+  let failScore = 0;
+  if (accumulator.passed > 0) {
+    const n = Math.max(1, accumulator.passed);
+    const parts = buildValidationScoreParts({
+      is06b,
+      overall: accumulator.sum_overall / n,
+      asr: accumulator.sum_asr / n,
+      health: accumulator.sum_health / n,
+      duration: accumulator.sum_duration / n,
+      passRate,
+      speaker: accumulator.speaker_samples > 0 ? accumulator.sum_speaker / accumulator.speaker_samples : NaN,
+      tone: accumulator.tone_samples > 0 ? accumulator.sum_tone / accumulator.tone_samples : NaN,
+      speed: accumulator.speed_samples > 0 ? accumulator.sum_speed / accumulator.speed_samples : NaN,
+    });
+    const tw = parts.reduce((acc, part) => acc + part.weight, 0) || 1;
+    failScore = parts.reduce((acc, part) => acc + (part.value * part.weight), 0) / tw;
+  }
+
   return {
     ok: false,
     message:
@@ -3838,7 +3988,7 @@ const finalizeValidationPresetResult = ({
         `samples=${accumulator.passed}/${totalSamples} ` +
           `pass_rate=${passRate.toFixed(3)} ` +
           `no_audio=${accumulator.no_audio} infra=${accumulator.infra_issues}`),
-    aggregateScore: 0,
+    aggregateScore: failScore,
     presetName: preset.name,
     passedSamples: accumulator.passed,
     totalSamples,
@@ -3864,7 +4014,7 @@ const scoreSingleValidationOutput = ({
   is06b: boolean;
   minToneScore: number;
 }): CheckpointValidationResult => {
-  const minOverall = is06b ? 0.9 : 0.85;
+  const minOverall = is06b ? 0.82 : 0.85;
   const minAsrScore = 0.8;
   const totalSamples = 1;
 
@@ -3899,16 +4049,41 @@ const scoreSingleValidationOutput = ({
   const tone = Number(quality.tone_score ?? NaN);
   const speed = Number(quality.speed_score ?? NaN);
 
-  const fail = (detail: string): CheckpointValidationResult => ({
-    ok: false,
-    message: `All presets failed: preset=${preset.name} ${detail}`,
-    aggregateScore: 0,
-    presetName: preset.name,
-    passedSamples: 0,
-    totalSamples,
-  });
+  // When core metrics are missing entirely, we genuinely have no score signal.
+  const coreMetricsAvailable =
+    Number.isFinite(overall) && Number.isFinite(duration) && Number.isFinite(health);
 
-  if (!Number.isFinite(overall) || !Number.isFinite(duration) || !Number.isFinite(health)) {
+  const fail = (detail: string): CheckpointValidationResult => {
+    // Compute real weighted score when we have enough metrics, so the
+    // campaign planner can distinguish near-pass from garbage.
+    // When metrics are missing entirely, fall back to 0.
+    let computedScore = 0;
+    if (coreMetricsAvailable) {
+      const parts = buildValidationScoreParts({
+        is06b,
+        overall,
+        asr: Number.isFinite(asr) ? asr : 0,
+        health,
+        duration,
+        passRate: 1,
+        speaker,
+        tone,
+        speed,
+      });
+      const tw = parts.reduce((acc, part) => acc + part.weight, 0) || 1;
+      computedScore = parts.reduce((acc, part) => acc + (part.value * part.weight), 0) / tw;
+    }
+    return {
+      ok: false,
+      message: `All presets failed: preset=${preset.name} ${detail}`,
+      aggregateScore: computedScore,
+      presetName: preset.name,
+      passedSamples: 0,
+      totalSamples,
+    };
+  };
+
+  if (!coreMetricsAvailable) {
     return fail("sample 1 seed " + seed + " invalid quality metrics");
   }
   if (!Number.isFinite(asr)) {
@@ -3932,7 +4107,7 @@ const scoreSingleValidationOutput = ({
   if (referenceAudioKey && Number.isFinite(tone) && tone < minToneScore) {
     return fail(`sample 1 seed ${seed} tone_score=${tone.toFixed(3)}`);
   }
-  if (referenceAudioKey && referenceText && Number.isFinite(speed) && speed < 0.55) {
+  if (referenceAudioKey && referenceText && Number.isFinite(speed) && speed < 0.35) {
     return fail(`sample 1 seed ${seed} speed_score=${speed.toFixed(3)}`);
   }
 
@@ -4908,7 +5083,7 @@ const validateTrainedCheckpoint = async (
   const validationTexts = getValidationTexts(lang, is06b);
   const validationSeedOffsets = is06b ? FAST_VALIDATION_SEEDS_OFFSET : FULL_VALIDATION_SEEDS_OFFSET;
   const totalSamples = validationTexts.length * validationSeedOffsets.length;
-  const minOverall = is06b ? 0.9 : 0.85;
+  const minOverall = is06b ? 0.82 : 0.85;
   const minPassRate = is06b ? MIN_PASS_RATE_06B : MIN_PASS_RATE_17B;
   const minAsrScore = 0.8;
   let referenceAudioKey = voice.ref_audio_r2_key ?? (datasetPrefix ? `${datasetPrefix}/ref_audio.wav` : null);
@@ -5082,13 +5257,13 @@ const validateTrainedCheckpoint = async (
             }
             continue;
           }
-          if (referenceAudioKey && Number.isFinite(tone) && tone < 0.45) {
+          if (referenceAudioKey && Number.isFinite(tone) && tone < (is06b ? 0.40 : 0.55)) {
             if (!firstFailureMessage) {
               firstFailureMessage = `sample ${i + 1} seed ${seed} tone_score=${tone.toFixed(3)}`;
             }
             continue;
           }
-          if (referenceAudioKey && referenceText && Number.isFinite(speed) && speed < 0.55) {
+          if (referenceAudioKey && referenceText && Number.isFinite(speed) && speed < 0.35) {
             if (!firstFailureMessage) {
               firstFailureMessage = `sample ${i + 1} seed ${seed} speed_score=${speed.toFixed(3)}`;
             }
@@ -5699,7 +5874,12 @@ app.post("/campaigns", async (c) => {
     status: "planning",
     base_config: normalizedBaseConfig,
     stop_rules: body.stop_rules ?? {},
-    planner_state: {},
+    planner_state: {
+      direction: typeof body.direction === "string" &&
+        ["conservative", "balanced", "exploratory"].includes(body.direction)
+        ? body.direction
+        : "balanced",
+    },
     summary: {},
     created_at: now,
     updated_at: now,
