@@ -850,7 +850,10 @@ const chooseCheckpointAdoption = async ({
   }
 
   const currentScore = await getCurrentReadyVoiceScore(c, voice);
-  if (currentScore !== null && candidateScore <= currentScore) {
+  const currentScoringVersion = typeof (voice as unknown as Record<string, unknown>).scoring_version === "number"
+    ? (voice as unknown as Record<string, unknown>).scoring_version as number
+    : 1;
+  if (currentScore !== null && candidateScore <= currentScore && currentScoringVersion >= SCORING_VERSION) {
     return {
       mode: "keep_current",
       preservedPrefix: currentPrefix,
@@ -1257,10 +1260,11 @@ const shouldKeepReadyVoiceOnValidationFailure = (
 type PodStatusDetail = NonNullable<Awaited<ReturnType<typeof getPodStatus>>>;
 
 const FULL_VALIDATION_SEEDS_OFFSET = [123456, 223456] as const;
-const FAST_VALIDATION_SEEDS_OFFSET = [123456, 223456] as const;
+const FAST_VALIDATION_SEEDS_OFFSET = [123456] as const;
 const MAX_CHECKPOINTS_TO_EVAL = 4;
 const MAX_CHECKPOINTS_TO_EVAL_06B = 4;
 const VALIDATION_RETRY_ATTEMPTS = 3;
+const SCORING_VERSION = 2;
 const MIN_PASS_RATE_06B = 5 / 6;
 const MIN_PASS_RATE_17B = 5 / 6;
 const PROVISIONING_STALE_MS = 4 * 60 * 1000;
@@ -3322,9 +3326,7 @@ const selectValidationCandidateCheckpoints = (
     return [];
   }
 
-  // For small runs, evaluate every checkpoint. This voice's best checkpoint has
-  // already appeared early in training, so a latest-only slice misses the real winner.
-  const targetCount = Math.min(uniqueAsc.length, Math.max(plan.maxCheckpointsToEval, 10));
+  const targetCount = Math.min(uniqueAsc.length, plan.maxCheckpointsToEval);
   if (uniqueAsc.length <= targetCount) {
     return uniqueAsc;
   }
@@ -3363,17 +3365,19 @@ const buildValidationScoreParts = ({
   speed: number;
 }): Array<{ value: number; weight: number }> => {
   const baseWeights = is06b
-    ? { overall: 0.40, asr: 0.22, health: 0.14, duration: 0.08, passRate: 0.08, speaker: 0.22, tone: 0.06, speed: 0.02 }
-    : { overall: 0.36, asr: 0.18, health: 0.12, duration: 0.06, passRate: 0.06, speaker: 0.20, tone: 0.16, speed: 0.04 };
+    ? { asr: 0.28, health: 0.14, duration: 0.10, passRate: 0.10, speaker: 0.24, tone: 0.10, speed: 0.04 }
+    : { asr: 0.22, health: 0.12, duration: 0.08, passRate: 0.08, speaker: 0.22, tone: 0.18, speed: 0.06, stability: 0.04 };
 
   const parts: Array<{ value: number; weight: number }> = [
-    { value: overall, weight: baseWeights.overall },
     { value: asr, weight: baseWeights.asr },
     { value: health, weight: baseWeights.health },
     { value: duration, weight: baseWeights.duration },
     { value: passRate, weight: baseWeights.passRate },
   ];
 
+  if (!is06b) {
+    parts.push({ value: overall, weight: (baseWeights as { stability: number }).stability });
+  }
   if (Number.isFinite(speaker)) {
     parts.push({ value: speaker, weight: baseWeights.speaker });
   }

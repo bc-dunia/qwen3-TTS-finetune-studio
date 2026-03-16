@@ -253,10 +253,10 @@ function configFamilyKey(lr: number, epochs: number, subtalker: number): string 
 
 function isInExclusionZone(
   candidate: { lr: number; epochs: number; subtalker: number },
-  failures: FailureCluster["configs"],
+  priorConfigs: Array<{ lr: number; epochs: number; subtalker: number }>,
 ): boolean {
-  for (const f of failures.slice(-3)) {
-    const dist = configDistance(candidate, f);
+  for (const prior of priorConfigs.slice(-10)) {
+    const dist = configDistance(candidate, prior);
     if (dist.lr_pct < 12 && dist.epochs_abs <= 1 && dist.subtalker_abs < 0.02) {
       return true;
     }
@@ -301,6 +301,7 @@ function analyzeHistory(voice: Voice, allVoiceJobs: TrainingJob[]): {
   familyStats: Map<string, { completed: number; active: number; passes: number; failures: number }>;
   blockedFamilies: Set<string>;
   nearMissSignals: NearMissSignal[];
+  allAttemptedConfigs: Array<{ lr: number; epochs: number; subtalker: number }>;
 } {
   const is06b = voice.model_size.includes("0.6");
   const passThreshold = is06b ? 0.82 : 0.85;
@@ -431,7 +432,18 @@ function analyzeHistory(voice: Voice, allVoiceJobs: TrainingJob[]): {
     phase = "bootstrap";
   }
 
-  return { successAnchors, nearPassAnchors, failureClusters: failureMap, dominantFailure, bestScore, phase, familyStats, blockedFamilies, nearMissSignals };
+  const allAttemptedConfigs: Array<{ lr: number; epochs: number; subtalker: number }> = [];
+  for (const job of [...completedJobs, ...activeJobs]) {
+    const cfg = job.config;
+    const lr = readNum(cfg.learning_rate) ?? 0;
+    const epochs = readNum(cfg.num_epochs) ?? 0;
+    const subtalker = readNum(cfg.subtalker_loss_weight) ?? 0;
+    if (lr > 0) {
+      allAttemptedConfigs.push({ lr, epochs, subtalker });
+    }
+  }
+
+  return { successAnchors, nearPassAnchors, failureClusters: failureMap, dominantFailure, bestScore, phase, familyStats, blockedFamilies, nearMissSignals, allAttemptedConfigs };
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +456,7 @@ function generateExploitCandidate(
   failureClusters: Map<FailureCluster["reason"], FailureCluster>,
   voice: Voice,
   attemptIndex: number,
+  allAttemptedConfigs: Array<{ lr: number; epochs: number; subtalker: number }>,
 ): PlannerCandidate | null {
   const pool = [...anchors, ...nearPass];
   if (pool.length === 0) return null;
@@ -469,17 +482,14 @@ function generateExploitCandidate(
     gpu_type_id: is06b ? "NVIDIA L40S" : "NVIDIA A100-SXM4-80GB",
   };
 
-  // Verify not in exclusion zone of failures with same dominant reason
-  for (const [, cluster] of failureClusters) {
-    if (isInExclusionZone(
-      { lr: Number(config.learning_rate), epochs: Number(config.num_epochs), subtalker: Number(config.subtalker_loss_weight) },
-      cluster.configs,
-    )) {
-      // Shift away
+    for (let shift = 0; shift < 3; shift++) {
+      if (!isInExclusionZone(
+        { lr: Number(config.learning_rate), epochs: Number(config.num_epochs), subtalker: Number(config.subtalker_loss_weight) },
+        allAttemptedConfigs,
+      )) break;
       config.learning_rate = Number(config.learning_rate) * 1.15;
       config.num_epochs = Number(config.num_epochs) + 1;
     }
-  }
 
   return {
     lane: "exploit",
@@ -494,6 +504,7 @@ function generateRepairCandidate(
   anchors: SuccessAnchor[],
   voice: Voice,
   attemptIndex: number,
+  allAttemptedConfigs: Array<{ lr: number; epochs: number; subtalker: number }>,
 ): PlannerCandidate {
   const is06b = voice.model_size.includes("0.6");
   const bestAnchor = anchors[0] ?? null;
@@ -552,8 +563,8 @@ function generateRepairCandidate(
     }
   }
 
-  const failedConfigs = failureClusters.get(dominantFailure ?? "unknown")?.configs ?? [];
-  if (isInExclusionZone({ lr, epochs, subtalker }, failedConfigs)) {
+  for (let shift = 0; shift < 3; shift++) {
+    if (!isInExclusionZone({ lr, epochs, subtalker }, allAttemptedConfigs)) break;
     lr *= 0.85;
     epochs = Math.max(is06b ? 5 : 4, epochs - 1);
     subtalker = Math.max(is06b ? 0.1 : 0.08, subtalker - 0.03);
@@ -586,6 +597,7 @@ function generateExploreCandidate(
   voice: Voice,
   attemptIndex: number,
   blockedFamilies: Set<string>,
+  allAttemptedConfigs: Array<{ lr: number; epochs: number; subtalker: number }>,
 ): PlannerCandidate {
   const is06b = voice.model_size.includes("0.6");
   const anchor = anchors[0] ?? null;
@@ -621,16 +633,14 @@ function generateExploreCandidate(
     shifted = true;
   }
 
-  for (const [, cluster] of failureClusters) {
-    if (isInExclusionZone(candidate, cluster.configs)) {
-      candidate = {
-        lr: candidate.lr * 0.85,
-        epochs: Math.max(is06b ? 5 : 4, candidate.epochs - 1),
-        subtalker: Math.max(0.1, candidate.subtalker - 0.04),
-      };
-      shifted = true;
-      break;
-    }
+  for (let shift = 0; shift < 3; shift++) {
+    if (!isInExclusionZone(candidate, allAttemptedConfigs)) break;
+    candidate = {
+      lr: candidate.lr * 0.85,
+      epochs: Math.max(is06b ? 5 : 4, candidate.epochs - 1),
+      subtalker: Math.max(0.1, candidate.subtalker - 0.04),
+    };
+    shifted = true;
   }
 
   for (const a of anchors) {
@@ -730,7 +740,7 @@ export function planCampaignAttempts(
   const direction: CampaignDirection =
     (campaign.planner_state?.direction as CampaignDirection) ?? "balanced";
 
-  const { successAnchors, nearPassAnchors, failureClusters, dominantFailure, bestScore, phase, familyStats, blockedFamilies, nearMissSignals } =
+  const { successAnchors, nearPassAnchors, failureClusters, dominantFailure, bestScore, phase, familyStats, blockedFamilies, nearMissSignals, allAttemptedConfigs } =
     analyzeHistory(voice, allVoiceJobs);
 
   // Infeasibility stop for 0.6B
@@ -775,24 +785,24 @@ export function planCampaignAttempts(
     switch (lane) {
       case "exploit":
         candidate = generateExploitCandidate(
-          successAnchors, nearPassAnchors, failureClusters, voice, idx,
+          successAnchors, nearPassAnchors, failureClusters, voice, idx, allAttemptedConfigs,
         );
         break;
       case "repair":
         candidate = generateRepairCandidate(
-          dominantFailure, failureClusters, successAnchors, voice, idx,
+          dominantFailure, failureClusters, successAnchors, voice, idx, allAttemptedConfigs,
         );
         break;
       case "explore":
         candidate = generateExploreCandidate(
-          successAnchors, failureClusters, voice, idx, blockedFamilies,
+          successAnchors, failureClusters, voice, idx, blockedFamilies, allAttemptedConfigs,
         );
         break;
     }
 
     if (!candidate) {
       candidate = generateRepairCandidate(
-        dominantFailure, failureClusters, successAnchors, voice, idx,
+        dominantFailure, failureClusters, successAnchors, voice, idx, allAttemptedConfigs,
       );
     }
 
@@ -802,7 +812,7 @@ export function planCampaignAttempts(
     const candFk = configFamilyKey(candLr, candEp, candSub);
     if (blockedFamilies.has(candFk)) {
       candidate = generateExploreCandidate(
-        successAnchors, failureClusters, voice, idx + 10, blockedFamilies,
+        successAnchors, failureClusters, voice, idx + 10, blockedFamilies, allAttemptedConfigs,
       );
       candidate.reasoning += " (original candidate was in blocked family)";
     }

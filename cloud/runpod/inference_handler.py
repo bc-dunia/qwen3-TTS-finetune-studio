@@ -459,6 +459,44 @@ def _cached_reference_audio(storage: Any, r2_key: str) -> Path:
     return local
 
 
+_REF_METRICS_CACHE: dict[str, dict[str, Any]] = {}
+_REF_METRICS_MAX_ENTRIES = 8
+
+
+def _get_cached_ref_metrics(storage: Any, reference_key: str) -> dict[str, Any] | None:
+    if reference_key in _REF_METRICS_CACHE:
+        return _REF_METRICS_CACHE[reference_key]
+
+    try:
+        librosa = importlib.import_module("librosa")
+        ref_path = _cached_reference_audio(storage, reference_key)
+        ref_audio, ref_sr = librosa.load(str(ref_path), sr=None, mono=True)
+        ref_audio_24 = _resample_audio(
+            np.asarray(ref_audio, dtype=np.float32), int(ref_sr or 24000), 24000
+        )
+    except Exception as exc:
+        _log(f"reference_load_failed key={reference_key} error={exc}")
+        return None
+
+    metrics: dict[str, Any] = {"ref_audio_24": ref_audio_24}
+    try:
+        metrics["ref_emb"] = _speaker_embedding(ref_audio_24, 24000)
+    except Exception as exc:
+        _log(f"reference_embedding_failed key={reference_key} error={exc}")
+    try:
+        median, std = _pitch_stats(ref_audio_24, 24000)
+        metrics["ref_pitch_median"] = median
+        metrics["ref_pitch_std"] = std
+    except Exception as exc:
+        _log(f"reference_pitch_failed key={reference_key} error={exc}")
+
+    if len(_REF_METRICS_CACHE) >= _REF_METRICS_MAX_ENTRIES:
+        oldest = next(iter(_REF_METRICS_CACHE))
+        del _REF_METRICS_CACHE[oldest]
+    _REF_METRICS_CACHE[reference_key] = metrics
+    return metrics
+
+
 def _reference_similarity_metrics(
     *,
     storage: Any | None,
@@ -474,13 +512,12 @@ def _reference_similarity_metrics(
     if not reference_key:
         return {}
 
+    ref = _get_cached_ref_metrics(storage, reference_key)
+    if ref is None:
+        return {}
+
+    ref_audio_24 = ref["ref_audio_24"]
     try:
-        librosa = importlib.import_module("librosa")
-        ref_path = _cached_reference_audio(storage, reference_key)
-        ref_audio, ref_sr = librosa.load(str(ref_path), sr=None, mono=True)
-        ref_audio_24 = _resample_audio(
-            np.asarray(ref_audio, dtype=np.float32), int(ref_sr or 24000), 24000
-        )
         gen_audio_24 = _resample_audio(audio, sr, 24000)
     except Exception as exc:
         _log(f"reference_review_failed key={reference_key} error={exc}")
@@ -489,38 +526,43 @@ def _reference_similarity_metrics(
     result: dict[str, float | str] = {}
 
     if bool(review_cfg.get("enable_speaker", True)):
-        try:
-            ref_emb = _speaker_embedding(ref_audio_24, 24000)
-            gen_emb = _speaker_embedding(gen_audio_24, 24000)
-            speaker_cos = _cosine(gen_emb, ref_emb)
-            result["speaker_cosine"] = float(speaker_cos)
-            result["speaker_score"] = float(
-                _clamp((speaker_cos - 0.85) / 0.15, 0.0, 1.0)
-            )
-        except Exception as exc:
-            _log(f"reference_speaker_review_failed key={reference_key} error={exc}")
+        ref_emb = ref.get("ref_emb")
+        if ref_emb is not None:
+            try:
+                gen_emb = _speaker_embedding(gen_audio_24, 24000)
+                speaker_cos = _cosine(gen_emb, ref_emb)
+                result["speaker_cosine"] = float(speaker_cos)
+                result["speaker_score"] = float(
+                    _clamp((speaker_cos - 0.85) / 0.15, 0.0, 1.0)
+                )
+            except Exception as exc:
+                _log(f"reference_speaker_review_failed key={reference_key} error={exc}")
 
     if bool(review_cfg.get("enable_style", True)):
-        try:
-            ref_pitch_median, ref_pitch_std = _pitch_stats(ref_audio_24, 24000)
-            gen_pitch_median, gen_pitch_std = _pitch_stats(gen_audio_24, 24000)
-            result["reference_pitch_median"] = float(ref_pitch_median)
-            result["reference_pitch_std"] = float(ref_pitch_std)
-            result["generated_pitch_median"] = float(gen_pitch_median)
-            result["generated_pitch_std"] = float(gen_pitch_std)
-            if ref_pitch_median > 0.0 and gen_pitch_median > 0.0:
-                tone_score = (
-                    _ratio_score(gen_pitch_median, ref_pitch_median, tolerance=1.3)
-                    * 0.7
-                ) + (
-                    _ratio_score(
-                        max(gen_pitch_std, 1.0), max(ref_pitch_std, 1.0), tolerance=1.1
+        ref_pitch_median = ref.get("ref_pitch_median")
+        ref_pitch_std = ref.get("ref_pitch_std")
+        if ref_pitch_median is not None and ref_pitch_std is not None:
+            try:
+                gen_pitch_median, gen_pitch_std = _pitch_stats(gen_audio_24, 24000)
+                result["reference_pitch_median"] = float(ref_pitch_median)
+                result["reference_pitch_std"] = float(ref_pitch_std)
+                result["generated_pitch_median"] = float(gen_pitch_median)
+                result["generated_pitch_std"] = float(gen_pitch_std)
+                if ref_pitch_median > 0.0 and gen_pitch_median > 0.0:
+                    tone_score = (
+                        _ratio_score(gen_pitch_median, ref_pitch_median, tolerance=1.3)
+                        * 0.7
+                    ) + (
+                        _ratio_score(
+                            max(gen_pitch_std, 1.0),
+                            max(ref_pitch_std, 1.0),
+                            tolerance=1.1,
+                        )
+                        * 0.3
                     )
-                    * 0.3
-                )
-                result["tone_score"] = float(_clamp(tone_score, 0.0, 1.0))
-        except Exception as exc:
-            _log(f"reference_style_review_failed key={reference_key} error={exc}")
+                    result["tone_score"] = float(_clamp(tone_score, 0.0, 1.0))
+            except Exception as exc:
+                _log(f"reference_style_review_failed key={reference_key} error={exc}")
 
     reference_text = str(review_cfg.get("reference_text", "") or "").strip()
     if bool(review_cfg.get("enable_speed", True)) and reference_text:
@@ -1010,13 +1052,16 @@ def _verify_quality(
 
     expected_duration_sec = max(0.3, _expected_seconds(text or ""))
     ratio = duration_sec / max(expected_duration_sec, 1e-6)
-    # Wider acceptable band: TTS naturally varies in pacing
-    if 0.5 <= ratio <= 2.0:
+    if 0.7 <= ratio <= 1.4:
         duration_score = 1.0
+    elif 0.5 <= ratio < 0.7:
+        duration_score = (ratio - 0.5) / 0.2
+    elif 1.4 < ratio <= 2.0:
+        duration_score = (2.0 - ratio) / 0.6
     elif 0.3 <= ratio < 0.5:
-        duration_score = (ratio - 0.3) / 0.2
-    elif 2.0 < ratio <= 3.5:
-        duration_score = (3.5 - ratio) / 1.5
+        duration_score = (ratio - 0.3) / 0.2 * 0.5
+    elif 2.0 < ratio <= 3.0:
+        duration_score = (3.0 - ratio) / 1.0 * 0.3
     else:
         duration_score = 0.0
 
