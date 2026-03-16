@@ -31,6 +31,7 @@ import {
   type TrainingConfig,
   type TrainingAdvice,
   type TrainingCampaign,
+  type CampaignDirection,
   updateTrainingPreprocessCache,
   updateTrainingPreprocessEntry,
   formatDateTime,
@@ -296,8 +297,9 @@ export function Training() {
   const [selectedDatasetName, setSelectedDatasetName] = useState('')
   const [starting, setStarting] = useState(false)
   const [startingCampaign, setStartingCampaign] = useState(false)
-  const [campaignAttempts, setCampaignAttempts] = useState(3)
-  const [campaignParallelism, setCampaignParallelism] = useState(1)
+  const [campaignAttempts, setCampaignAttempts] = useState(6)
+  const [campaignParallelism, setCampaignParallelism] = useState(3)
+  const [campaignDirection, setCampaignDirection] = useState<CampaignDirection>('balanced')
   const [activeCampaignId, setActiveCampaignId] = useState<string | null>(null)
   const [activeCampaign, setActiveCampaign] = useState<TrainingCampaign | null>(null)
   const [formError, setFormError] = useState('')
@@ -662,7 +664,8 @@ export function Training() {
       const response = await createTrainingCampaign(selectedVoiceId, {
         datasetName: effectiveDatasetName || undefined,
         attemptCount: Math.max(1, Math.min(Math.trunc(campaignAttempts), 12)),
-        parallelism: Math.max(1, Math.min(Math.trunc(campaignParallelism), 3)),
+        parallelism: 3,
+        direction: campaignDirection,
         baseConfigOverrides,
       })
       setActiveCampaign(response.campaign)
@@ -937,121 +940,6 @@ export function Training() {
               </select>
             </div>
 
-            <div className="rounded-lg border border-edge bg-surface px-3 py-2.5">
-              <button
-                type="button"
-                onClick={() => setShowAdvancedConfig((previous) => !previous)}
-                className="flex w-full items-center justify-between text-left"
-              >
-                <span className="text-primary text-xs font-semibold">Advanced training settings</span>
-                <span className="text-muted text-[10px] font-mono">{showAdvancedConfig ? 'Hide' : 'Show'}</span>
-              </button>
-
-              {showAdvancedConfig && (
-                <div className="mt-3 space-y-4">
-                  <div>
-                    <label htmlFor="training-batch-size" className="text-subtle text-xs font-medium mb-1.5 block">Batch Size</label>
-                    <input
-                      id="training-batch-size"
-                      type="number"
-                      value={batchSize}
-                      onChange={(e) => setBatchSize(parseInt(e.target.value) || 1)}
-                      min={1}
-                      max={32}
-                      className="w-full bg-raised border border-edge rounded-lg px-3 py-2.5 text-sm text-primary font-mono focus:border-accent transition-colors"
-                    />
-                  </div>
-
-                  <div>
-                    <label htmlFor="training-epochs" className="text-subtle text-xs font-medium mb-1.5 block">Epochs</label>
-                    <input
-                      id="training-epochs"
-                      type="number"
-                      value={epochs}
-                      onChange={(e) => setEpochs(parseInt(e.target.value) || 1)}
-                      min={1}
-                      max={50}
-                      className="w-full bg-raised border border-edge rounded-lg px-3 py-2.5 text-sm text-primary font-mono focus:border-accent transition-colors"
-                    />
-                    <p className="text-muted text-[10px] font-mono mt-1">Recommended: 5–15 (more epochs = higher similarity, risk of overfitting)</p>
-                  </div>
-
-                  <div>
-                    <label htmlFor="training-learning-rate" className="text-subtle text-xs font-medium mb-1.5 block">Learning Rate</label>
-                    <input
-                      id="training-learning-rate"
-                      type="text"
-                      value={learningRate}
-                      onChange={(e) => {
-                        const val = parseFloat(e.target.value)
-                        if (!isNaN(val)) setLearningRate(val)
-                      }}
-                      className="w-full bg-raised border border-edge rounded-lg px-3 py-2.5 text-sm text-primary font-mono focus:border-accent transition-colors"
-                    />
-                    <p className="text-muted text-[10px] font-mono mt-1">Recommended: 1e-5 to 5e-5</p>
-                  </div>
-
-                  <div>
-                    <label htmlFor="training-seed" className="text-subtle text-xs font-medium mb-1.5 block">Seed</label>
-                    <input
-                      id="training-seed"
-                      type="number"
-                      value={trainingSeed}
-                      onChange={(e) => setTrainingSeed(parseInt(e.target.value, 10) || 1)}
-                      className="w-full bg-raised border border-edge rounded-lg px-3 py-2.5 text-sm text-primary font-mono focus:border-accent transition-colors"
-                    />
-                  </div>
-
-                  <div>
-                    <label htmlFor="training-grad-acc" className="text-subtle text-xs font-medium mb-1.5 block">Gradient Accumulation</label>
-                    <input
-                      id="training-grad-acc"
-                      type="number"
-                      min={1}
-                      value={gradientAccumulationSteps}
-                      onChange={(e) => setGradientAccumulationSteps(parseInt(e.target.value, 10) || 1)}
-                      className="w-full bg-raised border border-edge rounded-lg px-3 py-2.5 text-sm text-primary font-mono focus:border-accent transition-colors"
-                    />
-                  </div>
-
-                  <div>
-                    <label htmlFor="training-subtalker" className="text-subtle text-xs font-medium mb-1.5 block">Subtalker Loss Weight</label>
-                    <input
-                      id="training-subtalker"
-                      type="number"
-                      step="0.05"
-                      value={subtalkerLossWeight}
-                      onChange={(e) => setSubtalkerLossWeight(parseFloat(e.target.value) || 0)}
-                      className="w-full bg-raised border border-edge rounded-lg px-3 py-2.5 text-sm text-primary font-mono focus:border-accent transition-colors"
-                    />
-                  </div>
-
-                  <div>
-                    <label htmlFor="training-save-every" className="text-subtle text-xs font-medium mb-1.5 block">Save Every N Epochs</label>
-                    <input
-                      id="training-save-every"
-                      type="number"
-                      min={1}
-                      value={saveEveryNEpochs}
-                      onChange={(e) => setSaveEveryNEpochs(parseInt(e.target.value, 10) || 1)}
-                      className="w-full bg-raised border border-edge rounded-lg px-3 py-2.5 text-sm text-primary font-mono focus:border-accent transition-colors"
-                    />
-                  </div>
-
-                  <div>
-                    <label htmlFor="training-gpu" className="text-subtle text-xs font-medium mb-1.5 block">GPU Type</label>
-                    <input
-                      id="training-gpu"
-                      type="text"
-                      value={gpuTypeId}
-                      onChange={(e) => setGpuTypeId(e.target.value)}
-                      className="w-full bg-raised border border-edge rounded-lg px-3 py-2.5 text-sm text-primary font-mono focus:border-accent transition-colors"
-                    />
-                  </div>
-                </div>
-              )}
-            </div>
-
             {/* Error */}
             {formError && (
               <div className="bg-error-dim border border-error/20 rounded-lg px-3 py-2 text-error text-xs">
@@ -1059,70 +947,308 @@ export function Training() {
               </div>
             )}
 
-            <div className="rounded-lg border border-edge bg-surface px-3 py-3 space-y-3">
-              <div className="flex items-center justify-between">
-                <span className="text-primary text-xs font-semibold">Autopilot Campaign</span>
-                {activeCampaign ? (
-                  <span className="text-[10px] font-mono text-muted">{activeCampaign.status}</span>
-                ) : null}
-              </div>
-              <div className="grid grid-cols-2 gap-2">
-                <label className="text-subtle text-[10px] font-medium">
-                  Attempts
-                  <input
-                    type="number"
-                    min={1}
-                    max={12}
-                    value={campaignAttempts}
-                    onChange={(e) => setCampaignAttempts(parseInt(e.target.value, 10) || 1)}
-                    className="mt-1 w-full bg-raised border border-edge rounded-lg px-2 py-1.5 text-xs text-primary font-mono"
-                  />
-                </label>
-                <label className="text-subtle text-[10px] font-medium">
-                  Parallelism
-                  <input
-                    type="number"
-                    min={1}
-                    max={3}
-                    value={campaignParallelism}
-                    onChange={(e) => setCampaignParallelism(parseInt(e.target.value, 10) || 1)}
-                    className="mt-1 w-full bg-raised border border-edge rounded-lg px-2 py-1.5 text-xs text-primary font-mono"
-                  />
-                </label>
-              </div>
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  onClick={() => void handleStartCampaign()}
-                  disabled={!selectedVoiceId || startingCampaign || voices.length === 0}
-                  className="flex-1 rounded-lg border border-edge px-3 py-2 text-[11px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent disabled:opacity-40"
-                >
-                  {startingCampaign ? 'Starting campaign...' : 'Start Autopilot'}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void handleCancelCampaign()}
-                  disabled={!activeCampaignId || activeCampaign?.status === 'cancelled'}
-                  className="rounded-lg border border-edge px-3 py-2 text-[11px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent disabled:opacity-40"
-                >
-                  Cancel
-                </button>
-              </div>
-              {activeCampaign ? (
-                <div className="rounded-lg border border-edge px-3 py-2 text-[10px] font-mono text-subtle">
-                  campaign={activeCampaign.campaign_id.slice(0, 8)} attempts={Number(activeCampaign.summary.attempts_created ?? 0)}/
-                  {activeCampaign.attempt_count}
+            {/* Autopilot Campaign */}
+            <div className="rounded-xl border border-edge bg-surface overflow-hidden">
+              {/* Header */}
+              <div className="px-4 py-3 border-b border-edge bg-raised/50">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <span className="text-heading text-sm font-semibold tracking-tight">Autopilot</span>
+                    <span className="text-muted text-[10px] font-mono bg-elevated px-1.5 py-0.5 rounded">AUTO</span>
+                  </div>
+                  {activeCampaign && (
+                    <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${
+                      activeCampaign.status === 'running' ? 'bg-accent-dim text-accent' :
+                      activeCampaign.status === 'completed' ? 'bg-accent-dim text-accent' :
+                      activeCampaign.status === 'cancelled' ? 'bg-warning-dim text-warning' :
+                      'bg-elevated text-muted'
+                    }`}>
+                      {activeCampaign.status === 'running' ? 'RUNNING' :
+                       activeCampaign.status === 'completed' ? 'DONE' :
+                       activeCampaign.status.toUpperCase()}
+                    </span>
+                  )}
                 </div>
-              ) : null}
+              </div>
+
+              <div className="px-4 py-3 space-y-3">
+                {/* Campaign Progress (when active) */}
+                {activeCampaign && (
+                  <div className={`rounded-lg border px-3 py-3 space-y-2.5 ${
+                    activeCampaign.status === 'running' ? 'border-accent/30 bg-accent-dim' :
+                    activeCampaign.status === 'completed' ? 'border-accent/20 bg-accent-dim' :
+                    activeCampaign.status === 'cancelled' ? 'border-warning/20 bg-warning-dim' :
+                    'border-edge bg-raised'
+                  }`}>
+                    {/* Status header */}
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-semibold text-primary">
+                        {activeCampaign.status === 'running' ? '\uD83D\uDD2C Autopilot Running' :
+                         activeCampaign.status === 'completed' ? '\u2705 Completed' :
+                         activeCampaign.status === 'cancelled' ? '\u26A0\uFE0F Stopped' :
+                         activeCampaign.status}
+                      </span>
+                      <span className="text-[10px] font-mono text-muted">
+                        {Number(activeCampaign.summary.attempts_created ?? 0)}/{activeCampaign.attempt_count} {'\uC2DC\uB3C4 \uC644\uB8CC'}
+                      </span>
+                    </div>
+
+                    {/* Progress bar */}
+                    <div className="w-full h-1.5 bg-edge rounded-full overflow-hidden">
+                      <div
+                        className={`h-full rounded-full transition-all duration-500 ${
+                          activeCampaign.status === 'running' ? 'bg-accent' :
+                          activeCampaign.status === 'completed' ? 'bg-accent' : 'bg-warning'
+                        }`}
+                        style={{ width: `${Math.min(100, (Number(activeCampaign.summary.attempts_created ?? 0) / Math.max(1, activeCampaign.attempt_count)) * 100)}%` }}
+                      />
+                    </div>
+
+                    {/* Planner insights grid */}
+                    <div className="grid grid-cols-2 gap-x-3 gap-y-1.5">
+                      {activeCampaign.planner_state.phase != null && (
+                        <div className="flex items-center justify-between">
+                          <span className="text-[10px] text-muted">Phase</span>
+                          <span className="text-[10px] font-semibold text-primary">
+                            {activeCampaign.planner_state.phase === 'bootstrap' ? '\uBD80\uD2B8\uC2A4\uD2B8\uB7A9' :
+                             activeCampaign.planner_state.phase === 'searching' ? '\uD0D0\uC0C9\uC911' :
+                             activeCampaign.planner_state.phase === 'exploiting' ? '\uCD5C\uC801\uD654\uC911' :
+                             activeCampaign.planner_state.phase === 'infeasible' ? '\uBD80\uC801\uD569' :
+                             String(activeCampaign.planner_state.phase)}
+                          </span>
+                        </div>
+                      )}
+                      {activeCampaign.planner_state.best_score != null && (
+                        <div className="flex items-center justify-between">
+                          <span className="text-[10px] text-muted">Best</span>
+                          <span className="text-[10px] font-mono font-semibold text-accent">
+                            {Number(activeCampaign.planner_state.best_score).toFixed(3)}
+                          </span>
+                        </div>
+                      )}
+                      {activeCampaign.planner_state.dominant_failure != null && (
+                        <div className="flex items-center justify-between">
+                          <span className="text-[10px] text-muted">Failure</span>
+                          <span className="text-[10px] font-semibold text-warning">
+                            {activeCampaign.planner_state.dominant_failure === 'speed' ? '\uC18D\uB3C4 \uB4DC\uB9AC\uD504\uD2B8' :
+                             activeCampaign.planner_state.dominant_failure === 'tone' ? '\uC74C\uC0C9 \uBD88\uC77C\uCE58' :
+                             activeCampaign.planner_state.dominant_failure === 'asr' ? 'ASR \uBD88\uC77C\uCE58' :
+                             activeCampaign.planner_state.dominant_failure === 'overall' ? '\uC804\uCCB4 \uD488\uC9C8' :
+                             activeCampaign.planner_state.dominant_failure === 'infra' ? '\uC778\uD504\uB77C' :
+                             String(activeCampaign.planner_state.dominant_failure)}
+                          </span>
+                        </div>
+                      )}
+                      {activeCampaign.planner_state.stop_recommendation != null && (
+                        <div className="flex items-center justify-between col-span-2">
+                          <span className="text-[10px] text-muted">Recommendation</span>
+                          <span className="text-[10px] font-semibold text-primary">
+                            {String(activeCampaign.planner_state.stop_recommendation)}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Cancel button */}
+                    <button
+                      type="button"
+                      onClick={() => void handleCancelCampaign()}
+                      disabled={activeCampaign.status === 'cancelled' || activeCampaign.status === 'completed'}
+                      className="w-full mt-1 rounded-lg border border-edge px-3 py-1.5 text-[10px] font-semibold text-muted transition-colors hover:border-warning hover:text-warning disabled:opacity-30 disabled:hover:border-edge disabled:hover:text-muted"
+                    >
+                      Cancel Campaign
+                    </button>
+                  </div>
+                )}
+
+                {/* Direction picker (when no active campaign or campaign done) */}
+                {(!activeCampaign || activeCampaign.status === 'completed' || activeCampaign.status === 'cancelled') && (
+                  <>
+                    {/* Direction cards */}
+                    <div>
+                      <span className="text-subtle text-[10px] font-medium mb-2 block tracking-wide uppercase">{'\uD0D0\uC0C9 \uBC29\uD5A5'}</span>
+                      <div className="grid grid-cols-3 gap-2">
+                        {([
+                          { value: 'conservative' as const, label: '\uC548\uC815\uC801', desc: '\uAC80\uC99D\uB41C \uC124\uC815 \uC911\uC2EC. \uAE30\uC874 \uC131\uACF5 \uC601\uC5ED \uC9D1\uC911 \uD0D0\uC0C9' },
+                          { value: 'balanced' as const, label: '\uADE0\uD615', desc: '\uC131\uACF5 \uC7AC\uD604 + \uC0C8\uB85C\uC6B4 \uC601\uC5ED \uD0D0\uC0C9\uC744 \uADE0\uD615\uC788\uAC8C' },
+                          { value: 'exploratory' as const, label: '\uD0D0\uD5D8\uC801', desc: '\uB300\uB2F4\uD55C \uC124\uC815 \uBCC0\uD654. \uC0C8\uB85C\uC6B4 \uAC00\uB2A5\uC131 \uD0D0\uC0C9' },
+                        ]).map((dir) => (
+                          <button
+                            key={dir.value}
+                            type="button"
+                            onClick={() => setCampaignDirection(dir.value)}
+                            className={`relative rounded-lg border px-2.5 py-2.5 text-left transition-all duration-150 ${
+                              campaignDirection === dir.value
+                                ? 'border-accent bg-accent-dim ring-1 ring-accent/30'
+                                : 'border-edge bg-raised hover:border-subtle hover:bg-elevated'
+                            }`}
+                          >
+                            <span className={`block text-xs font-semibold mb-0.5 ${
+                              campaignDirection === dir.value ? 'text-accent' : 'text-primary'
+                            }`}>
+                              {dir.label}
+                            </span>
+                            <span className="block text-[9px] leading-tight text-muted">
+                              {dir.desc}
+                            </span>
+                            {campaignDirection === dir.value && (
+                              <span className="absolute top-1.5 right-1.5 w-1.5 h-1.5 rounded-full bg-accent" />
+                            )}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Attempts input */}
+                    <div className="flex items-center gap-3">
+                      <label htmlFor="campaign-attempts" className="text-subtle text-[10px] font-medium whitespace-nowrap">{'\uC2DC\uB3C4 \uD69F\uC218'}</label>
+                      <input
+                        id="campaign-attempts"
+                        type="number"
+                        min={1}
+                        max={12}
+                        value={campaignAttempts}
+                        onChange={(e) => setCampaignAttempts(parseInt(e.target.value, 10) || 1)}
+                        className="w-16 bg-raised border border-edge rounded-lg px-2 py-1.5 text-xs text-primary font-mono text-center focus:border-accent transition-colors"
+                      />
+                      <span className="text-muted text-[10px] font-mono">{'\uC2AC\uB86F 3\uAC1C \uBCD1\uB82C \uC2E4\uD589'}</span>
+                    </div>
+
+                    {/* Start button */}
+                    <button
+                      type="button"
+                      onClick={() => void handleStartCampaign()}
+                      disabled={!selectedVoiceId || startingCampaign || voices.length === 0}
+                      className="w-full rounded-lg bg-accent hover:bg-accent-light text-void font-semibold text-xs py-2.5 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                    >
+                      {startingCampaign ? 'Starting...' : 'Start Autopilot'}
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-edge bg-surface px-3 py-2.5">
+              <button
+                type="button"
+                onClick={() => setShowAdvancedConfig((previous) => !previous)}
+                className="flex w-full items-center justify-between text-left"
+              >
+                <span className="text-muted text-[10px] font-semibold uppercase tracking-wide">Advanced</span>
+                <span className="text-muted text-[10px] font-mono">{showAdvancedConfig ? '\u25B4' : '\u25BE'}</span>
+              </button>
+
+              {showAdvancedConfig && (
+                <div className="mt-3 space-y-3 pt-3 border-t border-edge">
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label htmlFor="training-batch-size" className="text-subtle text-[10px] font-medium mb-1 block">Batch Size</label>
+                      <input
+                        id="training-batch-size"
+                        type="number"
+                        value={batchSize}
+                        onChange={(e) => setBatchSize(parseInt(e.target.value) || 1)}
+                        min={1}
+                        max={32}
+                        className="w-full bg-raised border border-edge rounded-lg px-2.5 py-1.5 text-xs text-primary font-mono focus:border-accent transition-colors"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="training-epochs" className="text-subtle text-[10px] font-medium mb-1 block">Epochs</label>
+                      <input
+                        id="training-epochs"
+                        type="number"
+                        value={epochs}
+                        onChange={(e) => setEpochs(parseInt(e.target.value) || 1)}
+                        min={1}
+                        max={50}
+                        className="w-full bg-raised border border-edge rounded-lg px-2.5 py-1.5 text-xs text-primary font-mono focus:border-accent transition-colors"
+                      />
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label htmlFor="training-learning-rate" className="text-subtle text-[10px] font-medium mb-1 block">Learning Rate</label>
+                      <input
+                        id="training-learning-rate"
+                        type="text"
+                        value={learningRate}
+                        onChange={(e) => {
+                          const val = parseFloat(e.target.value)
+                          if (!isNaN(val)) setLearningRate(val)
+                        }}
+                        className="w-full bg-raised border border-edge rounded-lg px-2.5 py-1.5 text-xs text-primary font-mono focus:border-accent transition-colors"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="training-seed" className="text-subtle text-[10px] font-medium mb-1 block">Seed</label>
+                      <input
+                        id="training-seed"
+                        type="number"
+                        value={trainingSeed}
+                        onChange={(e) => setTrainingSeed(parseInt(e.target.value, 10) || 1)}
+                        className="w-full bg-raised border border-edge rounded-lg px-2.5 py-1.5 text-xs text-primary font-mono focus:border-accent transition-colors"
+                      />
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label htmlFor="training-grad-acc" className="text-subtle text-[10px] font-medium mb-1 block">Gradient Accum.</label>
+                      <input
+                        id="training-grad-acc"
+                        type="number"
+                        min={1}
+                        value={gradientAccumulationSteps}
+                        onChange={(e) => setGradientAccumulationSteps(parseInt(e.target.value, 10) || 1)}
+                        className="w-full bg-raised border border-edge rounded-lg px-2.5 py-1.5 text-xs text-primary font-mono focus:border-accent transition-colors"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="training-subtalker" className="text-subtle text-[10px] font-medium mb-1 block">Subtalker Weight</label>
+                      <input
+                        id="training-subtalker"
+                        type="number"
+                        step="0.05"
+                        value={subtalkerLossWeight}
+                        onChange={(e) => setSubtalkerLossWeight(parseFloat(e.target.value) || 0)}
+                        className="w-full bg-raised border border-edge rounded-lg px-2.5 py-1.5 text-xs text-primary font-mono focus:border-accent transition-colors"
+                      />
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label htmlFor="training-save-every" className="text-subtle text-[10px] font-medium mb-1 block">Save Every N Ep.</label>
+                      <input
+                        id="training-save-every"
+                        type="number"
+                        min={1}
+                        value={saveEveryNEpochs}
+                        onChange={(e) => setSaveEveryNEpochs(parseInt(e.target.value, 10) || 1)}
+                        className="w-full bg-raised border border-edge rounded-lg px-2.5 py-1.5 text-xs text-primary font-mono focus:border-accent transition-colors"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="training-gpu" className="text-subtle text-[10px] font-medium mb-1 block">GPU Type</label>
+                      <input
+                        id="training-gpu"
+                        type="text"
+                        value={gpuTypeId}
+                        onChange={(e) => setGpuTypeId(e.target.value)}
+                        className="w-full bg-raised border border-edge rounded-lg px-2.5 py-1.5 text-xs text-primary font-mono focus:border-accent transition-colors"
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Submit */}
             <button
               type="submit"
               disabled={!selectedVoiceId || starting || voices.length === 0}
-              className="w-full bg-accent hover:bg-accent-light text-void font-semibold text-sm py-2.5 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              className="w-full bg-raised border border-edge hover:border-subtle text-primary font-semibold text-xs py-2.5 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
             >
-              {starting ? 'Starting...' : 'Start Training'}
+              {starting ? 'Starting...' : 'Start Single Training'}
             </button>
           </form>
         </div>

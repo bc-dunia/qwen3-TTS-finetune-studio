@@ -106,10 +106,13 @@ export interface TrainingCampaign {
   completed_at: number | null
 }
 
+export type CampaignDirection = 'conservative' | 'balanced' | 'exploratory'
+
 export interface CreateTrainingCampaignOptions {
   datasetName?: string
   attemptCount: number
   parallelism?: number
+  direction?: CampaignDirection
   baseConfigOverrides?: TrainingConfig
   stopRules?: TrainingCampaignStopRules
 }
@@ -777,6 +780,7 @@ export async function createTrainingCampaign(
       dataset_name: options.datasetName,
       attempt_count: options.attemptCount,
       parallelism: options.parallelism,
+      direction: options.direction,
       base_config_overrides: options.baseConfigOverrides,
       stop_rules: options.stopRules,
     }),
