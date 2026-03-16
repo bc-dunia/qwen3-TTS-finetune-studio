@@ -219,9 +219,7 @@ const buildInputPayload = (
 ): Record<string, unknown> => {
   const stylePrompt = typeof body.style_prompt === "string" ? body.style_prompt.trim() : "";
   const instruct = typeof body.instruct === "string" ? body.instruct.trim() : "";
-  const combinedInstruct = [stylePrompt ? `Style prompt: ${stylePrompt}` : "", instruct ? `Instruction: ${instruct}` : ""]
-    .filter(Boolean)
-    .join("\n");
+  const combinedInstruct = [stylePrompt, instruct].filter(Boolean).join("\n");
 
   return {
     text: body.text,
