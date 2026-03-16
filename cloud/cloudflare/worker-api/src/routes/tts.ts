@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import { createGeneration, getVoice } from "../lib/d1";
 import { enrichOutputWithReviewAsr } from "../lib/review-asr";
-import { getServerlessStatus, invokeServerless, invokeServerlessAsync } from "../lib/runpod";
+import { getServerlessStatus, invokeServerless, invokeServerlessAsync, type ServerlessSyncResult } from "../lib/runpod";
 import { authMiddleware } from "../middleware/auth";
 import type { AppContext, Generation, TTSRequest } from "../types";
 
@@ -271,13 +271,26 @@ const runTtsRequest = async (c: Context<AppContext>): Promise<Response> => {
   const seed = normalizeSeed(body.seed);
 
   const inputPayload = buildInputPayload(voiceId, modelId, voice, body, seed);
-  let runpodResponse: Record<string, unknown>;
+  let syncResult: ServerlessSyncResult;
   try {
-    runpodResponse = await invokeServerless(c.env, c.env.RUNPOD_ENDPOINT_ID, inputPayload);
+    syncResult = await invokeServerless(c.env, c.env.RUNPOD_ENDPOINT_ID, inputPayload);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown RunPod error";
     return c.json({ detail: { message } }, 502);
   }
+
+  if (syncResult.autoAsync) {
+    const jobId = String(syncResult.body.id ?? "");
+    if (!jobId) {
+      return c.json({ detail: { message: "RunPod returned async status but no job id" } }, 502);
+    }
+    return c.json(
+      { job_id: jobId, status: String(syncResult.body.status ?? "IN_PROGRESS") },
+      202
+    );
+  }
+
+  const runpodResponse = syncResult.body;
 
   if (typeof runpodResponse.error === "string" && runpodResponse.error) {
     const statusCode = isQualityThresholdError(runpodResponse.error) ? 422 : 502;
@@ -382,13 +395,27 @@ app.post("/:voice_id/review", async (c) => {
     },
   };
 
-  let runpodResponse: Record<string, unknown>;
+  let syncResult: ServerlessSyncResult;
   try {
-    runpodResponse = await invokeServerless(c.env, c.env.RUNPOD_ENDPOINT_ID, inputPayload);
+    syncResult = await invokeServerless(c.env, c.env.RUNPOD_ENDPOINT_ID, inputPayload);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown RunPod error";
     return c.json({ detail: { message } }, 502);
   }
+
+  if (syncResult.autoAsync) {
+    return c.json({
+      ok: false,
+      voice_id: voiceId,
+      model_id: modelId,
+      text,
+      voice_settings: body.voice_settings ?? voice.settings,
+      error: "Review generation exceeded sync timeout. Please retry.",
+      quality: null,
+    });
+  }
+
+  const runpodResponse = syncResult.body;
 
   const topLevelError =
     typeof runpodResponse.error === "string" && runpodResponse.error.trim()

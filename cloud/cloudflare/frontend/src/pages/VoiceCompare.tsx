@@ -11,7 +11,7 @@ import {
   formatDateTime,
   formatDurationMs,
   formatTime,
-  getSpeechGenerationStatus,
+  pollSpeechGeneration,
   promoteTrainingCheckpoint,
   startSpeechGenerationAsync,
   type SpeechGenerationOptions,
@@ -638,35 +638,22 @@ export function VoiceCompare() {
 
     try {
       const asyncJob = await startSpeechGenerationAsync(voiceId, text.trim(), settings, options)
-      let attempts = 0
-
-      while (attempts < 180) {
-        attempts += 1
-        const status = await getSpeechGenerationStatus(asyncJob.job_id)
-        if (status.status === 'COMPLETED' && status.audio) {
-          const bytes = Uint8Array.from(atob(status.audio), (value) => value.charCodeAt(0))
-          setResults((prev) => ({
-            ...prev,
-            [candidate.id]: {
-              status: 'Completed',
-              blob: new Blob([bytes], { type: 'audio/wav' }),
-            },
-          }))
-          return
-        }
-
-        if (status.status === 'FAILED') {
-          throw new Error(status.error || 'Generation failed')
-        }
-
+      const result = await pollSpeechGeneration(asyncJob.job_id, (status) => {
         setResults((prev) => ({
           ...prev,
-          [candidate.id]: { status: status.status },
+          [candidate.id]: { status },
         }))
-        await new Promise((resolve) => setTimeout(resolve, 1000))
+      })
+      if (result.audio) {
+        const bytes = Uint8Array.from(atob(result.audio), (value) => value.charCodeAt(0))
+        setResults((prev) => ({
+          ...prev,
+          [candidate.id]: {
+            status: 'Completed',
+            blob: new Blob([bytes], { type: 'audio/wav' }),
+          },
+        }))
       }
-
-      throw new Error('Generation timed out. Please try again.')
     } catch (err) {
       setResults((prev) => ({
         ...prev,

@@ -58,11 +58,27 @@ const callRest = async <T>(
   return (await response.json()) as T;
 };
 
+/**
+ * Result from a synchronous RunPod invocation.
+ *
+ * RunPod's `/runsync` endpoint auto-converts long-running jobs to async after
+ * ~30 seconds.  When that happens the response contains `{ id, status: "IN_PROGRESS" }`
+ * instead of `{ output: { ... } }`.  Callers must inspect `autoAsync` and, when
+ * true, treat the result as a queued job whose `id` can be polled via
+ * `getServerlessStatus`.
+ */
+export type ServerlessSyncResult = {
+  /** Whether RunPod auto-converted the request to async because it exceeded the sync timeout. */
+  autoAsync: boolean;
+  /** Raw response body from RunPod. */
+  body: Record<string, unknown>;
+};
+
 export const invokeServerless = async (
   env: Env,
   endpointId: string,
   input: Record<string, unknown>
-): Promise<Record<string, unknown>> => {
+): Promise<ServerlessSyncResult> => {
   const url = `${RUNPOD_SERVERLESS_BASE_URL}/${endpointId}/runsync`;
   const response = await fetch(url, {
     method: "POST",
@@ -78,7 +94,14 @@ export const invokeServerless = async (
     throw new Error(`RunPod serverless invocation failed (${response.status}): ${bodyText}`);
   }
 
-  return (await response.json()) as Record<string, unknown>;
+  const body = (await response.json()) as Record<string, unknown>;
+
+  // RunPod auto-converts long /runsync jobs to async.  Detect that scenario so
+  // callers can switch to polling instead of failing with "no audio output".
+  const status = typeof body.status === "string" ? body.status : "";
+  const autoAsync = status === "IN_PROGRESS" || status === "IN_QUEUE";
+
+  return { autoAsync, body };
 };
 
 export const invokeServerlessAsync = async (

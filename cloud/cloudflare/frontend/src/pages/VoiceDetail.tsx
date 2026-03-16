@@ -3,7 +3,7 @@ import { useParams, useNavigate } from 'react-router'
 import {
   fetchVoice,
   deleteVoice,
-  getSpeechGenerationStatus,
+  pollSpeechGeneration,
   startSpeechGenerationAsync,
   type SpeechGenerationOptions,
   type Voice,
@@ -87,26 +87,11 @@ export function VoiceDetail() {
         instruct: instruct.trim() || undefined,
       }
       const asyncJob = await startSpeechGenerationAsync(voiceId, text.trim(), settings, promptOptions)
-      let completed = false
-      let attempts = 0
-      while (attempts < 180) {
-        attempts += 1
-        const status = await getSpeechGenerationStatus(asyncJob.job_id)
-        if (status.status === 'COMPLETED' && status.audio) {
-          const bytes = Uint8Array.from(atob(status.audio), (c) => c.charCodeAt(0))
-          setAudioBlob(new Blob([bytes], { type: 'audio/wav' }))
-          setGenerateStatus('Completed')
-          completed = true
-          break
-        }
-        if (status.status === 'FAILED') {
-          throw new Error(status.error || 'Generation failed')
-        }
-        setGenerateStatus(status.status)
-        await new Promise((resolve) => setTimeout(resolve, 1000))
-      }
-      if (!completed) {
-        throw new Error('Generation timed out. Please try again.')
+      const result = await pollSpeechGeneration(asyncJob.job_id, setGenerateStatus)
+      if (result.audio) {
+        const bytes = Uint8Array.from(atob(result.audio), (c) => c.charCodeAt(0))
+        setAudioBlob(new Blob([bytes], { type: 'audio/wav' }))
+        setGenerateStatus('Completed')
       }
     } catch (err) {
       setGenError(err instanceof Error ? err.message : 'Generation failed')

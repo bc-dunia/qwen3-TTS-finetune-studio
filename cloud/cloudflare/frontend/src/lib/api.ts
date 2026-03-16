@@ -692,6 +692,33 @@ export async function getSpeechGenerationStatus(jobId: string): Promise<AsyncSpe
   return request<AsyncSpeechStatus>(`/v1/text-to-speech/jobs/${jobId}`)
 }
 
+const POLL_FAST_INTERVAL_MS = 2_000
+const POLL_SLOW_INTERVAL_MS = 5_000
+const POLL_FAST_PHASE_MS = 30_000
+const POLL_MAX_DURATION_MS = 480_000
+
+export async function pollSpeechGeneration(
+  jobId: string,
+  onStatus?: (status: string) => void,
+): Promise<AsyncSpeechStatus> {
+  const start = Date.now()
+
+  while (Date.now() - start < POLL_MAX_DURATION_MS) {
+    const status = await getSpeechGenerationStatus(jobId)
+    if (status.status === 'COMPLETED') return status
+    if (status.status === 'FAILED') {
+      throw new Error(status.error || 'Generation failed')
+    }
+    onStatus?.(status.status)
+
+    const elapsed = Date.now() - start
+    const interval = elapsed < POLL_FAST_PHASE_MS ? POLL_FAST_INTERVAL_MS : POLL_SLOW_INTERVAL_MS
+    await new Promise((resolve) => setTimeout(resolve, interval))
+  }
+
+  throw new Error('Generation timed out after 8 minutes. Please try again.')
+}
+
 // ── Models ─────────────────────────────────────────────────────────────────────
 
 export async function fetchModels(): Promise<Model[]> {

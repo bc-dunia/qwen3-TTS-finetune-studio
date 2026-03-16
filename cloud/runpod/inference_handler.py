@@ -90,6 +90,13 @@ def _runpod() -> Any:
     return importlib.import_module("runpod")
 
 
+def _report_progress(job: dict[str, Any], stage: str) -> None:
+    try:
+        _runpod().serverless.progress_update(job, {"status": stage})
+    except Exception:
+        pass
+
+
 def _to_int(v: Any) -> int | None:
     try:
         return int(v) if v is not None else None
@@ -269,7 +276,9 @@ def _load_eval_model() -> Any:
         # compete with the live generation model for VRAM.
         opts = {"device_map": "cpu", "torch_dtype": _torch().float32}
         opts = {k: v for k, v in opts.items() if v is not None}
-        model = Qwen3TTSModel.from_pretrained(BASE_MODEL_PATHS["qwen3-tts-0.6b"], **opts)
+        model = Qwen3TTSModel.from_pretrained(
+            BASE_MODEL_PATHS["qwen3-tts-0.6b"], **opts
+        )
         try:
             model.model.eval()
         except Exception:
@@ -463,7 +472,9 @@ def _reference_similarity_metrics(
         librosa = importlib.import_module("librosa")
         ref_path = _cached_reference_audio(storage, reference_key)
         ref_audio, ref_sr = librosa.load(str(ref_path), sr=None, mono=True)
-        ref_audio_24 = _resample_audio(np.asarray(ref_audio, dtype=np.float32), int(ref_sr or 24000), 24000)
+        ref_audio_24 = _resample_audio(
+            np.asarray(ref_audio, dtype=np.float32), int(ref_sr or 24000), 24000
+        )
         gen_audio_24 = _resample_audio(audio, sr, 24000)
     except Exception as exc:
         _log(f"reference_review_failed key={reference_key} error={exc}")
@@ -477,7 +488,9 @@ def _reference_similarity_metrics(
             gen_emb = _speaker_embedding(gen_audio_24, 24000)
             speaker_cos = _cosine(gen_emb, ref_emb)
             result["speaker_cosine"] = float(speaker_cos)
-            result["speaker_score"] = float(_clamp((speaker_cos - 0.85) / 0.15, 0.0, 1.0))
+            result["speaker_score"] = float(
+                _clamp((speaker_cos - 0.85) / 0.15, 0.0, 1.0)
+            )
         except Exception as exc:
             _log(f"reference_speaker_review_failed key={reference_key} error={exc}")
 
@@ -491,8 +504,13 @@ def _reference_similarity_metrics(
             result["generated_pitch_std"] = float(gen_pitch_std)
             if ref_pitch_median > 0.0 and gen_pitch_median > 0.0:
                 tone_score = (
-                    (_ratio_score(gen_pitch_median, ref_pitch_median, tolerance=1.3) * 0.7)
-                    + (_ratio_score(max(gen_pitch_std, 1.0), max(ref_pitch_std, 1.0), tolerance=1.1) * 0.3)
+                    _ratio_score(gen_pitch_median, ref_pitch_median, tolerance=1.3)
+                    * 0.7
+                ) + (
+                    _ratio_score(
+                        max(gen_pitch_std, 1.0), max(ref_pitch_std, 1.0), tolerance=1.1
+                    )
+                    * 0.3
                 )
                 result["tone_score"] = float(_clamp(tone_score, 0.0, 1.0))
         except Exception as exc:
@@ -505,7 +523,12 @@ def _reference_similarity_metrics(
             gen_duration_sec = float(len(gen_audio_24) / 24000.0)
             ref_chars = len(_normalize_text(reference_text))
             gen_chars = len(_normalize_text(text))
-            if ref_chars > 0 and gen_chars > 0 and ref_duration_sec > 0 and gen_duration_sec > 0:
+            if (
+                ref_chars > 0
+                and gen_chars > 0
+                and ref_duration_sec > 0
+                and gen_duration_sec > 0
+            ):
                 ref_cps = ref_chars / ref_duration_sec
                 gen_cps = gen_chars / gen_duration_sec
                 result["reference_chars_per_sec"] = float(ref_cps)
@@ -544,7 +567,9 @@ def _decode_params(job_input: dict[str, Any]) -> tuple[dict[str, Any], float | N
         "subtalker_temperature": _clamp(
             0.50 + (style * 0.18) + (variability * 0.10), 0.45, 0.85
         ),
-        "subtalker_top_k": int(round(_clamp(18 + (style * 12) + (variability * 8), 12, 40))),
+        "subtalker_top_k": int(
+            round(_clamp(18 + (style * 12) + (variability * 8), 12, 40))
+        ),
         "subtalker_top_p": _clamp(0.86 + (style * 0.08), 0.82, 0.96),
         "do_sample": True,
         "subtalker_dosample": True,
@@ -1086,7 +1111,9 @@ def _verify_quality(
         if isinstance(speed_score, (int, float)):
             weighted_parts.append((_clamp(float(speed_score), 0.0, 1.0), 0.02))
         total_weight = sum(weight for _, weight in weighted_parts) or 1.0
-        overall_score = sum(score * weight for score, weight in weighted_parts) / total_weight
+        overall_score = (
+            sum(score * weight for score, weight in weighted_parts) / total_weight
+        )
     else:
         overall_score = (
             _clamp(duration_score, 0.0, 1.0) * 0.3
@@ -1187,11 +1214,15 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                 )
         base_seed = _to_int(inp.get("seed"))
         seed_anchor = base_seed if base_seed is not None else int(time.time() * 1000)
+        review_cfg = inp.get("quality_review") or {}
+        is_quality_review = bool(review_cfg) and isinstance(review_cfg, dict)
         num_candidates = _to_int(inp.get("num_candidates"))
         if num_candidates is None:
-            num_candidates = 3 if model_id == "qwen3-tts-0.6b" else 2
+            if is_quality_review:
+                num_candidates = 3 if model_id == "qwen3-tts-0.6b" else 2
+            else:
+                num_candidates = 2
         num_candidates = max(1, min(5, num_candidates))
-        review_cfg = inp.get("quality_review") or {}
         allow_below_threshold = bool(
             review_cfg.get("allow_below_threshold", False)
             if isinstance(review_cfg, dict)
@@ -1199,6 +1230,7 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         )
 
         storage = _r2_storage_cls()()
+        _report_progress(job, "LOADING_MODEL")
         try:
             model = _get_model(
                 storage=storage,
@@ -1216,8 +1248,9 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         except Exception as exc:
             return {"error": f"Model loading failure: {exc}"}
 
+        _report_progress(job, "GENERATING")
         retries = 0
-        max_rounds = 3
+        max_rounds = 3 if is_quality_review else 1
         best_candidate: dict[str, Any] | None = None
         candidate_scores: list[float] = []
         last_error: Exception | None = None
@@ -1263,6 +1296,7 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                     )
                     continue
 
+                _report_progress(job, "REVIEWING")
                 quality = _verify_quality(
                     audio,
                     sr,
@@ -1377,7 +1411,11 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         ]:
             if key in quality:
                 raw_value = quality[key]
-                out["quality"][key] = float(raw_value) if isinstance(raw_value, (int, float)) else raw_value
+                out["quality"][key] = (
+                    float(raw_value)
+                    if isinstance(raw_value, (int, float))
+                    else raw_value
+                )
         if speed_hint is not None:
             out["speed_hint"] = speed_hint
             out["speed_hint_note"] = (
