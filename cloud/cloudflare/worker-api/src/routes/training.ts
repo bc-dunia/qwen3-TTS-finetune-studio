@@ -5166,7 +5166,12 @@ const validateTrainedCheckpoint = async (
           let lastErrorDetail = "unknown";
 
           for (let attempt = 1; attempt <= VALIDATION_RETRY_ATTEMPTS; attempt += 1) {
-            response = await invokeServerless(c.env, c.env.RUNPOD_ENDPOINT_ID, payload);
+            const syncResult = await invokeServerless(c.env, c.env.RUNPOD_ENDPOINT_ID, payload);
+            if (syncResult.autoAsync) {
+              lastErrorDetail = "validation exceeded sync timeout";
+              continue;
+            }
+            response = syncResult.body;
             output = (response.output ?? {}) as { quality?: Record<string, unknown>; audio?: string; error?: unknown };
 
             if (output.audio) {

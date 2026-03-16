@@ -90,11 +90,17 @@ def _runpod() -> Any:
     return importlib.import_module("runpod")
 
 
+_PROGRESS_ERROR_LOGGED = False
+
+
 def _report_progress(job: dict[str, Any], stage: str) -> None:
+    global _PROGRESS_ERROR_LOGGED
     try:
         _runpod().serverless.progress_update(job, {"status": stage})
-    except Exception:
-        pass
+    except Exception as exc:
+        if not _PROGRESS_ERROR_LOGGED:
+            _log(f"progress_update failed (will suppress further): {exc}")
+            _PROGRESS_ERROR_LOGGED = True
 
 
 def _to_int(v: Any) -> int | None:

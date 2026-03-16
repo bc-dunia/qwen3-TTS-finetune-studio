@@ -664,6 +664,14 @@ export async function generateSpeech(
     throw new ApiError(detail, response.status, detail)
   }
 
+  if (response.status === 202) {
+    throw new ApiError(
+      'Generation is still in progress. Use the async endpoint for long requests.',
+      202,
+      'async_redirect',
+    )
+  }
+
   return response.blob()
 }
 
@@ -696,15 +704,34 @@ const POLL_FAST_INTERVAL_MS = 2_000
 const POLL_SLOW_INTERVAL_MS = 5_000
 const POLL_FAST_PHASE_MS = 30_000
 const POLL_MAX_DURATION_MS = 480_000
+const POLL_MAX_TRANSIENT_ERRORS = 5
 
 export async function pollSpeechGeneration(
   jobId: string,
   onStatus?: (status: string) => void,
+  signal?: AbortSignal,
 ): Promise<AsyncSpeechStatus> {
   const start = Date.now()
+  let transientErrors = 0
 
   while (Date.now() - start < POLL_MAX_DURATION_MS) {
-    const status = await getSpeechGenerationStatus(jobId)
+    if (signal?.aborted) {
+      throw new Error('Generation cancelled')
+    }
+
+    let status: AsyncSpeechStatus
+    try {
+      status = await getSpeechGenerationStatus(jobId)
+      transientErrors = 0
+    } catch (err) {
+      transientErrors += 1
+      if (transientErrors >= POLL_MAX_TRANSIENT_ERRORS) {
+        throw err
+      }
+      await new Promise((resolve) => setTimeout(resolve, POLL_SLOW_INTERVAL_MS))
+      continue
+    }
+
     if (status.status === 'COMPLETED') return status
     if (status.status === 'FAILED') {
       throw new Error(status.error || 'Generation failed')
