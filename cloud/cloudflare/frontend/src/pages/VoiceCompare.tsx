@@ -26,6 +26,7 @@ import {
   shouldWatchTrainingJob,
 } from '../lib/trainingCheckout'
 import { buildTrainingAdvice } from '../lib/trainingAdvisor'
+import { formatScore, scoreColor } from '../lib/voiceScoreUi'
 
 const MAX_COMPARE_CANDIDATES = 4
 
@@ -45,6 +46,9 @@ type CheckpointCandidate = {
   isStoredCandidate: boolean
   isJobRecommendation: boolean
   validationPassed: boolean
+  toneScore: number | null
+  speedScore: number | null
+  styleScore: number | null
 }
 
 type RunSummary = {
@@ -231,6 +235,9 @@ function buildCheckpointCandidates(
       message: string | null
       isJobRecommendation: boolean
       validationPassed: boolean
+      toneScore: number | null
+      speedScore: number | null
+      styleScore: number | null
     }) => {
       const existing = byPrefix.get(input.prefix)
       const next: CheckpointCandidate = {
@@ -249,6 +256,9 @@ function buildCheckpointCandidates(
         isStoredCandidate: storedCandidatePrefix === input.prefix,
         isJobRecommendation: input.isJobRecommendation,
         validationPassed: input.validationPassed,
+        toneScore: input.toneScore,
+        speedScore: input.speedScore,
+        styleScore: input.styleScore,
       }
 
       if (!existing) {
@@ -266,6 +276,9 @@ function buildCheckpointCandidates(
         isStoredCandidate: existing.isStoredCandidate || next.isStoredCandidate,
         isJobRecommendation: existing.isJobRecommendation || next.isJobRecommendation,
         validationPassed: existing.validationPassed || next.validationPassed,
+        toneScore: next.toneScore ?? existing.toneScore,
+        speedScore: next.speedScore ?? existing.speedScore,
+        styleScore: next.styleScore ?? existing.styleScore,
         createdAt: Math.max(existing.createdAt, next.createdAt),
         completedAt: existing.completedAt ?? next.completedAt,
         attemptNumber: existing.attemptNumber ?? next.attemptNumber,
@@ -282,6 +295,9 @@ function buildCheckpointCandidates(
         message: candidate.message,
         isJobRecommendation: champion?.prefix === candidate.prefix,
         validationPassed: candidate.ok,
+        toneScore: candidate.tone_score ?? null,
+        speedScore: candidate.speed_score ?? null,
+        styleScore: candidate.style_score ?? null,
       })
     }
 
@@ -294,6 +310,9 @@ function buildCheckpointCandidates(
         message: validationMessage,
         isJobRecommendation: true,
         validationPassed,
+        toneScore: null,
+        speedScore: null,
+        styleScore: null,
       })
     }
 
@@ -306,6 +325,9 @@ function buildCheckpointCandidates(
         message: validationMessage,
         isJobRecommendation: false,
         validationPassed,
+        toneScore: null,
+        speedScore: null,
+        styleScore: null,
       })
     }
   }
@@ -330,6 +352,9 @@ function buildCheckpointCandidates(
       isStoredCandidate: false,
       isJobRecommendation: false,
       validationPassed: false,
+      toneScore: null,
+      speedScore: null,
+      styleScore: null,
     })
   }
 
@@ -350,6 +375,9 @@ function buildCheckpointCandidates(
       isStoredCandidate: true,
       isJobRecommendation: true,
       validationPassed: true,
+      toneScore: null,
+      speedScore: null,
+      styleScore: null,
     })
   }
 
@@ -995,6 +1023,19 @@ export function VoiceCompare() {
                         <div className="text-muted text-[10px] font-mono mt-1">
                           run={candidate.attemptNumber ?? 'n/a'} epoch={candidate.epoch ?? 'n/a'} score={candidate.score !== null ? candidate.score.toFixed(3) : 'n/a'}
                         </div>
+                        {(candidate.styleScore != null || candidate.toneScore != null || candidate.speedScore != null) && (
+                          <div className="text-[10px] font-mono mt-1 flex flex-wrap gap-x-2">
+                            {candidate.styleScore != null && (
+                              <span>style=<span className={scoreColor(candidate.styleScore)}>{formatScore(candidate.styleScore)}</span></span>
+                            )}
+                            {candidate.toneScore != null && (
+                              <span>tone=<span className={scoreColor(candidate.toneScore)}>{formatScore(candidate.toneScore)}</span></span>
+                            )}
+                            {candidate.speedScore != null && (
+                              <span>speed=<span className={scoreColor(candidate.speedScore)}>{formatScore(candidate.speedScore)}</span></span>
+                            )}
+                          </div>
+                        )}
                         <div className="text-muted text-[10px] font-mono mt-1">
                           {formatDate(candidate.createdAt)} {formatTime(candidate.createdAt)}
                           {candidate.completedAt !== null ? ` · done ${formatTime(candidate.completedAt)}` : ''}
@@ -1061,6 +1102,19 @@ export function VoiceCompare() {
                           <div className="text-muted text-[10px] font-mono mt-1">
                             run={candidate.attemptNumber ?? 'n/a'} epoch={candidate.epoch ?? 'n/a'} score={candidate.score !== null ? candidate.score.toFixed(3) : 'n/a'} preset={candidate.preset ?? 'n/a'}
                           </div>
+                          {(candidate.styleScore != null || candidate.toneScore != null || candidate.speedScore != null) && (
+                            <div className="text-[10px] font-mono mt-1 flex flex-wrap gap-x-2">
+                              {candidate.styleScore != null && (
+                                <span>style=<span className={scoreColor(candidate.styleScore)}>{formatScore(candidate.styleScore)}</span></span>
+                              )}
+                              {candidate.toneScore != null && (
+                                <span>tone=<span className={scoreColor(candidate.toneScore)}>{formatScore(candidate.toneScore)}</span></span>
+                              )}
+                              {candidate.speedScore != null && (
+                                <span>speed=<span className={scoreColor(candidate.speedScore)}>{formatScore(candidate.speedScore)}</span></span>
+                              )}
+                            </div>
+                          )}
                           <div className="text-muted text-[10px] font-mono mt-1">
                             {formatDate(candidate.createdAt)} {formatTime(candidate.createdAt)}
                           </div>

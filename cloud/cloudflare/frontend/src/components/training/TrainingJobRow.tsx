@@ -16,6 +16,7 @@ import {
   updateTrainingPreprocessCache,
   updateTrainingPreprocessEntry,
 } from '../../lib/api'
+import { formatScore, scoreColor } from '../../lib/voiceScoreUi'
 import {
   getTrainingCheckoutSearch,
   getTrainingJobDisplayStatus,
@@ -123,6 +124,10 @@ export function TrainingJobRow({
   const [showLogs, setShowLogs] = useState(false)
 
   const checkout = getTrainingCheckoutSearch(job)
+  const championEval = checkout.champion
+    ? checkout.evaluated.find((e) => e.prefix === checkout.champion?.prefix && e.is_champion)
+      ?? checkout.evaluated.find((e) => e.prefix === checkout.champion?.prefix)
+    : null
   const statusLabel = getTrainingJobDisplayStatus(job)
   const statusClass = getStatusClasses(statusLabel)
   const isActive = isActiveTrainingJobStatus(job.status)
@@ -191,6 +196,7 @@ export function TrainingJobRow({
         <div className="mt-2 text-[11px] font-mono text-muted">
           score <span className={checkout.champion.score >= 0.8 ? 'text-accent font-semibold' : checkout.champion.score >= 0.6 ? 'text-warning font-semibold' : 'text-error font-semibold'}>{checkout.champion.score.toFixed(3)}</span>
           {checkout.champion.epoch != null && <span> · epoch {checkout.champion.epoch}</span>}
+          {championEval?.style_score != null && <span> · style <span className={scoreColor(championEval.style_score)}>{formatScore(championEval.style_score)}</span></span>}
           {checkout.status === 'promoted' && <span className="text-accent"> · promoted</span>}
           {checkout.status === 'rejected' && <span className="text-muted"> · rejected</span>}
           {checkout.status === 'candidate_ready' && <span className="text-warning"> · candidate</span>}
@@ -208,6 +214,19 @@ export function TrainingJobRow({
               value={typeof checkout.champion?.score === 'number' ? checkout.champion.score.toFixed(3) : '—'}
             />
           </div>
+          {championEval && (championEval.style_score != null || championEval.tone_score != null || championEval.speed_score != null) && (
+            <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[10px] font-mono text-muted">
+              {championEval.style_score != null && (
+                <span>style <span className={scoreColor(championEval.style_score)}>{formatScore(championEval.style_score)}</span></span>
+              )}
+              {championEval.tone_score != null && (
+                <span>tone <span className={scoreColor(championEval.tone_score)}>{formatScore(championEval.tone_score)}</span></span>
+              )}
+              {championEval.speed_score != null && (
+                <span>speed <span className={scoreColor(championEval.speed_score)}>{formatScore(championEval.speed_score)}</span></span>
+              )}
+            </div>
+          )}
 
           {(checkout.message || checkout.last_message) && (
             <div className="mt-3 rounded-lg border border-edge px-3 py-2 text-[11px] text-subtle">

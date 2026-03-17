@@ -9,6 +9,7 @@ import {
   formatDurationMs,
 } from '../lib/api'
 import { formatScore, scoreColor } from '../lib/voiceScoreUi'
+import { getTrainingCheckoutSearch } from '../lib/trainingCheckout'
 import { computeNiceDomain } from '../components/charts/chartDomain'
 import { LineChart } from '../components/charts/LineChart'
 import { BarChart } from '../components/charts/BarChart'
@@ -31,6 +32,7 @@ type VoicePerformanceRow = {
   avgDurationMs: number | null
   lastTrainedAt: number | null
   sparkline: number[]
+  latestStyleScore: number | null
 }
 
 function readNumber(value: unknown): number | null {
@@ -384,6 +386,18 @@ export function Statistics() {
         ? Math.max(...completedTimestamps)
         : null
 
+      const latestCompletedJob = voiceCompletedJobs
+        .slice()
+        .sort((a, b) => b.created_at - a.created_at)[0] ?? null
+      let latestStyleScore: number | null = null
+      if (latestCompletedJob) {
+        const checkout = getTrainingCheckoutSearch(latestCompletedJob)
+        const championEval = checkout.champion
+          ? checkout.evaluated.find((e) => e.prefix === checkout.champion?.prefix)
+          : null
+        latestStyleScore = championEval?.style_score ?? null
+      }
+
       return {
         voiceId: voice.voice_id,
         name: voice.name,
@@ -397,6 +411,7 @@ export function Statistics() {
         avgDurationMs: durations.length > 0 ? durations.reduce((sum, value) => sum + value, 0) / durations.length : null,
         lastTrainedAt,
         sparkline: sortedScores,
+        latestStyleScore,
       }
     })
 
@@ -611,10 +626,11 @@ export function Statistics() {
         </div>
 
         <div className="bg-raised border border-edge rounded-xl p-5 space-y-3">
-          <div className="hidden md:grid grid-cols-[1.4fr_72px_96px_170px_110px_100px_95px_90px] gap-x-3 text-[10px] font-mono uppercase tracking-widest text-muted border-b border-edge pb-2">
+          <div className="hidden md:grid grid-cols-[1.4fr_72px_80px_60px_170px_100px_88px_80px_90px] gap-x-3 text-[10px] font-mono uppercase tracking-widest text-muted border-b border-edge pb-2">
             <button type="button" className={`text-left ${sortKey === 'name' ? 'text-primary' : ''}`} onClick={() => handleSort('name')}>Voice{sortArrow('name')}</button>
             <span>Model</span>
             <button type="button" className={`text-right ${sortKey === 'score' ? 'text-primary' : ''}`} onClick={() => handleSort('score')}>Current{sortArrow('score')}</button>
+            <span className="text-right">Style</span>
             <button type="button" className={`text-right ${sortKey === 'delta' ? 'text-primary' : ''}`} onClick={() => handleSort('delta')}>First → Best{sortArrow('delta')}</button>
             <button type="button" className={`text-right ${sortKey === 'jobs' ? 'text-primary' : ''}`} onClick={() => handleSort('jobs')}>Jobs{sortArrow('jobs')}</button>
             <button type="button" className={`text-right ${sortKey === 'duration' ? 'text-primary' : ''}`} onClick={() => handleSort('duration')}>Avg Dur{sortArrow('duration')}</button>
@@ -625,10 +641,11 @@ export function Statistics() {
           <div className="space-y-2">
             {tableRows.map((row) => (
               <div key={row.voiceId}>
-                <div className="hidden md:grid grid-cols-[1.4fr_72px_96px_170px_110px_100px_95px_90px] gap-x-3 items-center py-2.5 border-b border-edge/40 last:border-b-0">
+                <div className="hidden md:grid grid-cols-[1.4fr_72px_80px_60px_170px_100px_88px_80px_90px] gap-x-3 items-center py-2.5 border-b border-edge/40 last:border-b-0">
                   <Link to={`/voices/${row.voiceId}/training`} className="text-accent text-xs hover:text-accent-light truncate">{row.name}</Link>
                   <span className="text-muted text-[11px] font-mono">{row.modelSize}</span>
                   <span className={`text-right text-xs font-mono font-bold ${scoreColor(row.currentScore)}`}>{formatScore(row.currentScore)}</span>
+                  <span className={`text-right text-xs font-mono ${scoreColor(row.latestStyleScore)}`}>{formatScore(row.latestStyleScore)}</span>
                   <span className="text-right text-xs font-mono">
                     <span className="text-muted">{formatScore(row.firstScore)}</span>
                     <span className="text-muted mx-1">→</span>
@@ -655,7 +672,7 @@ export function Statistics() {
                   <div className="grid grid-cols-2 gap-2 text-[11px] font-mono">
                     <div className="text-muted">Current <span className={scoreColor(row.currentScore)}>{formatScore(row.currentScore)}</span></div>
                     <div className="text-muted text-right">Jobs {row.completedJobs}/{row.totalJobs}</div>
-                    <div className="text-muted">Avg {formatDurationMs(row.avgDurationMs)}</div>
+                    <div className="text-muted">Style <span className={scoreColor(row.latestStyleScore)}>{formatScore(row.latestStyleScore)}</span></div>
                     <div className="text-muted text-right">{relativeTime(row.lastTrainedAt)}</div>
                   </div>
                   <div className="text-[11px] font-mono">
