@@ -444,6 +444,150 @@ def _pitch_stats(audio: np.ndarray, sr: int) -> tuple[float, float]:
         return 0.0, 0.0
 
 
+def _f0_contour(audio: np.ndarray, sr: int, n_frames: int = 64) -> np.ndarray:
+    librosa = importlib.import_module("librosa")
+    arr = _resample_audio(audio, sr, 24000)
+    try:
+        f0, _, _ = librosa.pyin(
+            arr.astype(np.float32),
+            fmin=float(librosa.note_to_hz("C2")),
+            fmax=float(librosa.note_to_hz("C6")),
+            sr=24000,
+            frame_length=1024,
+            hop_length=256,
+        )
+        voiced_mask = np.isfinite(f0)
+        if voiced_mask.sum() < 4:
+            return np.zeros(n_frames, dtype=np.float32)
+        log_f0 = np.where(voiced_mask, np.log(np.clip(f0, 1e-6, None)), np.nan)
+        nans = np.isnan(log_f0)
+        if nans.any() and not nans.all():
+            idx = np.arange(len(log_f0))
+            log_f0[nans] = np.interp(idx[nans], idx[~nans], log_f0[~nans])
+        mu = np.nanmean(log_f0)
+        sd = max(np.nanstd(log_f0), 1e-6)
+        normalized = (log_f0 - mu) / sd
+        resampled = np.interp(
+            np.linspace(0, len(normalized) - 1, n_frames),
+            np.arange(len(normalized)),
+            normalized,
+        )
+        return resampled.astype(np.float32)
+    except Exception:
+        return np.zeros(n_frames, dtype=np.float32)
+
+
+def _energy_contour(audio: np.ndarray, sr: int, n_frames: int = 64) -> np.ndarray:
+    arr = _resample_audio(audio, sr, 24000).astype(np.float32)
+    hop = max(1, len(arr) // (n_frames * 4))
+    frame_len = hop * 2
+    if len(arr) < frame_len:
+        return np.zeros(n_frames, dtype=np.float32)
+    n = (len(arr) - frame_len) // hop + 1
+    rms_env = np.array(
+        [
+            float(np.sqrt(np.mean(np.square(arr[i * hop : i * hop + frame_len]))))
+            for i in range(n)
+        ],
+        dtype=np.float32,
+    )
+    if rms_env.max() > 0:
+        rms_env = rms_env / rms_env.max()
+    resampled = np.interp(
+        np.linspace(0, len(rms_env) - 1, n_frames),
+        np.arange(len(rms_env)),
+        rms_env,
+    )
+    return resampled.astype(np.float32)
+
+
+def _rhythm_features(audio: np.ndarray, sr: int) -> dict[str, float]:
+    arr = _resample_audio(audio, sr, 24000).astype(np.float32)
+    hop = 256
+    frame_len = 512
+    if len(arr) < frame_len:
+        return {
+            "pause_ratio": 1.0,
+            "pause_count": 0.0,
+            "median_voiced_len": 0.0,
+            "median_pause_len": 0.0,
+        }
+    n = (len(arr) - frame_len) // hop + 1
+    rms = np.array(
+        [
+            float(np.sqrt(np.mean(np.square(arr[i * hop : i * hop + frame_len]))))
+            for i in range(n)
+        ],
+        dtype=np.float32,
+    )
+    threshold = max(rms.max() * 0.06, 0.005)
+    voiced = rms >= threshold
+    total = max(len(voiced), 1)
+    pause_ratio = float(1.0 - voiced.sum() / total)
+    changes = np.diff(voiced.astype(np.int8))
+    starts = np.where(changes == 1)[0]
+    ends = np.where(changes == -1)[0]
+    pause_starts = np.where(changes == -1)[0]
+    pause_ends = np.where(changes == 1)[0]
+    voiced_lens = []
+    if len(starts) > 0 and len(ends) > 0:
+        for s in starts:
+            e_arr = ends[ends > s]
+            if len(e_arr) > 0:
+                voiced_lens.append(float(e_arr[0] - s))
+    pause_lens = []
+    if len(pause_starts) > 0 and len(pause_ends) > 0:
+        for ps in pause_starts:
+            pe_arr = pause_ends[pause_ends > ps]
+            if len(pe_arr) > 0:
+                pause_lens.append(float(pe_arr[0] - ps))
+    frame_sec = hop / 24000.0
+    return {
+        "pause_ratio": pause_ratio,
+        "pause_count": float(len(pause_starts)),
+        "median_voiced_len": float(np.median(voiced_lens) * frame_sec)
+        if voiced_lens
+        else 0.0,
+        "median_pause_len": float(np.median(pause_lens) * frame_sec)
+        if pause_lens
+        else 0.0,
+    }
+
+
+def _contour_similarity(a: np.ndarray, b: np.ndarray) -> float | None:
+    if len(a) == 0 or len(b) == 0:
+        return None
+    a_f = a.astype(np.float64)
+    b_f = b.astype(np.float64)
+    if a_f.std() < 1e-8 or b_f.std() < 1e-8:
+        return None
+    corr = float(np.corrcoef(a_f, b_f)[0, 1])
+    if not np.isfinite(corr):
+        return None
+    return _clamp(max(corr, 0.0), 0.0, 1.0)
+
+
+def _rhythm_similarity(
+    ref_rhythm: dict[str, float], gen_rhythm: dict[str, float]
+) -> float:
+    sub_scores = []
+    ref_pr = ref_rhythm.get("pause_ratio", 0.0)
+    gen_pr = gen_rhythm.get("pause_ratio", 0.0)
+    pr_diff = abs(ref_pr - gen_pr)
+    sub_scores.append(float(np.exp(-3.0 * pr_diff)))
+    ref_vl = ref_rhythm.get("median_voiced_len", 0.0)
+    gen_vl = gen_rhythm.get("median_voiced_len", 0.0)
+    if ref_vl > 0.01 and gen_vl > 0.01:
+        sub_scores.append(_ratio_score(gen_vl, ref_vl, tolerance=1.5))
+    ref_pl = ref_rhythm.get("median_pause_len", 0.0)
+    gen_pl = gen_rhythm.get("median_pause_len", 0.0)
+    if ref_pl > 0.01 and gen_pl > 0.01:
+        sub_scores.append(_ratio_score(gen_pl, ref_pl, tolerance=1.5))
+    if not sub_scores:
+        return 0.5
+    return float(np.mean(sub_scores))
+
+
 def _ratio_score(a: float, b: float, *, tolerance: float = 1.0) -> float:
     x = max(float(a), 1e-6)
     y = max(float(b), 1e-6)
@@ -491,6 +635,18 @@ def _get_cached_ref_metrics(storage: Any, reference_key: str) -> dict[str, Any] 
         metrics["ref_pitch_std"] = std
     except Exception as exc:
         _log(f"reference_pitch_failed key={reference_key} error={exc}")
+    try:
+        metrics["ref_f0_contour"] = _f0_contour(ref_audio_24, 24000)
+    except Exception as exc:
+        _log(f"reference_f0_contour_failed key={reference_key} error={exc}")
+    try:
+        metrics["ref_energy_contour"] = _energy_contour(ref_audio_24, 24000)
+    except Exception as exc:
+        _log(f"reference_energy_contour_failed key={reference_key} error={exc}")
+    try:
+        metrics["ref_rhythm"] = _rhythm_features(ref_audio_24, 24000)
+    except Exception as exc:
+        _log(f"reference_rhythm_failed key={reference_key} error={exc}")
 
     if len(_REF_METRICS_CACHE) >= _REF_METRICS_MAX_ENTRIES:
         oldest = next(iter(_REF_METRICS_CACHE))
@@ -588,6 +744,47 @@ def _reference_similarity_metrics(
                 )
         except Exception as exc:
             _log(f"reference_speed_review_failed key={reference_key} error={exc}")
+
+    if bool(review_cfg.get("enable_style", True)):
+        style_parts: list[tuple[float, float]] = []
+        ref_f0 = ref.get("ref_f0_contour")
+        if ref_f0 is not None:
+            try:
+                gen_f0 = _f0_contour(gen_audio_24, 24000)
+                f0_sim = _contour_similarity(ref_f0, gen_f0)
+                if f0_sim is not None:
+                    result["f0_contour_score"] = float(f0_sim)
+                    style_parts.append((f0_sim, 0.45))
+            except Exception as exc:
+                _log(
+                    f"reference_f0_contour_review_failed key={reference_key} error={exc}"
+                )
+        ref_rhythm = ref.get("ref_rhythm")
+        if ref_rhythm is not None:
+            try:
+                gen_rhythm = _rhythm_features(gen_audio_24, 24000)
+                rhythm_sim = _rhythm_similarity(ref_rhythm, gen_rhythm)
+                result["rhythm_score"] = float(rhythm_sim)
+                style_parts.append((rhythm_sim, 0.35))
+            except Exception as exc:
+                _log(f"reference_rhythm_review_failed key={reference_key} error={exc}")
+        ref_energy = ref.get("ref_energy_contour")
+        if ref_energy is not None:
+            try:
+                gen_energy = _energy_contour(gen_audio_24, 24000)
+                energy_sim = _contour_similarity(ref_energy, gen_energy)
+                if energy_sim is not None:
+                    result["energy_contour_score"] = float(energy_sim)
+                    style_parts.append((energy_sim, 0.20))
+            except Exception as exc:
+                _log(f"reference_energy_review_failed key={reference_key} error={exc}")
+        if style_parts:
+            total_w = sum(w for _, w in style_parts)
+            result["style_score"] = float(
+                _clamp(
+                    sum(s * w for s, w in style_parts) / max(total_w, 1e-6), 0.0, 1.0
+                )
+            )
 
     return result
 
@@ -1148,21 +1345,27 @@ def _verify_quality(
 
     if bool(review_cfg.get("enable_asr")) or reference_metrics:
         weighted_parts: list[tuple[float, float]] = [
-            (_clamp(duration_score, 0.0, 1.0), 0.22),
-            (_clamp(health_score, 0.0, 1.0), 0.33),
-            (_clamp(stability_score, 0.0, 1.0), 0.15),
+            (_clamp(duration_score, 0.0, 1.0), 0.10),
+            (_clamp(health_score, 0.0, 1.0), 0.15),
+            (_clamp(stability_score, 0.0, 1.0), 0.05),
         ]
         if bool(review_cfg.get("enable_asr")):
-            weighted_parts.append((_clamp(asr_score, 0.0, 1.0), 0.15))
+            weighted_parts.append((_clamp(asr_score, 0.0, 1.0), 0.20))
         speaker_score = reference_metrics.get("speaker_score")
         tone_score = reference_metrics.get("tone_score")
         speed_score = reference_metrics.get("speed_score")
+        style_score = reference_metrics.get("style_score")
         if isinstance(speaker_score, (int, float)):
-            weighted_parts.append((_clamp(float(speaker_score), 0.0, 1.0), 0.10))
-        if isinstance(tone_score, (int, float)):
-            weighted_parts.append((_clamp(float(tone_score), 0.0, 1.0), 0.03))
-        if isinstance(speed_score, (int, float)):
-            weighted_parts.append((_clamp(float(speed_score), 0.0, 1.0), 0.02))
+            weighted_parts.append((_clamp(float(speaker_score), 0.0, 1.0), 0.20))
+        if isinstance(style_score, (int, float)):
+            weighted_parts.append((_clamp(float(style_score), 0.0, 1.0), 0.30))
+        elif isinstance(tone_score, (int, float)) or isinstance(
+            speed_score, (int, float)
+        ):
+            if isinstance(tone_score, (int, float)):
+                weighted_parts.append((_clamp(float(tone_score), 0.0, 1.0), 0.03))
+            if isinstance(speed_score, (int, float)):
+                weighted_parts.append((_clamp(float(speed_score), 0.0, 1.0), 0.02))
         total_weight = sum(weight for _, weight in weighted_parts) or 1.0
         overall_score = (
             sum(score * weight for score, weight in weighted_parts) / total_weight
