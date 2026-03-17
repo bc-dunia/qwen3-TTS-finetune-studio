@@ -140,7 +140,7 @@ function buildFallbackCheckoutSearch(job: TrainingJob): TrainingCheckoutSearch {
       ) {
         return null
       }
-      return {
+      const evaluation: TrainingCheckoutEvaluation = {
         epoch: record.epoch,
         prefix: record.prefix,
         ok: record.ok,
@@ -152,7 +152,11 @@ function buildFallbackCheckoutSearch(job: TrainingJob): TrainingCheckoutSearch {
         run_name: parseRunNameFromCheckpointPrefix(record.prefix),
         is_champion: champion?.prefix === record.prefix,
         is_selected: selected?.prefix === record.prefix,
-      } satisfies TrainingCheckoutEvaluation
+        tone_score: typeof record.tone_score === 'number' ? record.tone_score : null,
+        speed_score: typeof record.speed_score === 'number' ? record.speed_score : null,
+        style_score: typeof record.style_score === 'number' ? record.style_score : null,
+      }
+      return evaluation
     })
     .filter((value): value is TrainingCheckoutEvaluation => value !== null)
     .sort((a, b) => {

@@ -158,6 +158,9 @@ export interface TrainingCheckoutEvaluation {
   run_name: string | null
   is_champion: boolean
   is_selected: boolean
+  tone_score?: number | null
+  speed_score?: number | null
+  style_score?: number | null
 }
 
 export interface TrainingCheckoutLedgerEntry {

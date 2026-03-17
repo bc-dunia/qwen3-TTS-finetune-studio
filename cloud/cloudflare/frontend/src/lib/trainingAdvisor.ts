@@ -296,6 +296,7 @@ export function buildTrainingAdvice(voice: Voice | null, jobs: TrainingJob[]): T
   const asrFailures = recentFailureMessages.filter((message) => message.includes('asr_score') || message.includes('missing asr')).length
   const toneFailures = recentFailureMessages.filter((message) => message.includes('tone_score')).length
   const speedFailures = recentFailureMessages.filter((message) => message.includes('speed_score')).length
+  const styleFailures = recentFailureMessages.filter((message) => message.includes('style_score')).length
   const overallFailures = recentFailureMessages.filter((message) => message.includes('overall_score') || message.includes('quality threshold')).length
   const infraFailures = recentFailureMessages.filter((message) => message.includes('no audio') || message.includes('request does not exist') || message.includes('stalled') || message.includes('recovery')).length
 
@@ -395,19 +396,21 @@ export function buildTrainingAdvice(voice: Voice | null, jobs: TrainingJob[]): T
     })
   }
 
-  if (toneFailures >= 1 || speedFailures >= 2) {
+  if (styleFailures >= 1 || toneFailures >= 1 || speedFailures >= 2) {
     const suggestion = tuneForTone(baseConfig, voice.model_size)
     return finalizeAdvice({
       mode: 'tone-explore',
       title: 'Run A Tone-Preservation Exploration',
       summary: `Speaker match is already in range, but the current history still looks too neutral or rushed. Try a lower-LR, lower-subtalker run focused on phrasing retention. ${describeConfig(suggestion)}`,
-      confidence: toneFailures >= 2 || speedFailures >= 2 ? 'high' : 'medium',
+      confidence: styleFailures >= 2 || toneFailures >= 2 || speedFailures >= 2 ? 'high' : 'medium',
       reasons: [
-        toneFailures > 0
-          ? `${toneFailures} recent failures mention tone loss directly.`
-          : speedFailures > 0
-            ? `${speedFailures} recent failures mention speed drift.`
-            : 'Validated runs exist, but they are not obviously solving speaking habit retention.',
+        styleFailures > 0
+          ? `${styleFailures} recent failures mention style score (f0/rhythm/energy contour).`
+          : toneFailures > 0
+            ? `${toneFailures} recent failures mention tone loss directly.`
+            : speedFailures > 0
+              ? `${speedFailures} recent failures mention speed drift.`
+              : 'Validated runs exist, but they are not obviously solving speaking habit retention.',
         'Lower learning rate and slightly lighter subtalker pressure tends to preserve signature phrasing better.',
         'Seed rotation helps surface a different local optimum without changing the dataset.',
       ],
