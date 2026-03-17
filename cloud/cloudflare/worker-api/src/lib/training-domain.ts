@@ -182,6 +182,7 @@ export interface ValidationThresholds {
   health_min: number;
   tone_min: number;
   speed_min: number;
+  style_min: number;
   overall_min: number;
   duration_min: number;
 }
@@ -189,37 +190,31 @@ export interface ValidationThresholds {
 export interface ValidationWeights {
   asr: number;
   speaker: number;
+  style: number;
   tone: number;
   speed: number;
   overall: number;
   duration: number;
 }
 
-/**
- * Gated thresholds — hard minimums that must pass before a checkpoint
- * is considered "usable" at all.
- */
 export const VALIDATION_GATE_THRESHOLDS: ValidationThresholds = {
-  asr_min: 0.8,
-  speaker_min: 0.75,
+  asr_min: 0.82,
+  speaker_min: 0.78,
   health_min: 0.72,
-  tone_min: 0.55,       // Raised from 0.4 — 40% likeness was too permissive
-  speed_min: 0.2,
-  overall_min: 0.85,
-  duration_min: 0.45,
+  tone_min: 0.50,
+  speed_min: 0.15,
+  style_min: 0.55,
+  overall_min: 0.80,
+  duration_min: 0.50,
 };
 
-/**
- * Ranking weights for comparing checkpoints that have passed the gate.
- * ASR and speaker are weighted highest because they directly affect
- * perceived voice quality. Duration is a weak signal.
- */
 export const VALIDATION_RANKING_WEIGHTS: ValidationWeights = {
   asr: 0.25,
   speaker: 0.25,
-  tone: 0.20,
-  speed: 0.15,
-  overall: 0.10,
+  style: 0.30,
+  tone: 0.00,
+  speed: 0.00,
+  overall: 0.05,
   duration: 0.05,
 };
 
@@ -229,6 +224,7 @@ export interface CheckpointScores {
   health_score?: number | null;
   tone_score?: number | null;
   speed_score?: number | null;
+  style_score?: number | null;
   overall_score?: number | null;
   duration_score?: number | null;
 }
@@ -245,14 +241,16 @@ export function passesValidationGate(
   const health = readNumber(scores.health_score);
   const tone = readNumber(scores.tone_score);
   const speed = readNumber(scores.speed_score);
+  const style = readNumber(scores.style_score);
   const overall = readNumber(scores.overall_score);
   const duration = readNumber(scores.duration_score);
 
   if (asr !== null && asr < thresholds.asr_min) return false;
   if (speaker !== null && speaker < thresholds.speaker_min) return false;
   if (health !== null && health < thresholds.health_min) return false;
-  if (tone !== null && tone < thresholds.tone_min) return false;
-  if (speed !== null && speed < thresholds.speed_min) return false;
+  if (style !== null && style < thresholds.style_min) return false;
+  if (tone !== null && style === null && tone < thresholds.tone_min) return false;
+  if (speed !== null && style === null && speed < thresholds.speed_min) return false;
   if (overall !== null && overall < thresholds.overall_min) return false;
   if (duration !== null && duration < thresholds.duration_min) return false;
 
@@ -269,14 +267,18 @@ export function computeRankingScore(
 ): number {
   const asr = readNumber(scores.asr_score) ?? 0;
   const speaker = readNumber(scores.speaker_score) ?? 0;
+  const style = readNumber(scores.style_score);
   const tone = readNumber(scores.tone_score) ?? 0;
   const speed = readNumber(scores.speed_score) ?? 0;
   const overall = readNumber(scores.overall_score) ?? 0;
   const duration = readNumber(scores.duration_score) ?? 0;
 
+  const styleValue = style ?? (tone * 0.6 + speed * 0.4);
+
   return (
     asr * weights.asr +
     speaker * weights.speaker +
+    styleValue * weights.style +
     tone * weights.tone +
     speed * weights.speed +
     overall * weights.overall +

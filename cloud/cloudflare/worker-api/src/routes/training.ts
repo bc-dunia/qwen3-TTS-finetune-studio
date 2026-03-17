@@ -141,9 +141,11 @@ type AsyncValidationAccumulator = {
   sum_speaker: number;
   sum_tone: number;
   sum_speed: number;
+  sum_style: number;
   speaker_samples: number;
   tone_samples: number;
   speed_samples: number;
+  style_samples: number;
   first_failure_message: string | null;
 };
 
@@ -225,6 +227,7 @@ type ValidationSampleOutcome = {
   speaker: number | null;
   tone: number | null;
   speed: number | null;
+  style: number | null;
   failureMessage: string | null;
 };
 
@@ -3370,6 +3373,7 @@ const buildValidationScoreParts = ({
   speaker,
   tone,
   speed,
+  style,
 }: {
   is06b: boolean;
   overall: number;
@@ -3380,10 +3384,16 @@ const buildValidationScoreParts = ({
   speaker: number;
   tone: number;
   speed: number;
+  style?: number;
 }): Array<{ value: number; weight: number }> => {
+  const hasStyle = typeof style === "number" && Number.isFinite(style);
   const baseWeights = is06b
-    ? { asr: 0.28, health: 0.14, duration: 0.10, passRate: 0.10, speaker: 0.24, tone: 0.10, speed: 0.04 }
-    : { asr: 0.22, health: 0.12, duration: 0.08, passRate: 0.08, speaker: 0.22, tone: 0.18, speed: 0.06, stability: 0.04 };
+    ? hasStyle
+      ? { asr: 0.25, health: 0.10, duration: 0.08, passRate: 0.08, speaker: 0.22, style: 0.27 }
+      : { asr: 0.28, health: 0.14, duration: 0.10, passRate: 0.10, speaker: 0.24, tone: 0.10, speed: 0.04 }
+    : hasStyle
+      ? { asr: 0.22, health: 0.08, duration: 0.06, passRate: 0.06, speaker: 0.22, style: 0.30, stability: 0.06 }
+      : { asr: 0.22, health: 0.12, duration: 0.08, passRate: 0.08, speaker: 0.22, tone: 0.18, speed: 0.06, stability: 0.04 };
 
   const parts: Array<{ value: number; weight: number }> = [
     { value: asr, weight: baseWeights.asr },
@@ -3392,17 +3402,21 @@ const buildValidationScoreParts = ({
     { value: passRate, weight: baseWeights.passRate },
   ];
 
-  if (!is06b) {
+  if (!is06b && "stability" in baseWeights) {
     parts.push({ value: overall, weight: (baseWeights as { stability: number }).stability });
   }
   if (Number.isFinite(speaker)) {
     parts.push({ value: speaker, weight: baseWeights.speaker });
   }
-  if (Number.isFinite(tone)) {
-    parts.push({ value: tone, weight: baseWeights.tone });
-  }
-  if (Number.isFinite(speed)) {
-    parts.push({ value: speed, weight: baseWeights.speed });
+  if (hasStyle) {
+    parts.push({ value: style, weight: (baseWeights as { style: number }).style });
+  } else {
+    if (Number.isFinite(tone) && "tone" in baseWeights) {
+      parts.push({ value: tone, weight: (baseWeights as { tone: number }).tone });
+    }
+    if (Number.isFinite(speed) && "speed" in baseWeights) {
+      parts.push({ value: speed, weight: (baseWeights as { speed: number }).speed });
+    }
   }
 
   return parts;
@@ -3577,9 +3591,11 @@ const createValidationAccumulator = (): AsyncValidationAccumulator => ({
   sum_speaker: 0,
   sum_tone: 0,
   sum_speed: 0,
+  sum_style: 0,
   speaker_samples: 0,
   tone_samples: 0,
   speed_samples: 0,
+  style_samples: 0,
   first_failure_message: null,
 });
 
@@ -3599,9 +3615,11 @@ const normalizeValidationAccumulator = (value: unknown): AsyncValidationAccumula
     sum_speaker: Number.isFinite(Number(src.sum_speaker)) ? Number(src.sum_speaker) : 0,
     sum_tone: Number.isFinite(Number(src.sum_tone)) ? Number(src.sum_tone) : 0,
     sum_speed: Number.isFinite(Number(src.sum_speed)) ? Number(src.sum_speed) : 0,
+    sum_style: Number.isFinite(Number(src.sum_style)) ? Number(src.sum_style) : 0,
     speaker_samples: Number.isFinite(Number(src.speaker_samples)) ? Number(src.speaker_samples) : 0,
     tone_samples: Number.isFinite(Number(src.tone_samples)) ? Number(src.tone_samples) : 0,
     speed_samples: Number.isFinite(Number(src.speed_samples)) ? Number(src.speed_samples) : 0,
+    style_samples: Number.isFinite(Number(src.style_samples)) ? Number(src.style_samples) : 0,
     first_failure_message:
       typeof src.first_failure_message === "string" ? src.first_failure_message : null,
   };
@@ -3816,6 +3834,7 @@ const evaluateValidationSample = ({
       speaker: null,
       tone: null,
       speed: null,
+      style: null,
       failureMessage,
     };
   }
@@ -3828,6 +3847,7 @@ const evaluateValidationSample = ({
   const speaker = Number(quality.speaker_score ?? NaN);
   const tone = Number(quality.tone_score ?? NaN);
   const speed = Number(quality.speed_score ?? NaN);
+  const style = Number(quality.style_score ?? NaN);
 
   const fail = (failureMessage: string, infraIssue = false): ValidationSampleOutcome => ({
     passed: false,
@@ -3840,6 +3860,7 @@ const evaluateValidationSample = ({
     speaker: Number.isFinite(speaker) ? speaker : null,
     tone: Number.isFinite(tone) ? tone : null,
     speed: Number.isFinite(speed) ? speed : null,
+    style: Number.isFinite(style) ? style : null,
     failureMessage,
   });
 
@@ -3861,13 +3882,16 @@ const evaluateValidationSample = ({
   if (asr < minAsrScore) {
     return fail(`sample ${sampleIndex} seed ${seed} asr_score=${asr.toFixed(3)}`);
   }
-  if (referenceAudioKey && Number.isFinite(speaker) && speaker < 0.75) {
+  if (referenceAudioKey && Number.isFinite(speaker) && speaker < VALIDATION_GATE_THRESHOLDS.speaker_min) {
     return fail(`sample ${sampleIndex} seed ${seed} speaker_score=${speaker.toFixed(3)}`);
   }
-  if (referenceAudioKey && Number.isFinite(tone) && tone < minToneScore) {
+  if (referenceAudioKey && Number.isFinite(style) && style < VALIDATION_GATE_THRESHOLDS.style_min) {
+    return fail(`sample ${sampleIndex} seed ${seed} style_score=${style.toFixed(3)}`);
+  }
+  if (referenceAudioKey && !Number.isFinite(style) && Number.isFinite(tone) && tone < minToneScore) {
     return fail(`sample ${sampleIndex} seed ${seed} tone_score=${tone.toFixed(3)}`);
   }
-  if (referenceAudioKey && referenceText && Number.isFinite(speed) && speed < 0.20) {
+  if (referenceAudioKey && !Number.isFinite(style) && referenceText && Number.isFinite(speed) && speed < VALIDATION_GATE_THRESHOLDS.speed_min) {
     return fail(`sample ${sampleIndex} seed ${seed} speed_score=${speed.toFixed(3)}`);
   }
 
@@ -3882,6 +3906,7 @@ const evaluateValidationSample = ({
     speaker: Number.isFinite(speaker) ? speaker : null,
     tone: Number.isFinite(tone) ? tone : null,
     speed: Number.isFinite(speed) ? speed : null,
+    style: Number.isFinite(style) ? style : null,
     failureMessage: null,
   };
 };
@@ -3921,6 +3946,10 @@ const applyValidationSampleOutcome = (
     next.sum_speed += outcome.speed;
     next.speed_samples += 1;
   }
+  if (typeof outcome.style === "number") {
+    next.sum_style += outcome.style;
+    next.style_samples += 1;
+  }
   return next;
 };
 
@@ -3948,6 +3977,7 @@ const finalizeValidationPresetResult = ({
       accumulator.speaker_samples > 0 ? accumulator.sum_speaker / accumulator.speaker_samples : NaN;
     const meanTone = accumulator.tone_samples > 0 ? accumulator.sum_tone / accumulator.tone_samples : NaN;
     const meanSpeed = accumulator.speed_samples > 0 ? accumulator.sum_speed / accumulator.speed_samples : NaN;
+    const meanStyle = accumulator.style_samples > 0 ? accumulator.sum_style / accumulator.style_samples : NaN;
     const scoreParts = buildValidationScoreParts({
       is06b,
       overall: meanOverall,
@@ -3958,14 +3988,21 @@ const finalizeValidationPresetResult = ({
       speaker: meanSpeaker,
       tone: meanTone,
       speed: meanSpeed,
+      style: meanStyle,
     });
     const totalWeight = scoreParts.reduce((acc, part) => acc + part.weight, 0) || 1;
     const score =
       scoreParts.reduce((acc, part) => acc + (part.value * part.weight), 0) / totalWeight;
-    const similarityNote =
-      Number.isFinite(meanSpeaker) && Number.isFinite(meanTone)
-        ? `speaker=${meanSpeaker.toFixed(3)} tone=${meanTone.toFixed(3)} `
-        : "";
+    const similaritySegments: string[] = [];
+    if (Number.isFinite(meanSpeaker)) {
+      similaritySegments.push(`speaker=${meanSpeaker.toFixed(3)}`);
+    }
+    if (Number.isFinite(meanStyle)) {
+      similaritySegments.push(`style=${meanStyle.toFixed(3)}`);
+    } else if (Number.isFinite(meanTone)) {
+      similaritySegments.push(`tone=${meanTone.toFixed(3)}`);
+    }
+    const similarityNote = similaritySegments.length > 0 ? `${similaritySegments.join(" ")} ` : "";
     const speedNote = Number.isFinite(meanSpeed) ? `speed=${meanSpeed.toFixed(3)} ` : "";
     return {
       ok: true,
@@ -3998,6 +4035,7 @@ const finalizeValidationPresetResult = ({
       speaker: accumulator.speaker_samples > 0 ? accumulator.sum_speaker / accumulator.speaker_samples : NaN,
       tone: accumulator.tone_samples > 0 ? accumulator.sum_tone / accumulator.tone_samples : NaN,
       speed: accumulator.speed_samples > 0 ? accumulator.sum_speed / accumulator.speed_samples : NaN,
+      style: accumulator.style_samples > 0 ? accumulator.sum_style / accumulator.style_samples : NaN,
     });
     const tw = parts.reduce((acc, part) => acc + part.weight, 0) || 1;
     failScore = parts.reduce((acc, part) => acc + (part.value * part.weight), 0) / tw;
@@ -4072,15 +4110,12 @@ const scoreSingleValidationOutput = ({
   const speaker = Number(quality.speaker_score ?? NaN);
   const tone = Number(quality.tone_score ?? NaN);
   const speed = Number(quality.speed_score ?? NaN);
+  const style = Number(quality.style_score ?? NaN);
 
-  // When core metrics are missing entirely, we genuinely have no score signal.
   const coreMetricsAvailable =
     Number.isFinite(overall) && Number.isFinite(duration) && Number.isFinite(health);
 
   const fail = (detail: string): CheckpointValidationResult => {
-    // Compute real weighted score when we have enough metrics, so the
-    // campaign planner can distinguish near-pass from garbage.
-    // When metrics are missing entirely, fall back to 0.
     let computedScore = 0;
     if (coreMetricsAvailable) {
       const parts = buildValidationScoreParts({
@@ -4093,6 +4128,7 @@ const scoreSingleValidationOutput = ({
         speaker,
         tone,
         speed,
+        style: Number.isFinite(style) ? style : undefined,
       });
       const tw = parts.reduce((acc, part) => acc + part.weight, 0) || 1;
       computedScore = parts.reduce((acc, part) => acc + (part.value * part.weight), 0) / tw;
@@ -4125,13 +4161,16 @@ const scoreSingleValidationOutput = ({
   if (asr < minAsrScore) {
     return fail(`sample 1 seed ${seed} asr_score=${asr.toFixed(3)}`);
   }
-  if (referenceAudioKey && Number.isFinite(speaker) && speaker < 0.75) {
+  if (referenceAudioKey && Number.isFinite(speaker) && speaker < VALIDATION_GATE_THRESHOLDS.speaker_min) {
     return fail(`sample 1 seed ${seed} speaker_score=${speaker.toFixed(3)}`);
   }
-  if (referenceAudioKey && Number.isFinite(tone) && tone < minToneScore) {
+  if (referenceAudioKey && Number.isFinite(style) && style < VALIDATION_GATE_THRESHOLDS.style_min) {
+    return fail(`sample 1 seed ${seed} style_score=${style.toFixed(3)}`);
+  }
+  if (referenceAudioKey && !Number.isFinite(style) && Number.isFinite(tone) && tone < minToneScore) {
     return fail(`sample 1 seed ${seed} tone_score=${tone.toFixed(3)}`);
   }
-  if (referenceAudioKey && referenceText && Number.isFinite(speed) && speed < 0.20) {
+  if (referenceAudioKey && !Number.isFinite(style) && referenceText && Number.isFinite(speed) && speed < VALIDATION_GATE_THRESHOLDS.speed_min) {
     return fail(`sample 1 seed ${seed} speed_score=${speed.toFixed(3)}`);
   }
 
@@ -4145,12 +4184,20 @@ const scoreSingleValidationOutput = ({
     speaker,
     tone,
     speed,
+    style: Number.isFinite(style) ? style : undefined,
   });
   const totalWeight = scoreParts.reduce((acc, part) => acc + part.weight, 0) || 1;
   const score = scoreParts.reduce((acc, part) => acc + (part.value * part.weight), 0) / totalWeight;
-  const similarityNote = Number.isFinite(speaker) && Number.isFinite(tone)
-    ? `speaker=${speaker.toFixed(3)} tone=${tone.toFixed(3)} `
-    : "";
+  const similaritySegments: string[] = [];
+  if (Number.isFinite(speaker)) {
+    similaritySegments.push(`speaker=${speaker.toFixed(3)}`);
+  }
+  if (Number.isFinite(style)) {
+    similaritySegments.push(`style=${style.toFixed(3)}`);
+  } else if (Number.isFinite(tone)) {
+    similaritySegments.push(`tone=${tone.toFixed(3)}`);
+  }
+  const similarityNote = similaritySegments.length > 0 ? `${similaritySegments.join(" ")} ` : "";
   const speedNote = Number.isFinite(speed)
     ? `speed=${speed.toFixed(3)} `
     : "";
@@ -5149,9 +5196,11 @@ const validateTrainedCheckpoint = async (
       let sumSpeaker = 0;
       let sumTone = 0;
       let sumSpeed = 0;
+      let sumStyle = 0;
       let speakerSamples = 0;
       let toneSamples = 0;
       let speedSamples = 0;
+      let styleSamples = 0;
       let firstFailureMessage: string | null = null;
 
       for (let i = 0; i < validationTexts.length; i += 1) {
@@ -5241,6 +5290,7 @@ const validateTrainedCheckpoint = async (
           const speaker = Number(quality.speaker_score ?? NaN);
           const tone = Number(quality.tone_score ?? NaN);
           const speed = Number(quality.speed_score ?? NaN);
+          const style = Number(quality.style_score ?? NaN);
 
           if (!Number.isFinite(overall) || !Number.isFinite(duration) || !Number.isFinite(health)) {
             infraIssues += 1;
@@ -5286,13 +5336,19 @@ const validateTrainedCheckpoint = async (
             }
             continue;
           }
-          if (referenceAudioKey && Number.isFinite(tone) && tone < (is06b ? 0.40 : VALIDATION_GATE_THRESHOLDS.tone_min)) {
+          if (referenceAudioKey && Number.isFinite(style) && style < (is06b ? 0.40 : VALIDATION_GATE_THRESHOLDS.tone_min)) {
+            if (!firstFailureMessage) {
+              firstFailureMessage = `sample ${i + 1} seed ${seed} style_score=${style.toFixed(3)}`;
+            }
+            continue;
+          }
+          if (referenceAudioKey && !Number.isFinite(style) && Number.isFinite(tone) && tone < (is06b ? 0.40 : VALIDATION_GATE_THRESHOLDS.tone_min)) {
             if (!firstFailureMessage) {
               firstFailureMessage = `sample ${i + 1} seed ${seed} tone_score=${tone.toFixed(3)}`;
             }
             continue;
           }
-          if (referenceAudioKey && referenceText && Number.isFinite(speed) && speed < VALIDATION_GATE_THRESHOLDS.speed_min) {
+          if (referenceAudioKey && !Number.isFinite(style) && referenceText && Number.isFinite(speed) && speed < VALIDATION_GATE_THRESHOLDS.speed_min) {
             if (!firstFailureMessage) {
               firstFailureMessage = `sample ${i + 1} seed ${seed} speed_score=${speed.toFixed(3)}`;
             }
@@ -5318,6 +5374,10 @@ const validateTrainedCheckpoint = async (
             sumSpeed += speed;
             speedSamples += 1;
           }
+          if (Number.isFinite(style)) {
+            sumStyle += style;
+            styleSamples += 1;
+          }
         }
       }
 
@@ -5331,6 +5391,7 @@ const validateTrainedCheckpoint = async (
         const meanSpeaker = speakerSamples > 0 ? (sumSpeaker / speakerSamples) : NaN;
         const meanTone = toneSamples > 0 ? (sumTone / toneSamples) : NaN;
         const meanSpeed = speedSamples > 0 ? (sumSpeed / speedSamples) : NaN;
+        const meanStyle = styleSamples > 0 ? (sumStyle / styleSamples) : NaN;
         const scoreParts = buildValidationScoreParts({
           is06b: true,
           overall: meanOverall,
@@ -5341,12 +5402,20 @@ const validateTrainedCheckpoint = async (
           speaker: meanSpeaker,
           tone: meanTone,
           speed: meanSpeed,
+          style: meanStyle,
         });
         const totalWeight = scoreParts.reduce((acc, part) => acc + part.weight, 0) || 1;
         const score = scoreParts.reduce((acc, part) => acc + (part.value * part.weight), 0) / totalWeight;
-        const similarityNote = Number.isFinite(meanSpeaker) && Number.isFinite(meanTone)
-          ? `speaker=${meanSpeaker.toFixed(3)} tone=${meanTone.toFixed(3)} `
-          : "";
+        const similaritySegments: string[] = [];
+        if (Number.isFinite(meanSpeaker)) {
+          similaritySegments.push(`speaker=${meanSpeaker.toFixed(3)}`);
+        }
+        if (Number.isFinite(meanStyle)) {
+          similaritySegments.push(`style=${meanStyle.toFixed(3)}`);
+        } else if (Number.isFinite(meanTone)) {
+          similaritySegments.push(`tone=${meanTone.toFixed(3)}`);
+        }
+        const similarityNote = similaritySegments.length > 0 ? `${similaritySegments.join(" ")} ` : "";
         const speedNote = Number.isFinite(meanSpeed)
           ? `speed=${meanSpeed.toFixed(3)} `
           : "";
