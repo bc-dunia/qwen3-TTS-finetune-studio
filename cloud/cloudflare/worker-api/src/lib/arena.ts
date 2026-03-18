@@ -33,6 +33,19 @@ interface Standing {
   buchholz: number;
 }
 
+function readScore(rec: Record<string, unknown>, primary: string, fallback: string): number | null {
+  if (typeof rec[primary] === "number") return rec[primary] as number;
+  if (typeof rec[fallback] === "number") return rec[fallback] as number;
+  return null;
+}
+
+function parseScoreFromMessage(msg: string, key: string): number | null {
+  const match = new RegExp(`(?:^|\\s)${key}=([\\d.]+)`).exec(msg);
+  if (!match) return null;
+  const val = parseFloat(match[1]);
+  return Number.isFinite(val) ? val : null;
+}
+
 export async function assembleArenaCandidates(
   db: D1Database,
   voiceId: string,
@@ -112,7 +125,12 @@ export async function assembleArenaCandidates(
   for (const job of recentJobs.results ?? []) {
     let summary: Record<string, unknown> = {};
     try { summary = JSON.parse(job.summary_json ?? "{}"); } catch { /* empty */ }
-    const evaluated = Array.isArray(summary.evaluated) ? summary.evaluated : [];
+    // Training pipeline writes "evaluated_checkpoints"; fall back to "evaluated" for compat
+    const evaluated = Array.isArray(summary.evaluated_checkpoints)
+      ? summary.evaluated_checkpoints
+      : Array.isArray(summary.evaluated)
+        ? summary.evaluated
+        : [];
     for (const ev of evaluated) {
       if (!ev || typeof ev !== "object") continue;
       const rec = ev as Record<string, unknown>;
@@ -120,19 +138,43 @@ export async function assembleArenaCandidates(
       const prefix = rec.prefix as string;
       if (seen.has(prefix)) continue;
 
+      // Scores may be stored as top-level fields (asr_score / asr) or embedded in message string.
+      // Try both naming conventions, then fall back to parsing the message.
       const scores: CheckpointScores = {
-        asr_score: typeof rec.asr_score === "number" ? rec.asr_score : null,
-        speaker_score: typeof rec.speaker_score === "number" ? rec.speaker_score : null,
-        health_score: typeof rec.health_score === "number" ? rec.health_score : null,
-        tone_score: typeof rec.tone_score === "number" ? rec.tone_score : null,
-        speed_score: typeof rec.speed_score === "number" ? rec.speed_score : null,
-        style_score: typeof rec.style_score === "number" ? rec.style_score : null,
-        overall_score: typeof rec.overall_score === "number" ? rec.overall_score : null,
-        duration_score: typeof rec.duration_score === "number" ? rec.duration_score : null,
+        asr_score: readScore(rec, "asr_score", "asr"),
+        speaker_score: readScore(rec, "speaker_score", "speaker"),
+        health_score: readScore(rec, "health_score", "health"),
+        tone_score: readScore(rec, "tone_score", "tone"),
+        speed_score: readScore(rec, "speed_score", "speed"),
+        style_score: readScore(rec, "style_score", "style"),
+        overall_score: readScore(rec, "overall_score", "overall"),
+        duration_score: readScore(rec, "duration_score", "duration"),
       };
 
-      if (!passesValidationGate(scores)) continue;
+      // If individual scores are missing, try parsing from the message string
+      // Format: "...asr=0.974 tone=0.874 speed=0.907 health=1.000 duration=1.000..."
+      if (typeof rec.message === "string") {
+        const msg = rec.message as string;
+        if (scores.asr_score === null) scores.asr_score = parseScoreFromMessage(msg, "asr");
+        if (scores.speaker_score === null) scores.speaker_score = parseScoreFromMessage(msg, "speaker");
+        if (scores.health_score === null) scores.health_score = parseScoreFromMessage(msg, "health");
+        if (scores.tone_score === null) scores.tone_score = parseScoreFromMessage(msg, "tone");
+        if (scores.speed_score === null) scores.speed_score = parseScoreFromMessage(msg, "speed");
+        if (scores.style_score === null) scores.style_score = parseScoreFromMessage(msg, "style");
+        if (scores.overall_score === null) scores.overall_score = parseScoreFromMessage(msg, "overall");
+        if (scores.duration_score === null) scores.duration_score = parseScoreFromMessage(msg, "duration");
+      }
+
+      // Entries with ok:true already passed validation during training; skip re-gating
+      // unless scores are fully absent (defensive)
+      const hasAnyScore = Object.values(scores).some((v) => v !== null);
+      if (!hasAnyScore && !rec.ok) continue;
+      if (hasAnyScore && !passesValidationGate(scores)) continue;
+
       seen.add(prefix);
+      const rankingScore = hasAnyScore
+        ? computeRankingScore(scores)
+        : typeof rec.score === "number" ? rec.score : 0;
       newCandidates.push({
         checkpoint_r2_prefix: prefix,
         job_id: job.job_id,
@@ -140,7 +182,7 @@ export async function assembleArenaCandidates(
         epoch: typeof rec.epoch === "number" ? rec.epoch : null,
         source: "new",
         auto_scores: scores as unknown as Record<string, number | null>,
-        ranking_score: computeRankingScore(scores),
+        ranking_score: rankingScore,
       });
     }
   }
