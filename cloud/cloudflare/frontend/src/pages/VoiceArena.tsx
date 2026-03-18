@@ -516,16 +516,11 @@ function SetupStep({
           </div>
         ) : (
           <div className="rounded-xl border border-dashed border-edge bg-surface px-4 py-8 text-center">
-            <div className="text-primary text-sm font-semibold">No candidates available yet</div>
+            <div className="text-primary text-sm font-semibold">Ready to assemble</div>
             <p className="mt-2 text-subtle text-xs">
-              Train at least 2 checkpoints to assemble an arena.
+              Candidates will be auto-assembled from your training checkpoints when you start the arena.
+              Requires at least 2 checkpoints that pass validation gates.
             </p>
-            <Link
-              to={`/voices/${voiceId}/training`}
-              className="mt-3 inline-flex items-center rounded-lg bg-accent px-3 py-2 text-[11px] font-semibold text-void transition-colors hover:bg-accent-light"
-            >
-              Open Training
-            </Link>
           </div>
         )}
 
@@ -572,11 +567,11 @@ function SetupStep({
 
           <button
             onClick={onStart}
-            disabled={loading || candidateCount < 2}
+            disabled={loading}
             className="w-full bg-accent hover:bg-accent-light text-void font-semibold text-sm py-2.5 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
             type="button"
           >
-            {loading ? 'Creating...' : 'Start Arena'}
+            {loading ? 'Assembling candidates...' : 'Start Arena'}
           </button>
         </div>
       </div>
