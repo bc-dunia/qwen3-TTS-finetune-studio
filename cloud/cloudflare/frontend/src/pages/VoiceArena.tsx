@@ -376,22 +376,42 @@ export function VoiceArena() {
         />
       )}
 
-      {step === 'generating' && (
-        <div className="rounded-xl border border-edge bg-raised p-8 text-center space-y-4">
-          <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-accent/10">
-            <svg className="w-8 h-8 text-accent animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
-            </svg>
+      {step === 'generating' && (() => {
+        const gp = (session as unknown as Record<string, unknown>)?.generation_progress as
+          | { total: number; completed: number; failed: number; pending: number }
+          | undefined
+        const pct = gp && gp.total > 0 ? Math.round((gp.completed / gp.total) * 100) : 0
+        return (
+          <div className="rounded-xl border border-edge bg-raised p-8 text-center space-y-4">
+            <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-accent/10">
+              <svg className="w-8 h-8 text-accent animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
+              </svg>
+            </div>
+            <div className="text-heading text-lg font-semibold">Generating Audio</div>
+            {gp ? (
+              <>
+                <div className="w-64 mx-auto h-2 bg-edge rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-accent rounded-full transition-[width] duration-500"
+                    style={{ width: `${pct}%` }}
+                  />
+                </div>
+                <p className="text-subtle text-sm">
+                  {gp.completed}/{gp.total} audio samples generated{gp.failed > 0 ? ` (${gp.failed} failed)` : ''}
+                </p>
+              </>
+            ) : (
+              <p className="text-subtle text-sm">
+                Generating audio for all {candidateCount} candidates...
+              </p>
+            )}
+            <p className="text-muted text-xs font-mono">
+              session={session?.session_id.slice(0, 12)} status={session?.status ?? 'unknown'}
+            </p>
           </div>
-          <div className="text-heading text-lg font-semibold">Generating Audio</div>
-          <p className="text-subtle text-sm">
-            Generating audio for all {candidateCount} candidates across {testTextsRaw.split('\n').filter((t) => t.trim()).length} test texts...
-          </p>
-          <p className="text-muted text-xs font-mono">
-            session={session?.session_id.slice(0, 12)} status={session?.status ?? 'unknown'}
-          </p>
-        </div>
-      )}
+        )
+      })()}
 
       {step === 'voting' && currentMatch && (
         <VotingStep

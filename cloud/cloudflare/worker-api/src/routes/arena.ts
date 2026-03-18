@@ -23,6 +23,7 @@ import {
   advanceRound,
   finalizeSession,
 } from "../lib/arena";
+import { invokeServerlessAsync, getServerlessStatus } from "../lib/runpod";
 import { calibrateFromArenaData } from "../lib/arena-calibration";
 import { authMiddleware } from "../middleware/auth";
 import type {
@@ -34,6 +35,38 @@ import type {
   ArenaVoteWinner,
   VoiceSettings,
 } from "../types";
+
+interface GenerationJob {
+  job_id: string;
+  r2_key: string;
+  candidate_id: string;
+  text_index: number;
+  status: "pending" | "completed" | "failed";
+  error?: string;
+}
+
+interface GenerationTracking {
+  jobs: GenerationJob[];
+  voice_id: string;
+  speaker_name: string;
+  model_id: string;
+  language: string;
+}
+
+function parseTracking(notes: string | null): GenerationTracking | null {
+  if (!notes) return null;
+  try {
+    const parsed = JSON.parse(notes);
+    return Array.isArray(parsed.jobs) ? parsed as GenerationTracking : null;
+  } catch { return null; }
+}
+
+const decodeBase64ToBytes = (value: string): Uint8Array => {
+  const decoded = atob(value);
+  const bytes = new Uint8Array(decoded.length);
+  for (let i = 0; i < decoded.length; i++) bytes[i] = decoded.charCodeAt(i);
+  return bytes;
+};
 
 const app = new Hono<AppContext>();
 app.use("*", authMiddleware);
@@ -195,9 +228,75 @@ app.post("/sessions", async (c) => {
 app.get("/sessions/:sessionId", async (c) => {
   try {
     const sessionId = c.req.param("sessionId");
-    const session = await getArenaSession(c.env.DB, sessionId);
+    let session = await getArenaSession(c.env.DB, sessionId);
     if (!session) {
       return c.json({ detail: { message: "Session not found" } }, 404);
+    }
+
+    if (session.status === "generating") {
+      const tracking = parseTracking(session.notes);
+      if (tracking) {
+        const pending = tracking.jobs.filter((j) => j.status === "pending");
+        const BATCH_SIZE = 5;
+        const batch = pending.slice(0, BATCH_SIZE);
+        let changed = false;
+
+        for (const job of batch) {
+          try {
+            const resp = await getServerlessStatus(c.env, c.env.RUNPOD_ENDPOINT_ID, job.job_id);
+            const status = String(resp.status ?? "");
+
+            if (status === "COMPLETED") {
+              const output = (resp.output ?? {}) as { audio?: string };
+              if (output.audio) {
+                const audioBytes = decodeBase64ToBytes(output.audio);
+                await c.env.R2.put(job.r2_key, audioBytes, {
+                  httpMetadata: { contentType: "audio/wav" },
+                });
+              }
+              job.status = "completed";
+              changed = true;
+            } else if (status === "FAILED") {
+              job.status = "failed";
+              job.error = String((resp.output as Record<string, unknown>)?.error ?? resp.error ?? "Generation failed");
+              changed = true;
+            }
+          } catch {
+            // Transient RunPod error, will retry on next poll
+          }
+        }
+
+        if (changed) {
+          const allDone = tracking.jobs.every((j) => j.status !== "pending");
+          const updates: Record<string, unknown> = { notes: JSON.stringify(tracking) };
+
+          if (allDone) {
+            updates.status = "active";
+
+            const allMatches = await listArenaMatches(c.env.DB, { session_id: sessionId });
+            for (const match of allMatches) {
+              const audioA = tracking.jobs.find(
+                (j) => j.candidate_id === match.candidate_a_id && j.text_index === match.text_index && j.status === "completed",
+              );
+              const audioB = tracking.jobs.find(
+                (j) => j.candidate_id === match.candidate_b_id && j.text_index === match.text_index && j.status === "completed",
+              );
+              if (audioA || audioB) {
+                await updateArenaMatch(c.env.DB, match.match_id, {
+                  audio_a_r2_key: audioA?.r2_key ?? null,
+                  audio_b_r2_key: audioB?.r2_key ?? null,
+                });
+              }
+            }
+          }
+
+          await updateArenaSession(c.env.DB, sessionId, updates);
+          session = await getArenaSession(c.env.DB, sessionId);
+          if (!session) {
+            return c.json({ detail: { message: "Session not found" } }, 404);
+          }
+        }
+      }
     }
 
     const candidates = await listArenaCandidates(c.env.DB, { session_id: sessionId });
@@ -206,7 +305,15 @@ app.get("/sessions/:sessionId", async (c) => {
       round_number: session.current_round,
     });
 
-    return c.json({ ...session, candidates, matches });
+    const tracking = parseTracking(session.notes);
+    const generationProgress = tracking ? {
+      total: tracking.jobs.length,
+      completed: tracking.jobs.filter((j) => j.status === "completed").length,
+      failed: tracking.jobs.filter((j) => j.status === "failed").length,
+      pending: tracking.jobs.filter((j) => j.status === "pending").length,
+    } : undefined;
+
+    return c.json({ ...session, candidates, matches, generation_progress: generationProgress });
   } catch (err) {
     console.error("GET /sessions/:sessionId error:", err);
     return c.json({ detail: { message: err instanceof Error ? err.message : "Internal server error" } }, 500);
@@ -225,45 +332,89 @@ app.post("/sessions/:sessionId/generate", async (c) => {
       return c.json({ detail: { message: `Cannot generate: session status is '${session.status}', expected 'assembling'` } }, 400);
     }
 
-    const candidates = await listArenaCandidates(c.env.DB, { session_id: sessionId });
-    const allMatches = await listArenaMatches(c.env.DB, { session_id: sessionId });
+    const voice = await getVoice(c.env.DB, session.voice_id);
+    if (!voice) {
+      return c.json({ detail: { message: "Voice not found" } }, 404);
+    }
 
-    // TODO: Integrate actual TTS generation via RunPod.
-    // For now, create R2 key paths for all candidate x text combinations
-    // and update arena_matches with the audio keys.
-    const audioKeys: Array<{ candidateId: string; textIndex: number; r2Key: string }> = [];
+    const candidates = await listArenaCandidates(c.env.DB, { session_id: sessionId });
+    const speakerName = voice.speaker_name ?? session.voice_id;
+    const modelId = voice.model_id ?? "qwen3-tts-1.7b";
+    const language = voice.labels?.language ?? "auto";
+    const seed = session.seed ?? 42;
+
+    const jobs: GenerationJob[] = [];
     for (const candidate of candidates) {
       for (let textIdx = 0; textIdx < session.test_texts.length; textIdx++) {
         const r2Key = `arena/${sessionId}/${candidate.candidate_id}/text${textIdx}.wav`;
-        audioKeys.push({ candidateId: candidate.candidate_id, textIndex: textIdx, r2Key });
-      }
-    }
+        const input = {
+          text: session.test_texts[textIdx],
+          voice_id: session.voice_id,
+          speaker_name: speakerName,
+          model_id: modelId,
+          voice_settings: session.settings ?? {},
+          seed,
+          language,
+          checkpoint_info: { r2_prefix: candidate.checkpoint_r2_prefix, type: "full" },
+        };
 
-    for (const match of allMatches) {
-      const audioA = audioKeys.find(
-        (ak) => ak.candidateId === match.candidate_a_id && ak.textIndex === match.text_index,
-      );
-      const audioB = audioKeys.find(
-        (ak) => ak.candidateId === match.candidate_b_id && ak.textIndex === match.text_index,
-      );
-      if (audioA || audioB) {
-        await updateArenaMatch(c.env.DB, match.match_id, {
-          audio_a_r2_key: audioA?.r2Key ?? null,
-          audio_b_r2_key: audioB?.r2Key ?? null,
+        const runpodResp = await invokeServerlessAsync(c.env, c.env.RUNPOD_ENDPOINT_ID, input);
+        const jobId = String(runpodResp.id ?? "");
+        jobs.push({
+          job_id: jobId,
+          r2_key: r2Key,
+          candidate_id: candidate.candidate_id,
+          text_index: textIdx,
+          status: jobId ? "pending" : "failed",
+          ...(jobId ? {} : { error: "No job ID returned from RunPod" }),
         });
       }
     }
 
-    await updateArenaSession(c.env.DB, sessionId, { status: "active" });
+    const tracking: GenerationTracking = {
+      jobs,
+      voice_id: session.voice_id,
+      speaker_name: speakerName,
+      model_id: modelId,
+      language,
+    };
+
+    await updateArenaSession(c.env.DB, sessionId, {
+      status: "generating",
+      notes: JSON.stringify(tracking),
+    });
 
     return c.json({
       session_id: sessionId,
-      status: "active",
-      audio_keys: audioKeys,
-      message: "Audio key paths assigned. TODO: actual TTS generation via RunPod not yet integrated.",
+      status: "generating",
+      total_jobs: jobs.length,
+      pending: jobs.filter((j) => j.status === "pending").length,
     });
   } catch (err) {
     console.error("POST /sessions/:sessionId/generate error:", err);
+    return c.json({ detail: { message: err instanceof Error ? err.message : "Internal server error" } }, 500);
+  }
+});
+
+app.get("/audio/:r2Key{.+}", async (c) => {
+  try {
+    const r2Key = decodeURIComponent(c.req.param("r2Key"));
+    if (!r2Key.startsWith("arena/")) {
+      return c.json({ detail: { message: "Invalid arena audio key" } }, 400);
+    }
+    const object = await c.env.R2.get(r2Key);
+    if (!object) {
+      return c.json({ detail: { message: "Audio not found" } }, 404);
+    }
+    return new Response(object.body, {
+      headers: {
+        "Content-Type": object.httpMetadata?.contentType ?? "audio/wav",
+        "Cache-Control": "public, max-age=86400",
+        "Content-Length": String(object.size),
+      },
+    });
+  } catch (err) {
+    console.error("GET /audio error:", err);
     return c.json({ detail: { message: err instanceof Error ? err.message : "Internal server error" } }, 500);
   }
 });
