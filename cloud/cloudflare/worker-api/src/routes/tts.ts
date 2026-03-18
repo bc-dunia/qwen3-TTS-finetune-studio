@@ -64,7 +64,7 @@ const normalizeSeed = (seed: number | undefined): number => {
   return bounded === 0 ? 1 : bounded;
 };
 
-const normalizeLanguageCode = (languageCode: string | undefined): string => {
+export const normalizeLanguageCode = (languageCode: string | undefined): string => {
   if (!languageCode || !languageCode.trim()) {
     return "auto";
   }

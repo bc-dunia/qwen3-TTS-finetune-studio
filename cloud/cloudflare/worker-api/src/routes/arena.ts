@@ -23,6 +23,7 @@ import {
   finalizeSession,
 } from "../lib/arena";
 import { invokeServerlessAsync, getServerlessStatus } from "../lib/runpod";
+import { normalizeLanguageCode } from "./tts";
 import { calibrateFromArenaData } from "../lib/arena-calibration";
 import { authMiddleware } from "../middleware/auth";
 import type {
@@ -242,14 +243,17 @@ app.get("/sessions/:sessionId", async (c) => {
             const status = String(resp.status ?? "");
 
             if (status === "COMPLETED") {
-              const output = (resp.output ?? {}) as { audio?: string };
+              const output = (resp.output ?? {}) as { audio?: string; error?: string };
               if (output.audio) {
                 const audioBytes = decodeBase64ToBytes(output.audio);
                 await c.env.R2.put(job.r2_key, audioBytes, {
                   httpMetadata: { contentType: "audio/wav" },
                 });
+                job.status = "completed";
+              } else {
+                job.status = "failed";
+                job.error = output.error ?? "RunPod returned no audio data";
               }
-              job.status = "completed";
               changed = true;
             } else if (status === "FAILED") {
               job.status = "failed";
@@ -335,7 +339,7 @@ app.post("/sessions/:sessionId/generate", async (c) => {
     const candidates = await listArenaCandidates(c.env.DB, { session_id: sessionId });
     const speakerName = voice.speaker_name ?? session.voice_id;
     const modelId = voice.model_id ?? "qwen3-tts-1.7b";
-    const language = voice.labels?.language ?? "auto";
+    const language = normalizeLanguageCode(voice.labels?.language);
     const seed = session.seed ?? 42;
 
     const tasks: Array<{ candidate_id: string; text_index: number; r2_key: string; input: Record<string, unknown> }> = [];
