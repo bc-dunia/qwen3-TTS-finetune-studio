@@ -1,4 +1,15 @@
 import type {
+  ArenaCalibrationConfidence,
+  ArenaCalibrationOverride,
+  ArenaCandidate,
+  ArenaCandidateRetention,
+  ArenaCandidateSource,
+  ArenaMatch,
+  ArenaSession,
+  ArenaSessionStatus,
+  ArenaAlgorithm,
+  ArenaVoteConfidence,
+  ArenaVoteWinner,
   DatasetSnapshot,
   Generation,
   TrainingCampaign,
@@ -1770,4 +1781,579 @@ export const replaceTrainingCheckoutLedgerForJob = async (
       )
       .run();
   }
+};
+
+// ── Arena Evaluation CRUD ──────────────────────────────────────────────────────
+
+type DbArenaSessionRow = {
+  session_id: string;
+  voice_id: string;
+  status: string;
+  algorithm: string;
+  current_round: number;
+  total_rounds: number | null;
+  test_texts_json: string;
+  seed: number;
+  settings_json: string;
+  ranking_json: string;
+  winner_candidate_id: string | null;
+  promoted: number;
+  notes: string | null;
+  created_at: number;
+  completed_at: number | null;
+};
+
+type DbArenaCandidateRow = {
+  candidate_id: string;
+  session_id: string;
+  voice_id: string;
+  checkpoint_r2_prefix: string;
+  job_id: string | null;
+  run_name: string | null;
+  epoch: number | null;
+  source: string;
+  seed_rank: number | null;
+  final_rank: number | null;
+  wins: number;
+  losses: number;
+  ties: number;
+  bye_count: number;
+  buchholz: number;
+  retention_status: string;
+  auto_scores_json: string | null;
+  created_at: number;
+  eliminated_at: number | null;
+};
+
+type DbArenaMatchRow = {
+  match_id: string;
+  session_id: string;
+  round_number: number;
+  candidate_a_id: string;
+  candidate_b_id: string;
+  display_order: string;
+  text_index: number;
+  audio_a_r2_key: string | null;
+  audio_b_r2_key: string | null;
+  winner: string | null;
+  confidence: string | null;
+  replay_count_a: number;
+  replay_count_b: number;
+  created_at: number;
+  voted_at: number | null;
+};
+
+type DbArenaCalibrationOverrideRow = {
+  override_id: string;
+  voice_id: string;
+  weights_json: string;
+  matchup_count: number;
+  accuracy: number | null;
+  confidence: string;
+  weight_shifts_json: string | null;
+  gate_diagnostics_json: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+const mapArenaSession = (row: DbArenaSessionRow): ArenaSession => ({
+  session_id: row.session_id,
+  voice_id: row.voice_id,
+  status: row.status as ArenaSessionStatus,
+  algorithm: row.algorithm as ArenaAlgorithm,
+  current_round: row.current_round,
+  total_rounds: row.total_rounds,
+  test_texts: parseJson<string[]>(row.test_texts_json, []),
+  seed: row.seed,
+  settings: parseJson<VoiceSettings>(row.settings_json, {}),
+  ranking: parseJson<Record<string, unknown>>(row.ranking_json, {}),
+  winner_candidate_id: row.winner_candidate_id,
+  promoted: row.promoted === 1,
+  notes: row.notes,
+  created_at: row.created_at,
+  completed_at: row.completed_at,
+});
+
+const mapArenaCandidate = (row: DbArenaCandidateRow): ArenaCandidate => ({
+  candidate_id: row.candidate_id,
+  session_id: row.session_id,
+  voice_id: row.voice_id,
+  checkpoint_r2_prefix: row.checkpoint_r2_prefix,
+  job_id: row.job_id,
+  run_name: row.run_name,
+  epoch: row.epoch,
+  source: row.source as ArenaCandidateSource,
+  seed_rank: row.seed_rank,
+  final_rank: row.final_rank,
+  wins: row.wins,
+  losses: row.losses,
+  ties: row.ties,
+  bye_count: row.bye_count,
+  buchholz: row.buchholz,
+  retention_status: row.retention_status as ArenaCandidateRetention,
+  auto_scores: parseJson<Record<string, number | null>>(row.auto_scores_json, {}),
+  created_at: row.created_at,
+  eliminated_at: row.eliminated_at,
+});
+
+const mapArenaMatch = (row: DbArenaMatchRow): ArenaMatch => ({
+  match_id: row.match_id,
+  session_id: row.session_id,
+  round_number: row.round_number,
+  candidate_a_id: row.candidate_a_id,
+  candidate_b_id: row.candidate_b_id,
+  display_order: row.display_order as "ab" | "ba",
+  text_index: row.text_index,
+  audio_a_r2_key: row.audio_a_r2_key,
+  audio_b_r2_key: row.audio_b_r2_key,
+  winner: row.winner as ArenaVoteWinner | null,
+  confidence: row.confidence as ArenaVoteConfidence | null,
+  replay_count_a: row.replay_count_a,
+  replay_count_b: row.replay_count_b,
+  created_at: row.created_at,
+  voted_at: row.voted_at,
+});
+
+const mapArenaCalibrationOverride = (row: DbArenaCalibrationOverrideRow): ArenaCalibrationOverride => ({
+  override_id: row.override_id,
+  voice_id: row.voice_id,
+  weights: parseJson<Record<string, number>>(row.weights_json, {}),
+  matchup_count: row.matchup_count,
+  accuracy: row.accuracy,
+  confidence: row.confidence as ArenaCalibrationConfidence,
+  weight_shifts: parseJson<Record<string, number> | null>(row.weight_shifts_json, null),
+  gate_diagnostics: parseJson<Record<string, unknown> | null>(row.gate_diagnostics_json, null),
+  created_at: row.created_at,
+  updated_at: row.updated_at,
+});
+
+// ── Arena Sessions ──────────────────────────────────────────────────────────────
+
+export const createArenaSession = async (db: D1Database, session: ArenaSession): Promise<void> => {
+  await db
+    .prepare(
+      `INSERT INTO arena_sessions (
+        session_id, voice_id, status, algorithm, current_round, total_rounds,
+        test_texts_json, seed, settings_json, ranking_json,
+        winner_candidate_id, promoted, notes, created_at, completed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      session.session_id,
+      session.voice_id,
+      session.status,
+      session.algorithm,
+      session.current_round,
+      session.total_rounds,
+      JSON.stringify(session.test_texts),
+      session.seed,
+      JSON.stringify(session.settings),
+      JSON.stringify(session.ranking),
+      session.winner_candidate_id,
+      session.promoted ? 1 : 0,
+      session.notes,
+      session.created_at,
+      session.completed_at,
+    )
+    .run();
+};
+
+export const getArenaSession = async (db: D1Database, sessionId: string): Promise<ArenaSession | null> => {
+  const row = await db
+    .prepare("SELECT * FROM arena_sessions WHERE session_id = ? LIMIT 1")
+    .bind(sessionId)
+    .first<DbArenaSessionRow>();
+
+  return row ? mapArenaSession(row) : null;
+};
+
+export const listArenaSessions = async (
+  db: D1Database,
+  filters: { voice_id?: string; limit?: number } = {}
+): Promise<ArenaSession[]> => {
+  const conditions: string[] = [];
+  const bindings: Array<string | number> = [];
+
+  if (filters.voice_id) {
+    conditions.push("voice_id = ?");
+    bindings.push(filters.voice_id);
+  }
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const limit = Math.max(1, Math.min(filters.limit ?? 20, 100));
+  const result = await db
+    .prepare(`SELECT * FROM arena_sessions ${whereClause} ORDER BY created_at DESC LIMIT ?`)
+    .bind(...bindings, limit)
+    .all<DbArenaSessionRow>();
+
+  return (result.results ?? []).map(mapArenaSession);
+};
+
+export const updateArenaSession = async (
+  db: D1Database,
+  sessionId: string,
+  updates: {
+    status?: ArenaSessionStatus;
+    current_round?: number;
+    total_rounds?: number | null;
+    ranking?: Record<string, unknown>;
+    winner_candidate_id?: string | null;
+    promoted?: boolean;
+    notes?: string | null;
+    completed_at?: number | null;
+  }
+): Promise<void> => {
+  const fields: string[] = [];
+  const bindings: Array<string | number | null> = [];
+
+  if (updates.status !== undefined) {
+    fields.push("status = ?");
+    bindings.push(updates.status);
+  }
+  if (updates.current_round !== undefined) {
+    fields.push("current_round = ?");
+    bindings.push(updates.current_round);
+  }
+  if (updates.total_rounds !== undefined) {
+    fields.push("total_rounds = ?");
+    bindings.push(updates.total_rounds);
+  }
+  if (updates.ranking !== undefined) {
+    fields.push("ranking_json = ?");
+    bindings.push(JSON.stringify(updates.ranking));
+  }
+  if (updates.winner_candidate_id !== undefined) {
+    fields.push("winner_candidate_id = ?");
+    bindings.push(updates.winner_candidate_id);
+  }
+  if (updates.promoted !== undefined) {
+    fields.push("promoted = ?");
+    bindings.push(updates.promoted ? 1 : 0);
+  }
+  if (updates.notes !== undefined) {
+    fields.push("notes = ?");
+    bindings.push(updates.notes);
+  }
+  if (updates.completed_at !== undefined) {
+    fields.push("completed_at = ?");
+    bindings.push(updates.completed_at);
+  }
+
+  if (fields.length === 0) return;
+
+  bindings.push(sessionId);
+  await db
+    .prepare(`UPDATE arena_sessions SET ${fields.join(", ")} WHERE session_id = ?`)
+    .bind(...bindings)
+    .run();
+};
+
+// ── Arena Candidates ────────────────────────────────────────────────────────────
+
+export const createArenaCandidate = async (db: D1Database, candidate: ArenaCandidate): Promise<void> => {
+  await db
+    .prepare(
+      `INSERT INTO arena_candidates (
+        candidate_id, session_id, voice_id, checkpoint_r2_prefix, job_id, run_name, epoch,
+        source, seed_rank, final_rank, wins, losses, ties, bye_count, buchholz,
+        retention_status, auto_scores_json, created_at, eliminated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      candidate.candidate_id,
+      candidate.session_id,
+      candidate.voice_id,
+      candidate.checkpoint_r2_prefix,
+      candidate.job_id,
+      candidate.run_name,
+      candidate.epoch,
+      candidate.source,
+      candidate.seed_rank,
+      candidate.final_rank,
+      candidate.wins,
+      candidate.losses,
+      candidate.ties,
+      candidate.bye_count,
+      candidate.buchholz,
+      candidate.retention_status,
+      JSON.stringify(candidate.auto_scores),
+      candidate.created_at,
+      candidate.eliminated_at,
+    )
+    .run();
+};
+
+export const listArenaCandidates = async (
+  db: D1Database,
+  filters: { session_id?: string; limit?: number } = {}
+): Promise<ArenaCandidate[]> => {
+  const conditions: string[] = [];
+  const bindings: Array<string | number> = [];
+
+  if (filters.session_id) {
+    conditions.push("session_id = ?");
+    bindings.push(filters.session_id);
+  }
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const limit = Math.max(1, Math.min(filters.limit ?? 100, 500));
+  const result = await db
+    .prepare(`SELECT * FROM arena_candidates ${whereClause} ORDER BY seed_rank ASC, created_at ASC LIMIT ?`)
+    .bind(...bindings, limit)
+    .all<DbArenaCandidateRow>();
+
+  return (result.results ?? []).map(mapArenaCandidate);
+};
+
+export const updateArenaCandidate = async (
+  db: D1Database,
+  candidateId: string,
+  updates: {
+    seed_rank?: number | null;
+    final_rank?: number | null;
+    wins?: number;
+    losses?: number;
+    ties?: number;
+    bye_count?: number;
+    buchholz?: number;
+    retention_status?: ArenaCandidateRetention;
+    auto_scores?: Record<string, number | null>;
+    eliminated_at?: number | null;
+  }
+): Promise<void> => {
+  const fields: string[] = [];
+  const bindings: Array<string | number | null> = [];
+
+  if (updates.seed_rank !== undefined) {
+    fields.push("seed_rank = ?");
+    bindings.push(updates.seed_rank);
+  }
+  if (updates.final_rank !== undefined) {
+    fields.push("final_rank = ?");
+    bindings.push(updates.final_rank);
+  }
+  if (updates.wins !== undefined) {
+    fields.push("wins = ?");
+    bindings.push(updates.wins);
+  }
+  if (updates.losses !== undefined) {
+    fields.push("losses = ?");
+    bindings.push(updates.losses);
+  }
+  if (updates.ties !== undefined) {
+    fields.push("ties = ?");
+    bindings.push(updates.ties);
+  }
+  if (updates.bye_count !== undefined) {
+    fields.push("bye_count = ?");
+    bindings.push(updates.bye_count);
+  }
+  if (updates.buchholz !== undefined) {
+    fields.push("buchholz = ?");
+    bindings.push(updates.buchholz);
+  }
+  if (updates.retention_status !== undefined) {
+    fields.push("retention_status = ?");
+    bindings.push(updates.retention_status);
+  }
+  if (updates.auto_scores !== undefined) {
+    fields.push("auto_scores_json = ?");
+    bindings.push(JSON.stringify(updates.auto_scores));
+  }
+  if (updates.eliminated_at !== undefined) {
+    fields.push("eliminated_at = ?");
+    bindings.push(updates.eliminated_at);
+  }
+
+  if (fields.length === 0) return;
+
+  bindings.push(candidateId);
+  await db
+    .prepare(`UPDATE arena_candidates SET ${fields.join(", ")} WHERE candidate_id = ?`)
+    .bind(...bindings)
+    .run();
+};
+
+export const getCarriedCandidates = async (
+  db: D1Database,
+  voiceId: string,
+): Promise<ArenaCandidate[]> => {
+  const result = await db
+    .prepare(
+      `SELECT * FROM arena_candidates
+       WHERE voice_id = ? AND retention_status IN ('champion', 'second', 'third')
+       ORDER BY CASE retention_status WHEN 'champion' THEN 1 WHEN 'second' THEN 2 WHEN 'third' THEN 3 END`
+    )
+    .bind(voiceId)
+    .all<DbArenaCandidateRow>();
+
+  return (result.results ?? []).map(mapArenaCandidate);
+};
+
+// ── Arena Matches ───────────────────────────────────────────────────────────────
+
+export const createArenaMatch = async (db: D1Database, match: ArenaMatch): Promise<void> => {
+  await db
+    .prepare(
+      `INSERT INTO arena_matches (
+        match_id, session_id, round_number, candidate_a_id, candidate_b_id,
+        display_order, text_index, audio_a_r2_key, audio_b_r2_key,
+        winner, confidence, replay_count_a, replay_count_b, created_at, voted_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      match.match_id,
+      match.session_id,
+      match.round_number,
+      match.candidate_a_id,
+      match.candidate_b_id,
+      match.display_order,
+      match.text_index,
+      match.audio_a_r2_key,
+      match.audio_b_r2_key,
+      match.winner,
+      match.confidence,
+      match.replay_count_a,
+      match.replay_count_b,
+      match.created_at,
+      match.voted_at,
+    )
+    .run();
+};
+
+export const getArenaMatch = async (db: D1Database, matchId: string): Promise<ArenaMatch | null> => {
+  const row = await db
+    .prepare("SELECT * FROM arena_matches WHERE match_id = ? LIMIT 1")
+    .bind(matchId)
+    .first<DbArenaMatchRow>();
+
+  return row ? mapArenaMatch(row) : null;
+};
+
+export const listArenaMatches = async (
+  db: D1Database,
+  filters: { session_id?: string; round_number?: number; limit?: number } = {}
+): Promise<ArenaMatch[]> => {
+  const conditions: string[] = [];
+  const bindings: Array<string | number> = [];
+
+  if (filters.session_id) {
+    conditions.push("session_id = ?");
+    bindings.push(filters.session_id);
+  }
+  if (filters.round_number !== undefined) {
+    conditions.push("round_number = ?");
+    bindings.push(filters.round_number);
+  }
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const limit = Math.max(1, Math.min(filters.limit ?? 200, 500));
+  const result = await db
+    .prepare(`SELECT * FROM arena_matches ${whereClause} ORDER BY round_number ASC, created_at ASC LIMIT ?`)
+    .bind(...bindings, limit)
+    .all<DbArenaMatchRow>();
+
+  return (result.results ?? []).map(mapArenaMatch);
+};
+
+export const updateArenaMatch = async (
+  db: D1Database,
+  matchId: string,
+  updates: {
+    audio_a_r2_key?: string | null;
+    audio_b_r2_key?: string | null;
+    winner?: ArenaVoteWinner | null;
+    confidence?: ArenaVoteConfidence | null;
+    replay_count_a?: number;
+    replay_count_b?: number;
+    voted_at?: number | null;
+  }
+): Promise<void> => {
+  const fields: string[] = [];
+  const bindings: Array<string | number | null> = [];
+
+  if (updates.audio_a_r2_key !== undefined) {
+    fields.push("audio_a_r2_key = ?");
+    bindings.push(updates.audio_a_r2_key);
+  }
+  if (updates.audio_b_r2_key !== undefined) {
+    fields.push("audio_b_r2_key = ?");
+    bindings.push(updates.audio_b_r2_key);
+  }
+  if (updates.winner !== undefined) {
+    fields.push("winner = ?");
+    bindings.push(updates.winner);
+  }
+  if (updates.confidence !== undefined) {
+    fields.push("confidence = ?");
+    bindings.push(updates.confidence);
+  }
+  if (updates.replay_count_a !== undefined) {
+    fields.push("replay_count_a = ?");
+    bindings.push(updates.replay_count_a);
+  }
+  if (updates.replay_count_b !== undefined) {
+    fields.push("replay_count_b = ?");
+    bindings.push(updates.replay_count_b);
+  }
+  if (updates.voted_at !== undefined) {
+    fields.push("voted_at = ?");
+    bindings.push(updates.voted_at);
+  }
+
+  if (fields.length === 0) return;
+
+  bindings.push(matchId);
+  await db
+    .prepare(`UPDATE arena_matches SET ${fields.join(", ")} WHERE match_id = ?`)
+    .bind(...bindings)
+    .run();
+};
+
+// ── Arena Calibration Overrides ─────────────────────────────────────────────────
+
+export const getArenaCalibrationOverride = async (
+  db: D1Database,
+  voiceId: string,
+): Promise<ArenaCalibrationOverride | null> => {
+  const row = await db
+    .prepare("SELECT * FROM arena_calibration_overrides WHERE voice_id = ? LIMIT 1")
+    .bind(voiceId)
+    .first<DbArenaCalibrationOverrideRow>();
+
+  return row ? mapArenaCalibrationOverride(row) : null;
+};
+
+export const upsertArenaCalibrationOverride = async (
+  db: D1Database,
+  override: ArenaCalibrationOverride,
+): Promise<void> => {
+  await db
+    .prepare(
+      `INSERT INTO arena_calibration_overrides (
+        override_id, voice_id, weights_json, matchup_count, accuracy, confidence,
+        weight_shifts_json, gate_diagnostics_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(voice_id) DO UPDATE SET
+        weights_json = excluded.weights_json,
+        matchup_count = excluded.matchup_count,
+        accuracy = excluded.accuracy,
+        confidence = excluded.confidence,
+        weight_shifts_json = excluded.weight_shifts_json,
+        gate_diagnostics_json = excluded.gate_diagnostics_json,
+        updated_at = excluded.updated_at`
+    )
+    .bind(
+      override.override_id,
+      override.voice_id,
+      JSON.stringify(override.weights),
+      override.matchup_count,
+      override.accuracy,
+      override.confidence,
+      override.weight_shifts ? JSON.stringify(override.weight_shifts) : null,
+      override.gate_diagnostics ? JSON.stringify(override.gate_diagnostics) : null,
+      override.created_at,
+      override.updated_at,
+    )
+    .run();
 };

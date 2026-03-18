@@ -1,13 +1,18 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router'
-import { AudioPlayer } from '../components/AudioPlayer'
 import { TrainingAdviceCard } from '../components/TrainingAdviceCard'
+import { DecisionHeader } from '../components/compare/DecisionHeader'
+import { ComparisonSetupForm } from '../components/compare/ComparisonSetupForm'
+import { CandidateGrid } from '../components/compare/CandidateGrid'
+import { CompareTray } from '../components/compare/CompareTray'
+import { RecommendationBanner } from '../components/compare/RecommendationBanner'
+import { MAX_COMPARE_CANDIDATES } from '../components/compare/types'
+import type { CheckpointCandidate, RunSummary, CompareResult } from '../components/compare/types'
 import {
   DEFAULT_VOICE_SETTINGS,
   fetchTrainingAdvice,
   fetchTrainingJobs,
   fetchVoice,
-  formatDate,
   formatDateTime,
   formatDurationMs,
   formatTime,
@@ -26,53 +31,9 @@ import {
   shouldWatchTrainingJob,
 } from '../lib/trainingCheckout'
 import { buildTrainingAdvice } from '../lib/trainingAdvisor'
-import { formatScore, scoreColor } from '../lib/voiceScoreUi'
 
-const MAX_COMPARE_CANDIDATES = 4
 
-type CheckpointCandidate = {
-  id: string
-  prefix: string
-  epoch: number | null
-  score: number | null
-  preset: string | null
-  message: string | null
-  jobId: string | null
-  createdAt: number
-  completedAt: number | null
-  attemptNumber: number | null
-  runName: string | null
-  isCurrentProduction: boolean
-  isStoredCandidate: boolean
-  isJobRecommendation: boolean
-  validationPassed: boolean
-  toneScore: number | null
-  speedScore: number | null
-  styleScore: number | null
-}
-
-type RunSummary = {
-  jobId: string
-  attemptNumber: number | null
-  createdAt: number
-  startedAt: number | null
-  completedAt: number | null
-  durationMs: number | null
-  status: string
-  championScore: number | null
-  championEpoch: number | null
-  championPreset: string | null
-  validationMessage: string | null
-  hasCandidates: boolean
-  validationPassed: boolean
-  validationRejected: boolean
-}
-
-type CompareResult = {
-  status: string
-  blob?: Blob
-  error?: string
-}
+// ── Utility functions ─────────────────────────────────────────────────────────
 
 function normalizeVoiceSettings(value: Partial<VoiceSettings> | null | undefined): VoiceSettings {
   const src = value ?? {}
@@ -89,7 +50,7 @@ function getDefaultCompareText(language: string | undefined): string {
     case 'en':
       return 'Hello. This sample compares checkpoint quality, tone preservation, and speaker similarity.'
     case 'ja':
-      return 'こんにちは。この 샘플은 체크포인트별 화자 유사도와 말투 보존을 비교하기 위한 문장입니다。'
+      return 'こんにちは。このサンプルは、チェックポイントごとの話者類似度と話し方の保持を比較するための文章です。'
     case 'zh':
       return '你好。这段样例用于比较各个检查点的音色、语气和整体稳定性。'
     case 'ko':
@@ -200,15 +161,6 @@ function getTrainingResetAt(voice: Voice | null): number | null {
 
 function getRunOutcomeLabel(run: RunSummary): string {
   return run.status
-}
-
-function getCandidateTitle(candidate: CheckpointCandidate): string {
-  if (candidate.isCurrentProduction && candidate.validationPassed) return 'Trusted Current'
-  if (candidate.isCurrentProduction) return 'Current Production (Invalidated)'
-  if (candidate.isStoredCandidate) return 'Stored Candidate'
-  if (candidate.validationPassed) return 'Recommended Candidate'
-  if (!candidate.validationPassed) return 'Rejected Candidate'
-  return candidate.runName ?? 'Checkpoint'
 }
 
 function buildCheckpointCandidates(
@@ -351,7 +303,7 @@ function buildCheckpointCandidates(
       isCurrentProduction: true,
       isStoredCandidate: false,
       isJobRecommendation: false,
-      validationPassed: false,
+      validationPassed: typeof voice.checkpoint_score === 'number',
       toneScore: null,
       speedScore: null,
       styleScore: null,
@@ -394,79 +346,72 @@ function buildCheckpointCandidates(
   })
 }
 
-function SettingSlider({
-  label,
-  value,
-  onChange,
-  min,
-  max,
-  step,
-}: {
-  label: string
-  value: number
-  onChange: (value: number) => void
-  min: number
-  max: number
-  step: number
-}) {
-  return (
-    <div>
-      <div className="flex items-center justify-between mb-1.5">
-        <label className="text-subtle text-xs font-medium">{label}</label>
-        <span className="text-muted text-[10px] font-mono">{value.toFixed(2)}</span>
-      </div>
-      <input
-        type="range"
-        min={min}
-        max={max}
-        step={step}
-        value={value}
-        onChange={(e) => onChange(Number(e.target.value))}
-        className="w-full accent-accent"
-      />
-    </div>
-  )
-}
+// ── Recent Attempts Disclosure ────────────────────────────────────────────────
 
-function SummaryCard({
-  title,
-  subtitle,
-  detail,
-  badge,
-  onSelect,
-  actionLabel,
-}: {
-  title: string
-  subtitle: string
-  detail: string
-  badge: string
-  onSelect?: () => void
-  actionLabel?: string
-}) {
+function RecentAttemptsDisclosure({ runSummaries }: { runSummaries: RunSummary[] }) {
+  const [open, setOpen] = useState(false)
+
+  if (runSummaries.length === 0) return null
+
   return (
-    <div className="rounded-xl border border-edge bg-raised p-4">
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <div className="text-heading text-sm font-semibold">{title}</div>
-          <div className="mt-1 text-primary text-sm">{subtitle}</div>
-        </div>
-        <span className="rounded-full bg-surface px-2 py-0.5 text-[10px] font-mono text-muted">
-          {badge}
-        </span>
-      </div>
-      <p className="mt-3 text-[12px] leading-relaxed text-subtle">{detail}</p>
-      {onSelect && actionLabel && (
-        <button
-          onClick={onSelect}
-          className="mt-4 inline-flex items-center rounded-lg border border-edge px-3 py-2 text-[11px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent"
-          type="button"
+    <div className="rounded-xl border border-edge bg-raised p-5">
+      <button
+        onClick={() => setOpen((prev) => !prev)}
+        className="flex items-center gap-2 w-full"
+        type="button"
+      >
+        <svg
+          className={`w-3.5 h-3.5 text-muted transition-transform duration-200 ${open ? 'rotate-90' : ''}`}
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2.5"
+          strokeLinecap="round"
+          strokeLinejoin="round"
         >
-          {actionLabel}
-        </button>
+          <polyline points="9 18 15 12 9 6" />
+        </svg>
+        <h2 className="text-heading font-semibold text-sm">
+          Recent Attempts ({runSummaries.length})
+        </h2>
+      </button>
+
+      {open && (
+        <div className="mt-4 space-y-3 animate-slide-up">
+          {runSummaries.map((run) => (
+            <div key={run.jobId} className="rounded-lg border border-edge bg-surface px-3 py-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-primary text-xs font-mono">
+                    run #{run.attemptNumber ?? '\u2014'} \u00B7 {run.jobId.slice(0, 12)}
+                  </div>
+                  <div className="mt-1 text-[10px] font-mono text-muted">
+                    created={formatDateTime(run.createdAt)}
+                  </div>
+                </div>
+                <div className="text-right text-[10px] font-mono text-muted">
+                  {run.completedAt !== null ? `done ${formatTime(run.completedAt)}` : run.startedAt !== null ? `started ${formatTime(run.startedAt)}` : 'pending'}
+                </div>
+              </div>
+              <div className="mt-2 flex flex-wrap gap-2 text-[10px] font-mono text-muted">
+                <span>status={getRunOutcomeLabel(run)}</span>
+                <span>score={run.championScore !== null ? run.championScore.toFixed(3) : 'n/a'}</span>
+                <span>epoch={run.championEpoch ?? 'n/a'}</span>
+                <span>preset={run.championPreset ?? 'n/a'}</span>
+                {run.durationMs !== null && <span>duration={formatDurationMs(run.durationMs)}</span>}
+              </div>
+              {run.validationMessage && (
+                <div className="mt-2 text-[11px] text-subtle">{run.validationMessage}</div>
+              )}
+            </div>
+          ))}
+        </div>
       )}
     </div>
   )
 }
+
+// ── Main Component ────────────────────────────────────────────────────────────
 
 export function VoiceCompare() {
   const { voiceId = '' } = useParams()
@@ -717,33 +662,31 @@ export function VoiceCompare() {
     }
   }
 
-  function selectCurrentAndBest() {
-    const next = new Set<string>()
-    const current = trustedCurrent
-    const bestAlternative = recommendedCandidate
-    if (current) next.add(current.id)
-    if (bestAlternative) next.add(bestAlternative.id)
+  function handleSelectPreset(preset: 'trusted-recommended' | 'recommended-rejected' | 'clear') {
     setSelectionError('')
+    if (preset === 'clear') {
+      setSelectedCandidateIds(new Set())
+      return
+    }
+    const next = new Set<string>()
+    if (preset === 'trusted-recommended') {
+      if (trustedCurrent) next.add(trustedCurrent.id)
+      if (recommendedCandidate) next.add(recommendedCandidate.id)
+    } else {
+      if (recommendedCandidate) next.add(recommendedCandidate.id)
+      if (latestRejectedCandidate) next.add(latestRejectedCandidate.id)
+    }
     setSelectedCandidateIds(next)
   }
 
-  function selectRecommendedAndRejected() {
-    const next = new Set<string>()
-    if (recommendedCandidate) next.add(recommendedCandidate.id)
-    if (latestRejectedCandidate) next.add(latestRejectedCandidate.id)
-    setSelectionError('')
-    setSelectedCandidateIds(next)
-  }
+  // ── Loading / Error states ──────────────────────────────────────────────────
 
   if (loading) {
     return (
       <div className="space-y-6 animate-pulse">
         <div className="h-7 bg-raised rounded w-48" />
         <div className="h-20 bg-raised rounded-xl" />
-        <div className="grid lg:grid-cols-[320px_1fr] gap-6">
-          <div className="h-96 bg-raised rounded-xl" />
-          <div className="h-96 bg-raised rounded-xl" />
-        </div>
+        <div className="h-96 bg-raised rounded-xl" />
       </div>
     )
   }
@@ -763,33 +706,13 @@ export function VoiceCompare() {
     )
   }
 
+  // ── Render ──────────────────────────────────────────────────────────────────
+
   return (
-    <div className="space-y-8">
+    <div className="space-y-6 pb-28 lg:pb-24">
       {error && (
         <div className="rounded-lg border border-error/20 bg-error-dim px-3 py-2 text-sm text-error">{error}</div>
       )}
-
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] font-mono text-muted">
-          <span>trusted={voice.run_name ?? 'none'}</span>
-          <span>epoch={typeof voice.epoch === 'number' ? voice.epoch : 'none'}</span>
-          <span>cycle_runs={runSummaries.length}</span>
-          <span>checkpoints={candidates.length}</span>
-          {refreshing && <span>refreshing</span>}
-          {trainingResetAt !== null && <span>fresh_cycle</span>}
-        </div>
-        <button
-          onClick={() => void loadData({ silent: true })}
-          className="inline-flex items-center rounded-lg border border-edge px-3 py-1.5 text-[11px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent"
-          type="button"
-        >
-          Refresh
-        </button>
-      </div>
-
-      <p className="text-subtle text-sm -mt-5">
-        Listen to trusted, recommended, and rejected checkpoints side by side before accepting a new version.
-      </p>
 
       {actionMessage && (
         <div className="rounded-lg border border-accent/20 bg-accent-dim px-4 py-3 text-accent text-sm">
@@ -797,32 +720,13 @@ export function VoiceCompare() {
         </div>
       )}
 
-      <div className="grid md:grid-cols-3 gap-4">
-        <SummaryCard
-          title="Trusted Now"
-          subtitle={trustedCurrent ? `${trustedCurrent.runName ?? 'current'} · run ${trustedCurrent.attemptNumber ?? 'n/a'} · epoch ${trustedCurrent.epoch ?? 'n/a'}` : currentProductionCandidate ? `${currentProductionCandidate.runName ?? 'current'} · invalidated` : 'No trusted checkpoint'}
-          detail={trustedCurrent?.message ?? currentProductionCandidate?.message ?? 'A fresh cycle is in progress. Existing discarded checkpoints are not treated as trusted.'}
-          badge={trustedCurrent ? 'current' : currentProductionCandidate ? 'invalidated' : 'empty'}
-          onSelect={trustedCurrent ? () => setSelectedCandidateIds(new Set([trustedCurrent.id])) : undefined}
-          actionLabel={trustedCurrent ? 'Listen' : undefined}
-        />
-        <SummaryCard
-          title={storedCandidate ? 'Candidate Slot' : 'Recommended'}
-          subtitle={recommendedCandidate ? `${recommendedCandidate.runName ?? 'candidate'} · run ${recommendedCandidate.attemptNumber ?? 'n/a'} · epoch ${recommendedCandidate.epoch ?? 'n/a'}` : 'No recommendation yet'}
-          detail={recommendedCandidate?.message ?? 'A recommendation appears here once the current cycle produces candidates.'}
-          badge={storedCandidate ? 'candidate' : recommendedCandidate?.validationPassed ? 'validated' : recommendedCandidate ? 'candidate' : 'waiting'}
-          onSelect={recommendedCandidate ? () => setSelectedCandidateIds(new Set([recommendedCandidate.id])) : undefined}
-          actionLabel={recommendedCandidate ? 'Listen' : undefined}
-        />
-        <SummaryCard
-          title="Latest Rejected"
-          subtitle={latestRejectedCandidate ? `${latestRejectedCandidate.runName ?? 'rejected'} · run ${latestRejectedCandidate.attemptNumber ?? 'n/a'} · epoch ${latestRejectedCandidate.epoch ?? 'n/a'}` : 'No rejected checkpoint in this cycle'}
-          detail={latestRejectedCandidate?.message ?? 'If a checkpoint is trained but rejected by validation, it will still show up here for manual listening.'}
-          badge={latestRejectedCandidate ? 'rejected' : 'waiting'}
-          onSelect={latestRejectedCandidate ? () => setSelectedCandidateIds(new Set([latestRejectedCandidate.id])) : undefined}
-          actionLabel={latestRejectedCandidate ? 'Listen' : undefined}
-        />
-      </div>
+      <DecisionHeader
+        trustedCandidate={trustedCurrent}
+        recommendedCandidate={recommendedCandidate}
+        currentProductionCandidate={currentProductionCandidate}
+        refreshing={refreshing}
+        onRefresh={() => void loadData({ silent: true })}
+      />
 
       <TrainingAdviceCard
         voiceId={voice.voice_id}
@@ -831,329 +735,58 @@ export function VoiceCompare() {
         showCompareLink={false}
       />
 
-      <div className="grid lg:grid-cols-[340px_1fr] gap-6">
-        <div className="space-y-6">
-          <div className="bg-raised border border-edge rounded-xl p-5 space-y-4">
-            <div>
-              <h2 className="text-heading font-semibold text-sm">Audition Controls</h2>
-              <p className="text-subtle text-xs mt-1">
-                Generate the same script across multiple checkpoints to compare tone retention, pacing, and speaker stability.
-              </p>
-              {trainingResetAt !== null && (
-                <p className="text-warning text-[11px] mt-2">
-                  Fresh-cycle mode is active. Older discarded 0.6B runs are hidden from this page by default.
-                </p>
-              )}
-              {archivedJobsCount > 0 && (
-                <p className="text-muted text-[11px] mt-2">
-                  Hidden older runs: {archivedJobsCount}
-                </p>
-              )}
-            </div>
+      <ComparisonSetupForm
+        text={text}
+        onTextChange={setText}
+        seed={seed}
+        onSeedChange={setSeed}
+        settings={settings}
+        onSettingChange={updateSetting}
+        stylePrompt={stylePrompt}
+        onStylePromptChange={setStylePrompt}
+        instruct={instruct}
+        onInstructChange={setInstruct}
+        supportsPromptControls={supportsPromptControls}
+        trainingResetAt={trainingResetAt}
+        archivedJobsCount={archivedJobsCount}
+      />
 
-            <div>
-              <label className="text-subtle text-xs font-medium mb-1.5 block">Comparison Text</label>
-              <textarea
-                value={text}
-                onChange={(e) => setText(e.target.value)}
-                rows={6}
-                className="w-full bg-surface border border-edge rounded-lg px-3 py-2 text-sm text-primary placeholder:text-muted focus:border-accent transition-colors resize-none"
-              />
-            </div>
+      <CandidateGrid
+        candidates={candidates}
+        selectedIds={selectedCandidateIds}
+        onToggle={toggleCandidate}
+        results={results}
+        generating={generating}
+        applyingCandidateId={applyingCandidateId}
+        onApply={handleApplyCandidate}
+        selectionError={selectionError}
+        onSelectPreset={handleSelectPreset}
+      />
 
-            <div>
-              <label className="text-subtle text-xs font-medium mb-1.5 block">Seed</label>
-              <input
-                type="number"
-                value={seed}
-                onChange={(e) => setSeed(parseInt(e.target.value, 10) || 1)}
-                className="w-full bg-surface border border-edge rounded-lg px-3 py-2 text-sm text-primary font-mono focus:border-accent transition-colors"
-              />
-            </div>
+      <RecentAttemptsDisclosure runSummaries={runSummaries} />
 
-            <div className="space-y-4 pt-1">
-              <SettingSlider label="Stability" value={settings.stability} onChange={(value) => updateSetting('stability', value)} min={0} max={1} step={0.01} />
-              <SettingSlider label="Similarity Boost" value={settings.similarity_boost} onChange={(value) => updateSetting('similarity_boost', value)} min={0} max={1} step={0.01} />
-              <SettingSlider label="Style" value={settings.style} onChange={(value) => updateSetting('style', value)} min={0} max={1} step={0.01} />
-              <SettingSlider label="Speed" value={settings.speed} onChange={(value) => updateSetting('speed', value)} min={0.5} max={2} step={0.05} />
-            </div>
+      <RecommendationBanner
+        trustedCandidate={trustedCurrent}
+        recommendedCandidate={recommendedCandidate}
+        results={results}
+        onApply={handleApplyCandidate}
+        applyingCandidateId={applyingCandidateId}
+      />
 
-            <div className="pt-1 border-t border-edge space-y-3">
-              <div>
-                <label className="text-subtle text-xs font-medium mb-1.5 block">Style Prompt</label>
-                <textarea
-                  value={stylePrompt}
-                  onChange={(e) => setStylePrompt(e.target.value)}
-                  disabled={!supportsPromptControls}
-                  rows={3}
-                  placeholder="Preserve the speaker's distinctive phrasing, measured pauses, and sentence-ending emphasis."
-                  className="w-full bg-surface border border-edge rounded-lg px-3 py-2 text-sm text-primary placeholder:text-muted disabled:opacity-50 disabled:cursor-not-allowed focus:border-accent transition-colors resize-none"
-                />
-              </div>
-              <div>
-                <label className="text-subtle text-xs font-medium mb-1.5 block">Instruct</label>
-                <textarea
-                  value={instruct}
-                  onChange={(e) => setInstruct(e.target.value)}
-                  disabled={!supportsPromptControls}
-                  rows={3}
-                  placeholder="Keep the original speaking habit and intonation instead of smoothing it into a generic narration tone."
-                  className="w-full bg-surface border border-edge rounded-lg px-3 py-2 text-sm text-primary placeholder:text-muted disabled:opacity-50 disabled:cursor-not-allowed focus:border-accent transition-colors resize-none"
-                />
-              </div>
-            </div>
-
-            <div className="flex flex-wrap gap-2">
-              <button
-                onClick={selectCurrentAndBest}
-                className="inline-flex items-center rounded-lg border border-edge px-3 py-2 text-[11px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent"
-                type="button"
-              >
-                Select Trusted + Recommended
-              </button>
-              <button
-                onClick={selectRecommendedAndRejected}
-                className="inline-flex items-center rounded-lg border border-edge px-3 py-2 text-[11px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent"
-                type="button"
-              >
-                Select Recommended + Rejected
-              </button>
-              <button
-                onClick={() => setSelectedCandidateIds(new Set())}
-                className="inline-flex items-center rounded-lg border border-edge px-3 py-2 text-[11px] font-semibold text-muted transition-colors hover:text-primary"
-                type="button"
-              >
-                Clear Selection
-              </button>
-            </div>
-
-            {selectionError && (
-              <div className="rounded-lg border border-warning/20 bg-warning-dim px-3 py-2 text-warning text-xs">
-                {selectionError}
-              </div>
-            )}
-
-            <button
-              onClick={handleGenerateSelected}
-              disabled={generating || selectedCandidates.length === 0 || !text.trim()}
-              className="w-full bg-accent hover:bg-accent-light text-void font-semibold text-sm py-2.5 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-              type="button"
-            >
-              {generating ? 'Generating…' : `Generate ${selectedCandidates.length} Selected Checkpoint${selectedCandidates.length === 1 ? '' : 's'}`}
-            </button>
-          </div>
-
-          <div className="bg-raised border border-edge rounded-xl p-5">
-            <h2 className="text-heading font-semibold text-sm mb-4">Recent Attempts</h2>
-            <div className="space-y-3">
-              {runSummaries.map((run) => (
-                <div key={run.jobId} className="rounded-lg border border-edge bg-surface px-3 py-3">
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <div className="text-primary text-xs font-mono">
-                        run #{run.attemptNumber ?? '—'} · {run.jobId.slice(0, 12)}
-                      </div>
-                      <div className="mt-1 text-[10px] font-mono text-muted">
-                        created={formatDateTime(run.createdAt)}
-                      </div>
-                    </div>
-                    <div className="text-right text-[10px] font-mono text-muted">
-                      {run.completedAt !== null ? `done ${formatTime(run.completedAt)}` : run.startedAt !== null ? `started ${formatTime(run.startedAt)}` : 'pending'}
-                    </div>
-                  </div>
-                  <div className="mt-2 flex flex-wrap gap-2 text-[10px] font-mono text-muted">
-                    <span>status={getRunOutcomeLabel(run)}</span>
-                    <span>score={run.championScore !== null ? run.championScore.toFixed(3) : 'n/a'}</span>
-                    <span>epoch={run.championEpoch ?? 'n/a'}</span>
-                    <span>preset={run.championPreset ?? 'n/a'}</span>
-                    {run.durationMs !== null && <span>duration={formatDurationMs(run.durationMs)}</span>}
-                  </div>
-                  {run.validationMessage && (
-                    <div className="mt-2 text-[11px] text-subtle">{run.validationMessage}</div>
-                  )}
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-
-        <div className="space-y-6">
-          <div className="bg-raised border border-edge rounded-xl p-5">
-            <div className="flex items-center justify-between gap-4 mb-4">
-              <div>
-                <h2 className="text-heading font-semibold text-sm">Checkpoint Candidates</h2>
-                <p className="text-subtle text-xs mt-1">Recommended versions are highlighted, but rejected checkpoints are also kept here for manual listening.</p>
-              </div>
-              <div className="text-muted text-[10px] font-mono">max_select={MAX_COMPARE_CANDIDATES}</div>
-            </div>
-
-            {candidates.length === 0 ? (
-              <div className="rounded-xl border border-dashed border-edge bg-surface px-4 py-8 text-center">
-                <div className="text-primary text-sm font-semibold">No checkpoints in the current training cycle yet</div>
-                <p className="mt-2 text-subtle text-sm">
-                  Start a fresh training run first. As soon as checkpoints are saved, this page will surface trusted, recommended, and rejected candidates here.
-                </p>
-                <button
-                  onClick={() => navigate(`/voices/${voiceId}/training`)}
-                  className="mt-4 inline-flex items-center rounded-lg bg-accent px-3 py-2 text-[11px] font-semibold text-void transition-colors hover:bg-accent-light"
-                  type="button"
-                >
-                  Open Training
-                </button>
-              </div>
-            ) : (
-            <div className="grid xl:grid-cols-2 gap-3">
-              {candidates.map((candidate) => {
-                const selected = selectedCandidateIds.has(candidate.id)
-                return (
-                  <button
-                    key={candidate.id}
-                    onClick={() => toggleCandidate(candidate.id)}
-                    className={`rounded-xl border p-4 text-left transition-colors ${selected ? 'border-accent bg-accent-dim/20' : 'border-edge bg-surface hover:border-accent/40'}`}
-                    type="button"
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div>
-                        <div className="text-primary text-sm font-semibold">
-                          {getCandidateTitle(candidate)}
-                        </div>
-                        <div className="text-subtle text-[11px] mt-1">
-                          {candidate.runName ?? candidate.jobId?.slice(0, 8) ?? 'checkpoint'}
-                        </div>
-                        <div className="text-muted text-[10px] font-mono mt-1">
-                          run={candidate.attemptNumber ?? 'n/a'} epoch={candidate.epoch ?? 'n/a'} score={candidate.score !== null ? candidate.score.toFixed(3) : 'n/a'}
-                        </div>
-                        {(candidate.styleScore != null || candidate.toneScore != null || candidate.speedScore != null) && (
-                          <div className="text-[10px] font-mono mt-1 flex flex-wrap gap-x-2">
-                            {candidate.styleScore != null && (
-                              <span>style=<span className={scoreColor(candidate.styleScore)}>{formatScore(candidate.styleScore)}</span></span>
-                            )}
-                            {candidate.toneScore != null && (
-                              <span>tone=<span className={scoreColor(candidate.toneScore)}>{formatScore(candidate.toneScore)}</span></span>
-                            )}
-                            {candidate.speedScore != null && (
-                              <span>speed=<span className={scoreColor(candidate.speedScore)}>{formatScore(candidate.speedScore)}</span></span>
-                            )}
-                          </div>
-                        )}
-                        <div className="text-muted text-[10px] font-mono mt-1">
-                          {formatDate(candidate.createdAt)} {formatTime(candidate.createdAt)}
-                          {candidate.completedAt !== null ? ` · done ${formatTime(candidate.completedAt)}` : ''}
-                        </div>
-                      </div>
-                      <input
-                        type="checkbox"
-                        checked={selected}
-                        onChange={() => toggleCandidate(candidate.id)}
-                        className="accent-accent mt-1"
-                      />
-                    </div>
-
-                    <div className="mt-3 flex flex-wrap gap-2 text-[10px] font-mono">
-                      {candidate.isCurrentProduction && (
-                        <span className={`rounded-full px-2 py-0.5 ${candidate.validationPassed ? 'bg-accent-dim text-accent' : 'bg-error-dim text-error'}`}>
-                          {candidate.validationPassed ? 'current' : 'invalidated'}
-                        </span>
-                      )}
-                      {candidate.isJobRecommendation && (
-                        <span className="rounded-full bg-warning-dim px-2 py-0.5 text-warning">recommended</span>
-                      )}
-                      {candidate.isStoredCandidate && (
-                        <span className="rounded-full bg-accent-dim px-2 py-0.5 text-accent">candidate</span>
-                      )}
-                      {candidate.validationPassed && (
-                        <span className="rounded-full bg-accent-dim px-2 py-0.5 text-accent">passed</span>
-                      )}
-                      {!candidate.validationPassed && !candidate.isCurrentProduction && (
-                        <span className="rounded-full bg-error-dim px-2 py-0.5 text-error">rejected</span>
-                      )}
-                      {candidate.preset && (
-                        <span className="rounded-full bg-raised px-2 py-0.5 text-muted">{candidate.preset}</span>
-                      )}
-                    </div>
-
-                    {candidate.message && (
-                      <p className="mt-3 text-[11px] leading-relaxed text-subtle">
-                        {candidate.message}
-                      </p>
-                    )}
-                  </button>
-                )
-              })}
-            </div>
-            )}
-          </div>
-
-          <div className="bg-raised border border-edge rounded-xl p-5">
-            <h2 className="text-heading font-semibold text-sm mb-4">Side-by-Side Listening</h2>
-            {selectedCandidates.length === 0 ? (
-              <div className="text-subtle text-sm py-8 text-center">Select checkpoints above to audition them together.</div>
-            ) : (
-              <div className="grid xl:grid-cols-2 gap-4">
-                {selectedCandidates.map((candidate) => {
-                  const result = results[candidate.id]
-                  return (
-                    <div key={candidate.id} className="rounded-xl border border-edge bg-surface p-4">
-                      <div className="flex items-start justify-between gap-3 mb-3">
-                        <div>
-                          <div className="text-primary font-semibold text-sm">
-                            {candidate.isCurrentProduction && !candidate.validationPassed ? 'Current Production (Invalidated)' : candidate.isCurrentProduction ? 'Current Production' : candidate.runName ?? 'Candidate'}
-                          </div>
-                          <div className="text-muted text-[10px] font-mono mt-1">
-                            run={candidate.attemptNumber ?? 'n/a'} epoch={candidate.epoch ?? 'n/a'} score={candidate.score !== null ? candidate.score.toFixed(3) : 'n/a'} preset={candidate.preset ?? 'n/a'}
-                          </div>
-                          {(candidate.styleScore != null || candidate.toneScore != null || candidate.speedScore != null) && (
-                            <div className="text-[10px] font-mono mt-1 flex flex-wrap gap-x-2">
-                              {candidate.styleScore != null && (
-                                <span>style=<span className={scoreColor(candidate.styleScore)}>{formatScore(candidate.styleScore)}</span></span>
-                              )}
-                              {candidate.toneScore != null && (
-                                <span>tone=<span className={scoreColor(candidate.toneScore)}>{formatScore(candidate.toneScore)}</span></span>
-                              )}
-                              {candidate.speedScore != null && (
-                                <span>speed=<span className={scoreColor(candidate.speedScore)}>{formatScore(candidate.speedScore)}</span></span>
-                              )}
-                            </div>
-                          )}
-                          <div className="text-muted text-[10px] font-mono mt-1">
-                            {formatDate(candidate.createdAt)} {formatTime(candidate.createdAt)}
-                          </div>
-                        </div>
-                        <div className="text-[10px] font-mono text-muted">{result?.status ?? 'Idle'}</div>
-                      </div>
-
-                      <AudioPlayer blob={result?.blob} generating={generating && !result?.blob && result?.status !== 'Failed'} />
-
-                      {result?.error && (
-                        <div className="mt-3 rounded-lg border border-error/20 bg-error-dim px-3 py-2 text-error text-xs">
-                          {result.error}
-                        </div>
-                      )}
-
-                      {candidate.message && (
-                        <div className="mt-3 text-[11px] text-subtle">
-                          {candidate.message}
-                        </div>
-                      )}
-
-                      {candidate.jobId && !candidate.isCurrentProduction && (
-                        <button
-                          onClick={() => void handleApplyCandidate(candidate)}
-                          disabled={applyingCandidateId === candidate.id}
-                          className="mt-3 inline-flex items-center rounded-lg border border-edge px-3 py-2 text-[11px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent disabled:opacity-50"
-                          type="button"
-                        >
-                          {applyingCandidateId === candidate.id ? 'Applying…' : 'Apply This Checkpoint'}
-                        </button>
-                      )}
-                    </div>
-                  )
-                })}
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
+      <CompareTray
+        selectedCandidates={selectedCandidates}
+        onRemove={(id) => {
+          setSelectedCandidateIds((prev) => {
+            const next = new Set(prev)
+            next.delete(id)
+            return next
+          })
+        }}
+        onGenerate={handleGenerateSelected}
+        generating={generating}
+        hasText={Boolean(text.trim())}
+        maxSelect={MAX_COMPARE_CANDIDATES}
+      />
     </div>
   )
 }

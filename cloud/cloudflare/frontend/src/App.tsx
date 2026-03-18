@@ -10,6 +10,8 @@ import { VoiceWorkspace, VoiceDefaultRedirect } from './pages/VoiceWorkspace'
 import { VoiceTrainingTab } from './pages/VoiceTrainingTab'
 import { QueuePage } from './pages/QueuePage'
 import { Statistics } from './pages/Statistics'
+import { VoiceArena } from './pages/VoiceArena'
+import { ArenaCalibration } from './pages/ArenaCalibration'
 
 export function App() {
   return (
@@ -23,6 +25,8 @@ export function App() {
           <Route path="training" element={<VoiceTrainingTab />} />
           <Route path="dataset" element={<VoiceDataset />} />
           <Route path="compare" element={<VoiceCompare />} />
+          <Route path="arena" element={<VoiceArena />} />
+          <Route path="arena/calibration" element={<ArenaCalibration />} />
         </Route>
         <Route path="playground" element={<Playground />} />
         <Route path="queue" element={<QueuePage />} />

@@ -1447,3 +1447,175 @@ export const DEFAULT_VOICE_SETTINGS: VoiceSettings = {
   style: 0.05,
   speed: 1.0,
 }
+
+// ── Arena Types ───────────────────────────────────────────────────────────────
+
+export type ArenaSessionStatus = 'assembling' | 'generating' | 'active' | 'completed' | 'cancelled'
+export type ArenaAlgorithm = 'swiss' | 'round_robin'
+export type ArenaVoteWinner = 'a' | 'b' | 'tie' | 'both_bad'
+export type ArenaVoteConfidence = 'clear' | 'slight'
+export type ArenaCandidateSource = 'champion_carry' | 'second_carry' | 'third_carry' | 'new'
+export type ArenaCandidateRetention = 'active' | 'champion' | 'second' | 'third' | 'eliminated' | 'purged'
+export type ArenaCalibrationConfidence = 'preliminary' | 'calibrated' | 'high'
+
+export interface ArenaSession {
+  session_id: string
+  voice_id: string
+  status: ArenaSessionStatus
+  algorithm: ArenaAlgorithm
+  current_round: number
+  total_rounds: number | null
+  test_texts: string[]
+  seed: number
+  settings: Record<string, unknown>
+  ranking: Record<string, unknown>
+  winner_candidate_id: string | null
+  promoted: boolean
+  notes: string | null
+  created_at: number
+  completed_at: number | null
+}
+
+export interface ArenaCandidate {
+  candidate_id: string
+  session_id: string
+  voice_id: string
+  checkpoint_r2_prefix: string
+  job_id: string | null
+  run_name: string | null
+  epoch: number | null
+  source: ArenaCandidateSource
+  seed_rank: number | null
+  final_rank: number | null
+  wins: number
+  losses: number
+  ties: number
+  bye_count: number
+  buchholz: number
+  retention_status: ArenaCandidateRetention
+  auto_scores: Record<string, number | null>
+  created_at: number
+  eliminated_at: number | null
+}
+
+export interface ArenaMatch {
+  match_id: string
+  session_id: string
+  round_number: number
+  candidate_a_id: string
+  candidate_b_id: string
+  display_order: 'ab' | 'ba'
+  text_index: number
+  audio_a_r2_key: string | null
+  audio_b_r2_key: string | null
+  winner: ArenaVoteWinner | null
+  confidence: ArenaVoteConfidence | null
+  replay_count_a: number
+  replay_count_b: number
+  created_at: number
+  voted_at: number | null
+}
+
+export interface CalibrationResult {
+  learned_weights: Record<string, number>
+  confidence: ArenaCalibrationConfidence | 'insufficient'
+  matchup_count: number
+  accuracy: number
+  weight_shifts: Record<string, number>
+  gate_diagnostics: {
+    both_bad_rate: number
+    gate_pass_loss_rate: number
+    suggested_gate_changes: Array<{
+      metric: string
+      direction: 'tighten' | 'loosen'
+      current: number
+      suggested: number
+    }>
+  }
+}
+
+export interface ArenaSessionResponse extends ArenaSession {
+  candidates: ArenaCandidate[]
+  matches: ArenaMatch[]
+}
+
+// ── Arena API ─────────────────────────────────────────────────────────────────
+
+export async function createArenaSession(
+  voiceId: string,
+  testTexts: string[],
+  seed?: number,
+): Promise<ArenaSessionResponse> {
+  return request<ArenaSessionResponse>('/v1/arena/sessions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      voice_id: voiceId,
+      test_texts: testTexts,
+      seed,
+    }),
+  })
+}
+
+export async function getArenaSession(
+  sessionId: string,
+): Promise<ArenaSessionResponse> {
+  return request<ArenaSessionResponse>(`/v1/arena/sessions/${sessionId}`)
+}
+
+export async function generateArenaAudio(
+  sessionId: string,
+): Promise<void> {
+  await request<{ status: string }>(`/v1/arena/sessions/${sessionId}/generate`, {
+    method: 'POST',
+  })
+}
+
+export async function submitArenaVote(
+  matchId: string,
+  winner: ArenaVoteWinner,
+  confidence?: ArenaVoteConfidence,
+): Promise<{ round_complete: boolean }> {
+  return request<{ round_complete: boolean }>(`/v1/arena/matches/${matchId}/vote`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ winner, confidence }),
+  })
+}
+
+export async function completeArenaSession(
+  sessionId: string,
+): Promise<void> {
+  await request<{ status: string }>(`/v1/arena/sessions/${sessionId}/complete`, {
+    method: 'POST',
+  })
+}
+
+export async function promoteArenaWinner(
+  sessionId: string,
+): Promise<void> {
+  await request<{ status: string }>(`/v1/arena/sessions/${sessionId}/promote`, {
+    method: 'POST',
+  })
+}
+
+export async function getArenaCalibration(
+  voiceId?: string,
+): Promise<CalibrationResult> {
+  const params = new URLSearchParams()
+  if (voiceId) params.set('voice_id', voiceId)
+  const query = params.toString()
+  const path = query ? `/v1/arena/calibration?${query}` : '/v1/arena/calibration'
+  return request<CalibrationResult>(path)
+}
+
+export async function applyArenaCalibration(
+  weights: Record<string, number>,
+  voiceId?: string,
+): Promise<void> {
+  await request<{ status: string }>('/v1/arena/calibration/apply', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ voice_id: voiceId, weights }),
+  })
+}

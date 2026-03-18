@@ -348,3 +348,102 @@ export interface TrainingRound {
   started_at: number | null;
   completed_at: number | null;
 }
+
+// ── Arena Evaluation Types ──────────────────────────────────────────────────────
+
+export type ArenaSessionStatus = "assembling" | "generating" | "active" | "completed" | "cancelled";
+export type ArenaAlgorithm = "swiss" | "round_robin";
+export type ArenaVoteWinner = "a" | "b" | "tie" | "both_bad";
+export type ArenaVoteConfidence = "clear" | "slight";
+export type ArenaCandidateSource = "champion_carry" | "second_carry" | "third_carry" | "new";
+export type ArenaCandidateRetention = "active" | "champion" | "second" | "third" | "eliminated" | "purged";
+export type ArenaCalibrationConfidence = "preliminary" | "calibrated" | "high";
+
+export interface ArenaSession {
+  session_id: string;
+  voice_id: string;
+  status: ArenaSessionStatus;
+  algorithm: ArenaAlgorithm;
+  current_round: number;
+  total_rounds: number | null;
+  test_texts: string[];
+  seed: number;
+  settings: VoiceSettings;
+  ranking: Record<string, unknown>;
+  winner_candidate_id: string | null;
+  promoted: boolean;
+  notes: string | null;
+  created_at: number;
+  completed_at: number | null;
+}
+
+export interface ArenaCandidate {
+  candidate_id: string;
+  session_id: string;
+  voice_id: string;
+  checkpoint_r2_prefix: string;
+  job_id: string | null;
+  run_name: string | null;
+  epoch: number | null;
+  source: ArenaCandidateSource;
+  seed_rank: number | null;
+  final_rank: number | null;
+  wins: number;
+  losses: number;
+  ties: number;
+  bye_count: number;
+  buchholz: number;
+  retention_status: ArenaCandidateRetention;
+  auto_scores: Record<string, number | null>;
+  created_at: number;
+  eliminated_at: number | null;
+}
+
+export interface ArenaMatch {
+  match_id: string;
+  session_id: string;
+  round_number: number;
+  candidate_a_id: string;
+  candidate_b_id: string;
+  display_order: "ab" | "ba";
+  text_index: number;
+  audio_a_r2_key: string | null;
+  audio_b_r2_key: string | null;
+  winner: ArenaVoteWinner | null;
+  confidence: ArenaVoteConfidence | null;
+  replay_count_a: number;
+  replay_count_b: number;
+  created_at: number;
+  voted_at: number | null;
+}
+
+export interface ArenaCalibrationOverride {
+  override_id: string;
+  voice_id: string;
+  weights: Record<string, number>;
+  matchup_count: number;
+  accuracy: number | null;
+  confidence: ArenaCalibrationConfidence;
+  weight_shifts: Record<string, number> | null;
+  gate_diagnostics: Record<string, unknown> | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface CalibrationResult {
+  learned_weights: Record<string, number>;
+  confidence: ArenaCalibrationConfidence | "insufficient";
+  matchup_count: number;
+  accuracy: number;
+  weight_shifts: Record<string, number>;
+  gate_diagnostics: {
+    both_bad_rate: number;
+    gate_pass_loss_rate: number;
+    suggested_gate_changes: Array<{
+      metric: string;
+      direction: "tighten" | "loosen";
+      current: number;
+      suggested: number;
+    }>;
+  };
+}

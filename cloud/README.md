@@ -193,7 +193,8 @@ The React SPA is deployed to Cloudflare Pages. It uses React Router v7, Tailwind
   /generate   TTS generation
   /training   VoiceTrainingTab (AutopilotPanel + active jobs + history)
   /dataset    Dataset management
-  /compare    Checkpoint comparison
+  /compare    Checkpoint comparison (decomposed UI with score bands, filter tabs, sticky compare tray)
+  /arena      Voice Arena — blind A/B checkpoint comparison with Elo rating
 /playground Quick TTS playground
 /queue      Global queue monitor (real pod capacity, per-voice stats)
 ```
@@ -206,6 +207,21 @@ The React SPA is deployed to Cloudflare Pages. It uses React Router v7, Tailwind
 - `TrainingJobRow` — single job status row with live progress
 - `TrainingHistoryList` — paginated job history with checkpoint scores
 - `QueuePage` — global queue view showing real pod capacity and per-voice queue depth
+- `VoiceCompare` — checkpoint comparison page decomposed into focused sub-components (see Compare Components below)
+
+**Compare Components (`components/compare/`):**
+
+The checkpoint comparison page was refactored from a 1159-line monolith into composable sub-components:
+
+- `DecisionHeader` — compact Trusted vs Recommended comparison header with score bands and one-line comparison summary
+- `ComparisonSetupForm` — comparison text and seed always visible; stability/similarity/style/speed sliders and prompt controls collapse into an "Advanced Settings" accordion
+- `CandidateGrid` — filterable grid (All / Passed / Rejected tabs) with quick-selection presets (Trusted + Recommended, Recommended + Rejected, Clear)
+- `CandidateCard` — dual-mode card: browse mode (selection, score band pill, role badges, validation message) and listening mode (AudioPlayer, trait bars, Apply button)
+- `ScoreBand` — visual score grade pill (Excellent / Strong / Borderline / Weak) replacing raw numeric display
+- `TraitBars` — horizontal mini-bars for style, tone, and speed sub-scores
+- `CompareTray` — sticky bottom bar showing selected checkpoint chips with a Generate CTA
+- `RecommendationBanner` — post-generation decision support comparing trusted vs recommended scores with Promote / Keep Current actions
+- `RunDetailsDisclosure` — collapsible expert-detail panel (run IDs, epochs, timestamps, raw scores)
 
 ---
 
@@ -248,6 +264,7 @@ cloud/
     │       │   ├── training-callbacks.ts  # RunPod callback handler
     │       │   ├── dataset.ts         # Dataset management
     │       │   ├── upload.ts          # Presigned URL generation
+    │       │   ├── arena.ts           # Voice Arena API (blind A/B, Elo rating)
     │       │   └── admin.ts           # Admin utilities
     │       └── lib/
     │           ├── training-domain.ts     # Canonical config, validation, helpers
@@ -259,7 +276,9 @@ cloud/
     │           ├── transcript-review.ts   # LLM transcript quality review
     │           ├── runpod.ts              # RunPod API client
     │           ├── r2.ts                  # R2 presigned URLs
-    │           └── d1.ts                  # D1 query helpers
+    │           ├── d1.ts                  # D1 query helpers
+    │           ├── arena.ts               # Arena match logic and Elo computation
+    │           └── arena-calibration.ts   # Arena calibration utilities
     └── frontend/
         ├── package.json
         ├── vite.config.ts
@@ -272,7 +291,8 @@ cloud/
             │   ├── api.ts                 # API client + TypeScript types
             │   ├── training-domain.ts     # Frontend canonical config (mirrors worker)
             │   ├── trainingAdvisor.ts     # Client-side advice rendering
-            │   └── trainingCheckout.ts    # Checkpoint selection helpers
+            │   ├── trainingCheckout.ts    # Checkpoint selection helpers
+            │   └── voiceScoreUi.ts        # Score formatting, color, and band utilities
             ├── hooks/
             │   └── useTheme.ts
             ├── pages/
@@ -282,16 +302,29 @@ cloud/
             │   ├── VoiceDetail.tsx
             │   ├── VoiceTrainingTab.tsx
             │   ├── VoiceDataset.tsx
-            │   ├── VoiceCompare.tsx
+            │   ├── VoiceCompare.tsx       # Orchestrator using compare/* components
+            │   ├── VoiceArena.tsx         # Blind A/B checkpoint comparison with Elo
+            │   ├── ArenaCalibration.tsx   # Arena Elo calibration dashboard
             │   ├── Playground.tsx
             │   └── QueuePage.tsx
             └── components/
                 ├── Layout.tsx
-                ├── AudioPlayer.tsx
+                ├── AudioPlayer.tsx            # Canvas waveform with play/pause/seek
                 ├── VoiceCard.tsx
                 ├── TrainingAdviceCard.tsx
+                ├── compare/                   # Checkpoint comparison sub-components
+                │   ├── types.ts               # Shared types (CheckpointCandidate, etc.)
+                │   ├── utils.ts               # getCandidateTitle helper
+                │   ├── ScoreBand.tsx           # Score grade pill + TraitBars
+                │   ├── RunDetailsDisclosure.tsx  # Collapsible debug detail
+                │   ├── DecisionHeader.tsx      # Trusted vs Recommended header
+                │   ├── ComparisonSetupForm.tsx  # Text/seed + advanced accordion
+                │   ├── CandidateCard.tsx       # Dual-mode browse/listening card
+                │   ├── CandidateGrid.tsx       # Filterable candidate grid
+                │   ├── CompareTray.tsx         # Sticky bottom selection bar
+                │   └── RecommendationBanner.tsx  # Post-generation decision support
                 └── training/
-                    ├── AutopilotPanel.tsx     # Goal-first training UI
+                    ├── AutopilotPanel.tsx      # Goal-first training UI
                     ├── AutopilotCard.tsx
                     ├── TrainingJobRow.tsx
                     └── TrainingHistoryList.tsx

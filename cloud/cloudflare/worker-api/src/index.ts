@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import adminRoutes from "./routes/admin";
+import arenaRoutes from "./routes/arena";
 import datasetRoutes from "./routes/dataset";
 import modelsRoutes from "./routes/models";
 import trainingCallbacksRoutes from "./routes/training-callbacks";
@@ -31,6 +32,7 @@ app.route("/v1/training", trainingRoutes);
 app.route("/v1/internal/training", trainingCallbacksRoutes);
 app.route("/v1/upload", uploadRoutes);
 app.route("/v1/dataset", datasetRoutes);
+app.route("/v1/arena", arenaRoutes);
 
 app.onError((err, c) => {
   if (err instanceof SyntaxError) {

@@ -1,0 +1,444 @@
+import { Hono } from "hono";
+import {
+  createArenaCandidate,
+  createArenaMatch,
+  createArenaSession,
+  getArenaCalibrationOverride,
+  getArenaMatch,
+  getArenaSession,
+  getVoice,
+  listArenaCandidates,
+  listArenaMatches,
+  updateArenaMatch,
+  updateArenaSession,
+  updateVoice,
+  upsertArenaCalibrationOverride,
+} from "../lib/d1";
+import {
+  assembleArenaCandidates,
+  computeTotalRounds,
+  generateSwissPairings,
+  generateRoundRobinSchedule,
+  submitVote,
+  advanceRound,
+  finalizeSession,
+} from "../lib/arena";
+import { calibrateFromArenaData } from "../lib/arena-calibration";
+import { authMiddleware } from "../middleware/auth";
+import type {
+  AppContext,
+  ArenaCandidate,
+  ArenaMatch,
+  ArenaSession,
+  ArenaVoteConfidence,
+  ArenaVoteWinner,
+  VoiceSettings,
+} from "../types";
+
+const app = new Hono<AppContext>();
+app.use("*", authMiddleware);
+
+app.post("/sessions", async (c) => {
+  try {
+    const body = await c.req.json<{
+      voice_id: string;
+      test_texts: string[];
+      seed?: number;
+      settings?: VoiceSettings;
+    }>();
+
+    if (!body.voice_id || !Array.isArray(body.test_texts) || body.test_texts.length === 0) {
+      return c.json({ detail: { message: "voice_id and non-empty test_texts are required" } }, 400);
+    }
+
+    const voice = await getVoice(c.env.DB, body.voice_id);
+    if (!voice) {
+      return c.json({ detail: { message: "Voice not found" } }, 404);
+    }
+
+    const { candidates: assembled, algorithm } = await assembleArenaCandidates(c.env.DB, body.voice_id);
+    if (assembled.length < 2) {
+      return c.json({ detail: { message: "Need at least 2 candidates for an arena session" } }, 400);
+    }
+
+    const totalRounds = computeTotalRounds(assembled.length, algorithm);
+    const seed = body.seed ?? 42;
+    const now = Date.now();
+    const sessionId = crypto.randomUUID();
+
+    const session: ArenaSession = {
+      session_id: sessionId,
+      voice_id: body.voice_id,
+      status: "assembling",
+      algorithm,
+      current_round: 1,
+      total_rounds: totalRounds,
+      test_texts: body.test_texts,
+      seed,
+      settings: body.settings ?? {},
+      ranking: {},
+      winner_candidate_id: null,
+      promoted: false,
+      notes: null,
+      created_at: now,
+      completed_at: null,
+    };
+
+    await createArenaSession(c.env.DB, session);
+
+    const candidateRecords: ArenaCandidate[] = assembled.map((ac, idx) => ({
+      candidate_id: crypto.randomUUID(),
+      session_id: sessionId,
+      voice_id: body.voice_id,
+      checkpoint_r2_prefix: ac.checkpoint_r2_prefix,
+      job_id: ac.job_id,
+      run_name: ac.run_name,
+      epoch: ac.epoch,
+      source: ac.source,
+      seed_rank: idx + 1,
+      final_rank: null,
+      wins: 0,
+      losses: 0,
+      ties: 0,
+      bye_count: 0,
+      buchholz: 0,
+      retention_status: "active",
+      auto_scores: ac.auto_scores,
+      created_at: now,
+      eliminated_at: null,
+    }));
+
+    for (const candidate of candidateRecords) {
+      await createArenaCandidate(c.env.DB, candidate);
+    }
+
+    const matchRecords: ArenaMatch[] = [];
+    if (algorithm === "round_robin") {
+      const pairs = generateRoundRobinSchedule(
+        candidateRecords.map((cr) => cr.candidate_id),
+        body.test_texts.length,
+      );
+      for (const p of pairs) {
+        matchRecords.push({
+          match_id: crypto.randomUUID(),
+          session_id: sessionId,
+          round_number: 1,
+          candidate_a_id: p.a,
+          candidate_b_id: p.b,
+          display_order: p.displayOrder,
+          text_index: p.textIndex,
+          audio_a_r2_key: null,
+          audio_b_r2_key: null,
+          winner: null,
+          confidence: null,
+          replay_count_a: 0,
+          replay_count_b: 0,
+          created_at: now,
+          voted_at: null,
+        });
+      }
+    } else {
+      const standings = candidateRecords.map((cr) => ({
+        candidate_id: cr.candidate_id,
+        wins: 0,
+        losses: 0,
+        ties: 0,
+        bye_count: 0,
+        buchholz: 0,
+      }));
+      const { pairs, byeCandidateId } = generateSwissPairings(standings, 1, [], body.test_texts.length);
+
+      if (byeCandidateId) {
+        const byeCandidate = candidateRecords.find((cr) => cr.candidate_id === byeCandidateId);
+        if (byeCandidate) {
+          byeCandidate.wins = 1;
+          byeCandidate.bye_count = 1;
+        }
+      }
+
+      for (const p of pairs) {
+        matchRecords.push({
+          match_id: crypto.randomUUID(),
+          session_id: sessionId,
+          round_number: 1,
+          candidate_a_id: p.a,
+          candidate_b_id: p.b,
+          display_order: p.displayOrder,
+          text_index: p.textIndex,
+          audio_a_r2_key: null,
+          audio_b_r2_key: null,
+          winner: null,
+          confidence: null,
+          replay_count_a: 0,
+          replay_count_b: 0,
+          created_at: now,
+          voted_at: null,
+        });
+      }
+    }
+
+    for (const match of matchRecords) {
+      await createArenaMatch(c.env.DB, match);
+    }
+
+    return c.json({
+      ...session,
+      candidates: candidateRecords,
+      matches: matchRecords,
+    }, 201);
+  } catch (err) {
+    console.error("POST /sessions error:", err);
+    return c.json({ detail: { message: err instanceof Error ? err.message : "Internal server error" } }, 500);
+  }
+});
+
+app.get("/sessions/:sessionId", async (c) => {
+  try {
+    const sessionId = c.req.param("sessionId");
+    const session = await getArenaSession(c.env.DB, sessionId);
+    if (!session) {
+      return c.json({ detail: { message: "Session not found" } }, 404);
+    }
+
+    const candidates = await listArenaCandidates(c.env.DB, { session_id: sessionId });
+    const matches = await listArenaMatches(c.env.DB, {
+      session_id: sessionId,
+      round_number: session.current_round,
+    });
+
+    return c.json({ ...session, candidates, matches });
+  } catch (err) {
+    console.error("GET /sessions/:sessionId error:", err);
+    return c.json({ detail: { message: err instanceof Error ? err.message : "Internal server error" } }, 500);
+  }
+});
+
+app.post("/sessions/:sessionId/generate", async (c) => {
+  try {
+    const sessionId = c.req.param("sessionId");
+    const session = await getArenaSession(c.env.DB, sessionId);
+    if (!session) {
+      return c.json({ detail: { message: "Session not found" } }, 404);
+    }
+
+    if (session.status !== "assembling") {
+      return c.json({ detail: { message: `Cannot generate: session status is '${session.status}', expected 'assembling'` } }, 400);
+    }
+
+    const candidates = await listArenaCandidates(c.env.DB, { session_id: sessionId });
+    const allMatches = await listArenaMatches(c.env.DB, { session_id: sessionId });
+
+    // TODO: Integrate actual TTS generation via RunPod.
+    // For now, create R2 key paths for all candidate x text combinations
+    // and update arena_matches with the audio keys.
+    const audioKeys: Array<{ candidateId: string; textIndex: number; r2Key: string }> = [];
+    for (const candidate of candidates) {
+      for (let textIdx = 0; textIdx < session.test_texts.length; textIdx++) {
+        const r2Key = `arena/${sessionId}/${candidate.candidate_id}/text${textIdx}.wav`;
+        audioKeys.push({ candidateId: candidate.candidate_id, textIndex: textIdx, r2Key });
+      }
+    }
+
+    for (const match of allMatches) {
+      const audioA = audioKeys.find(
+        (ak) => ak.candidateId === match.candidate_a_id && ak.textIndex === match.text_index,
+      );
+      const audioB = audioKeys.find(
+        (ak) => ak.candidateId === match.candidate_b_id && ak.textIndex === match.text_index,
+      );
+      if (audioA || audioB) {
+        await updateArenaMatch(c.env.DB, match.match_id, {
+          audio_a_r2_key: audioA?.r2Key ?? null,
+          audio_b_r2_key: audioB?.r2Key ?? null,
+        });
+      }
+    }
+
+    await updateArenaSession(c.env.DB, sessionId, { status: "active" });
+
+    return c.json({
+      session_id: sessionId,
+      status: "active",
+      audio_keys: audioKeys,
+      message: "Audio key paths assigned. TODO: actual TTS generation via RunPod not yet integrated.",
+    });
+  } catch (err) {
+    console.error("POST /sessions/:sessionId/generate error:", err);
+    return c.json({ detail: { message: err instanceof Error ? err.message : "Internal server error" } }, 500);
+  }
+});
+
+app.post("/matches/:matchId/vote", async (c) => {
+  try {
+    const matchId = c.req.param("matchId");
+    const body = await c.req.json<{
+      winner: ArenaVoteWinner;
+      confidence?: ArenaVoteConfidence;
+    }>();
+
+    if (!body.winner || !["a", "b", "tie", "both_bad"].includes(body.winner)) {
+      return c.json({ detail: { message: "winner must be one of: a, b, tie, both_bad" } }, 400);
+    }
+
+    const confidence = body.confidence ?? null;
+    if (confidence !== null && !["clear", "slight"].includes(confidence)) {
+      return c.json({ detail: { message: "confidence must be one of: clear, slight" } }, 400);
+    }
+
+    const result = await submitVote(c.env.DB, matchId, body.winner, confidence);
+
+    if (result.conflict) {
+      return c.json({ detail: { message: "Match already voted" } }, 409);
+    }
+
+    let advanceResult = { advanced: false, finalized: false };
+    if (result.roundComplete) {
+      advanceResult = await advanceRound(c.env.DB, result.sessionId);
+    }
+
+    return c.json({
+      success: result.success,
+      round_complete: result.roundComplete,
+      round_advanced: advanceResult.advanced,
+      session_finalized: advanceResult.finalized,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Internal server error";
+    if (message === "Match not found") {
+      return c.json({ detail: { message } }, 404);
+    }
+    console.error("POST /matches/:matchId/vote error:", err);
+    return c.json({ detail: { message } }, 500);
+  }
+});
+
+app.post("/sessions/:sessionId/complete", async (c) => {
+  try {
+    const sessionId = c.req.param("sessionId");
+    const session = await getArenaSession(c.env.DB, sessionId);
+    if (!session) {
+      return c.json({ detail: { message: "Session not found" } }, 404);
+    }
+
+    if (session.status === "completed") {
+      return c.json({ detail: { message: "Session already completed" } }, 400);
+    }
+
+    await finalizeSession(c.env.DB, sessionId);
+
+    const updated = await getArenaSession(c.env.DB, sessionId);
+    const candidates = await listArenaCandidates(c.env.DB, { session_id: sessionId });
+
+    return c.json({ session: updated, candidates });
+  } catch (err) {
+    console.error("POST /sessions/:sessionId/complete error:", err);
+    return c.json({ detail: { message: err instanceof Error ? err.message : "Internal server error" } }, 500);
+  }
+});
+
+app.post("/sessions/:sessionId/promote", async (c) => {
+  try {
+    const sessionId = c.req.param("sessionId");
+    const session = await getArenaSession(c.env.DB, sessionId);
+    if (!session) {
+      return c.json({ detail: { message: "Session not found" } }, 404);
+    }
+
+    if (session.status !== "completed") {
+      return c.json({ detail: { message: "Session must be completed before promotion" } }, 400);
+    }
+
+    if (!session.winner_candidate_id) {
+      return c.json({ detail: { message: "No winner to promote" } }, 400);
+    }
+
+    if (session.promoted) {
+      return c.json({ detail: { message: "Winner already promoted" } }, 400);
+    }
+
+    const candidates = await listArenaCandidates(c.env.DB, { session_id: sessionId });
+    const winner = candidates.find((cr) => cr.candidate_id === session.winner_candidate_id);
+    if (!winner) {
+      return c.json({ detail: { message: "Winner candidate not found" } }, 404);
+    }
+
+    const voice = await getVoice(c.env.DB, session.voice_id);
+    if (!voice) {
+      return c.json({ detail: { message: "Voice not found" } }, 404);
+    }
+
+    await updateVoice(c.env.DB, voice.voice_id, {
+      checkpoint_r2_prefix: winner.checkpoint_r2_prefix,
+      run_name: winner.run_name,
+      epoch: winner.epoch,
+      checkpoint_job_id: winner.job_id,
+      updated_at: Date.now(),
+    });
+
+    await updateArenaSession(c.env.DB, sessionId, { promoted: true });
+
+    return c.json({
+      promoted: true,
+      voice_id: voice.voice_id,
+      checkpoint_r2_prefix: winner.checkpoint_r2_prefix,
+      run_name: winner.run_name,
+      epoch: winner.epoch,
+    });
+  } catch (err) {
+    console.error("POST /sessions/:sessionId/promote error:", err);
+    return c.json({ detail: { message: err instanceof Error ? err.message : "Internal server error" } }, 500);
+  }
+});
+
+app.get("/calibration", async (c) => {
+  try {
+    const voiceId = c.req.query("voice_id") || undefined;
+    const result = await calibrateFromArenaData(c.env.DB, voiceId);
+    return c.json(result);
+  } catch (err) {
+    console.error("GET /calibration error:", err);
+    return c.json({ detail: { message: err instanceof Error ? err.message : "Internal server error" } }, 500);
+  }
+});
+
+app.post("/calibration/apply", async (c) => {
+  try {
+    const body = await c.req.json<{
+      voice_id?: string;
+      weights: Record<string, number>;
+    }>();
+
+    if (!body.weights || typeof body.weights !== "object") {
+      return c.json({ detail: { message: "weights object is required" } }, 400);
+    }
+
+    const targetVoiceId = body.voice_id ?? "__global__";
+    const now = Date.now();
+
+    const existing = await getArenaCalibrationOverride(c.env.DB, targetVoiceId);
+
+    await upsertArenaCalibrationOverride(c.env.DB, {
+      override_id: existing?.override_id ?? crypto.randomUUID(),
+      voice_id: targetVoiceId,
+      weights: body.weights,
+      matchup_count: existing?.matchup_count ?? 0,
+      accuracy: existing?.accuracy ?? null,
+      confidence: existing?.confidence ?? "preliminary",
+      weight_shifts: existing?.weight_shifts ?? null,
+      gate_diagnostics: existing?.gate_diagnostics ?? null,
+      created_at: existing?.created_at ?? now,
+      updated_at: now,
+    });
+
+    return c.json({
+      applied: true,
+      voice_id: targetVoiceId,
+      weights: body.weights,
+    });
+  } catch (err) {
+    console.error("POST /calibration/apply error:", err);
+    return c.json({ detail: { message: err instanceof Error ? err.message : "Internal server error" } }, 500);
+  }
+});
+
+export default app;

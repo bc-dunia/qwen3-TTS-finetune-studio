@@ -8,6 +8,7 @@ const TABS = [
   { to: 'training', label: 'Training' },
   { to: 'dataset', label: 'Dataset' },
   { to: 'compare', label: 'Compare' },
+  { to: 'arena', label: 'Arena' },
 ]
 
 function getStatusClass(status: Voice['status']) {
