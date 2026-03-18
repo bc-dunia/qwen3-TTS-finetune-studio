@@ -19,6 +19,7 @@
 import type { TrainingConfig, TrainingJob, Voice, TrainingCampaign } from "../types";
 import { buildTrainingCheckoutSearch } from "./training-checkout";
 import { sanitizeConfig } from "./training-advisor";
+import { readNumber as readNum, clamp } from "./training-domain";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -87,14 +88,7 @@ const LANE_WEIGHTS: Record<CampaignDirection, Record<StrategyLane, number>> = {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function readNum(value: unknown): number | null {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
-}
 
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
-}
 
 function getCheckout(job: TrainingJob) {
   if (!job.checkout_search) {

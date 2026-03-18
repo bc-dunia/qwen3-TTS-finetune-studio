@@ -810,19 +810,6 @@ def _compute_signal_metrics(audio_path: Path) -> dict[str, float]:
     }
 
 
-def _compute_rms(audio_path: Path) -> float:
-    import numpy as np
-    import soundfile as sf
-
-    samples, _ = sf.read(str(audio_path), always_2d=False)
-    arr = np.asarray(samples, dtype=np.float32)
-    if arr.size == 0:
-        return 0.0
-    if arr.ndim > 1:
-        arr = arr.mean(axis=1)
-    return float(np.sqrt(np.mean(np.square(arr))))
-
-
 def preprocess_raw_audio(
     dataset_dir: Path, output_jsonl: Path, status: StatusWriter,
     whisper_language: str | None = None,
@@ -1236,7 +1223,7 @@ def upload_preprocess_cache(
 ) -> str | None:
     dataset_signature = (cfg.dataset_signature or "").strip()
     if not dataset_signature:
-      return None
+        return None
 
     cache_prefix = f"{PREFIX_PREPROCESS_CACHE}/{cfg.voice_id}/{dataset_signature}"
     train_raw_jsonl = dataset_dir / "train_raw.jsonl"

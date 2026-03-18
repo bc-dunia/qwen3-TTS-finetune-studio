@@ -136,6 +136,17 @@ def _write_lock_pid(key: str, pid: int, command: list[str]) -> None:
     tmp_path.replace(path)
 
 
+def _started_at_from_info(info: dict[str, object] | None) -> float | None:
+    raw = (info or {}).get("started_at")
+    if isinstance(raw, bool):
+        return None
+    return float(raw) if isinstance(raw, (int, float)) else None
+
+
+def _read_lock_started_at(key: str) -> float | None:
+    return _started_at_from_info(_read_lock_info(key))
+
+
 def _clear_lock(
     key: str,
     *,
@@ -153,10 +164,10 @@ def _clear_lock(
     if expected_pid is not None and lock_pid != int(expected_pid):
         return
     if expected_started_at is not None:
-        started_at = info.get("started_at")
-        if not isinstance(started_at, (int, float)):
+        actual = _started_at_from_info(info)
+        if actual is None:
             return
-        if abs(float(started_at) - float(expected_started_at)) > 1e-6:
+        if abs(actual - float(expected_started_at)) > 1e-6:
             return
     path.unlink(missing_ok=True)
 
@@ -177,12 +188,7 @@ def start_process(
             info = _read_lock_info(key) or {}
             script_raw = info.get("script")
             script = script_raw if isinstance(script_raw, str) else None
-            started_at_raw = info.get("started_at")
-            started_at = (
-                float(started_at_raw)
-                if isinstance(started_at_raw, (int, float))
-                else None
-            )
+            started_at = _started_at_from_info(info)
             if script is None:
                 _clear_lock(key, expected_pid=lock_pid, expected_started_at=started_at)
             else:
@@ -219,12 +225,11 @@ def clear_process(key: str, proc: subprocess.Popen[str]) -> None:
         current = _ACTIVE.get(key)
         if current is proc:
             _ACTIVE.pop(key, None)
-        info = _read_lock_info(key) or {}
-        started_at_raw = info.get("started_at")
-        started_at = (
-            float(started_at_raw) if isinstance(started_at_raw, (int, float)) else None
+        _clear_lock(
+            key,
+            expected_pid=int(proc.pid),
+            expected_started_at=_read_lock_started_at(key),
         )
-        _clear_lock(key, expected_pid=int(proc.pid), expected_started_at=started_at)
 
 
 def stop_process(key: str) -> str:
@@ -242,23 +247,17 @@ def stop_process(key: str) -> str:
         finally:
             with _LOCK:
                 _ACTIVE.pop(key, None)
-            info = _read_lock_info(key) or {}
-            started_at_raw = info.get("started_at")
-            started_at = (
-                float(started_at_raw)
-                if isinstance(started_at_raw, (int, float))
-                else None
+            _clear_lock(
+                key,
+                expected_pid=int(proc.pid),
+                expected_started_at=_read_lock_started_at(key),
             )
-            _clear_lock(key, expected_pid=int(proc.pid), expected_started_at=started_at)
 
     lock_pid = _read_lock_pid(key)
     if not pid_alive(lock_pid):
-        info = _read_lock_info(key) or {}
-        started_at_raw = info.get("started_at")
-        started_at = (
-            float(started_at_raw) if isinstance(started_at_raw, (int, float)) else None
+        _clear_lock(
+            key, expected_pid=lock_pid, expected_started_at=_read_lock_started_at(key)
         )
-        _clear_lock(key, expected_pid=lock_pid, expected_started_at=started_at)
         return "No running process."
 
     # Cross-process stop path: send signal to tracked pid.
@@ -266,10 +265,7 @@ def stop_process(key: str) -> str:
     info = _read_lock_info(key) or {}
     script_raw = info.get("script")
     script = script_raw if isinstance(script_raw, str) else None
-    started_at_raw = info.get("started_at")
-    started_at = (
-        float(started_at_raw) if isinstance(started_at_raw, (int, float)) else None
-    )
+    started_at = _started_at_from_info(info)
     if script is None:
         _clear_lock(key, expected_pid=lock_pid, expected_started_at=started_at)
         return "No running process."
@@ -319,22 +315,16 @@ def is_running(key: str) -> bool:
     pid = _read_lock_pid(key)
     alive = pid_alive(pid)
     if not alive and pid is not None:
-        info = _read_lock_info(key) or {}
-        started_at_raw = info.get("started_at")
-        started_at = (
-            float(started_at_raw) if isinstance(started_at_raw, (int, float)) else None
+        _clear_lock(
+            key, expected_pid=pid, expected_started_at=_read_lock_started_at(key)
         )
-        _clear_lock(key, expected_pid=pid, expected_started_at=started_at)
         return False
 
     if alive and pid is not None:
         info = _read_lock_info(key) or {}
         script_raw = info.get("script")
         script = script_raw if isinstance(script_raw, str) else None
-        started_at_raw = info.get("started_at")
-        started_at = (
-            float(started_at_raw) if isinstance(started_at_raw, (int, float)) else None
-        )
+        started_at = _started_at_from_info(info)
         if script is None:
             _clear_lock(key, expected_pid=pid, expected_started_at=started_at)
             return False
