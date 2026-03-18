@@ -4,7 +4,6 @@ import {
   createArenaMatch,
   createArenaSession,
   getArenaCalibrationOverride,
-  getArenaMatch,
   getArenaSession,
   getVoice,
   listArenaCandidates,
@@ -47,10 +46,6 @@ interface GenerationJob {
 
 interface GenerationTracking {
   jobs: GenerationJob[];
-  voice_id: string;
-  speaker_name: string;
-  model_id: string;
-  language: string;
 }
 
 function parseTracking(notes: string | null): GenerationTracking | null {
@@ -343,41 +338,48 @@ app.post("/sessions/:sessionId/generate", async (c) => {
     const language = voice.labels?.language ?? "auto";
     const seed = session.seed ?? 42;
 
-    const jobs: GenerationJob[] = [];
+    const tasks: Array<{ candidate_id: string; text_index: number; r2_key: string; input: Record<string, unknown> }> = [];
     for (const candidate of candidates) {
       for (let textIdx = 0; textIdx < session.test_texts.length; textIdx++) {
-        const r2Key = `arena/${sessionId}/${candidate.candidate_id}/text${textIdx}.wav`;
-        const input = {
-          text: session.test_texts[textIdx],
-          voice_id: session.voice_id,
-          speaker_name: speakerName,
-          model_id: modelId,
-          voice_settings: session.settings ?? {},
-          seed,
-          language,
-          checkpoint_info: { r2_prefix: candidate.checkpoint_r2_prefix, type: "full" },
-        };
-
-        const runpodResp = await invokeServerlessAsync(c.env, c.env.RUNPOD_ENDPOINT_ID, input);
-        const jobId = String(runpodResp.id ?? "");
-        jobs.push({
-          job_id: jobId,
-          r2_key: r2Key,
+        tasks.push({
           candidate_id: candidate.candidate_id,
           text_index: textIdx,
-          status: jobId ? "pending" : "failed",
-          ...(jobId ? {} : { error: "No job ID returned from RunPod" }),
+          r2_key: `arena/${sessionId}/${candidate.candidate_id}/text${textIdx}.wav`,
+          input: {
+            text: session.test_texts[textIdx],
+            voice_id: session.voice_id,
+            speaker_name: speakerName,
+            model_id: modelId,
+            voice_settings: session.settings ?? {},
+            seed,
+            language,
+            checkpoint_info: { r2_prefix: candidate.checkpoint_r2_prefix, type: "full" },
+          },
         });
       }
     }
 
-    const tracking: GenerationTracking = {
-      jobs,
-      voice_id: session.voice_id,
-      speaker_name: speakerName,
-      model_id: modelId,
-      language,
-    };
+    const CONCURRENCY = 5;
+    const jobs: GenerationJob[] = [];
+    for (let i = 0; i < tasks.length; i += CONCURRENCY) {
+      const batch = tasks.slice(i, i + CONCURRENCY);
+      const results = await Promise.all(
+        batch.map(async (t) => {
+          try {
+            const resp = await invokeServerlessAsync(c.env, c.env.RUNPOD_ENDPOINT_ID, t.input);
+            const jobId = String(resp.id ?? "");
+            return { ...t, job_id: jobId, status: (jobId ? "pending" : "failed") as "pending" | "failed", error: jobId ? undefined : "No job ID returned" };
+          } catch (err) {
+            return { ...t, job_id: "", status: "failed" as const, error: err instanceof Error ? err.message : "RunPod invocation failed" };
+          }
+        }),
+      );
+      for (const r of results) {
+        jobs.push({ job_id: r.job_id, r2_key: r.r2_key, candidate_id: r.candidate_id, text_index: r.text_index, status: r.status, ...(r.error ? { error: r.error } : {}) });
+      }
+    }
+
+    const tracking: GenerationTracking = { jobs };
 
     await updateArenaSession(c.env.DB, sessionId, {
       status: "generating",

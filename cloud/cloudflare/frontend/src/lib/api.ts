@@ -1537,6 +1537,12 @@ export interface CalibrationResult {
 export interface ArenaSessionResponse extends ArenaSession {
   candidates: ArenaCandidate[]
   matches: ArenaMatch[]
+  generation_progress?: {
+    total: number
+    completed: number
+    failed: number
+    pending: number
+  }
 }
 
 // ── Arena API ─────────────────────────────────────────────────────────────────

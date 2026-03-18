@@ -165,10 +165,7 @@ export async function assembleArenaCandidates(
         if (scores.duration_score === null) scores.duration_score = parseScoreFromMessage(msg, "duration");
       }
 
-      // Entries with ok:true already passed validation during training; skip re-gating
-      // unless scores are fully absent (defensive)
       const hasAnyScore = Object.values(scores).some((v) => v !== null);
-      if (!hasAnyScore && !rec.ok) continue;
       if (hasAnyScore && !passesValidationGate(scores)) continue;
 
       seen.add(prefix);

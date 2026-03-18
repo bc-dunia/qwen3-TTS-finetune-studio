@@ -225,6 +225,7 @@ export function VoiceArena() {
       startPolling(created.session_id)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create arena session')
+      setStep('setup')
     } finally {
       setLoading(false)
     }
@@ -377,9 +378,7 @@ export function VoiceArena() {
       )}
 
       {step === 'generating' && (() => {
-        const gp = (session as unknown as Record<string, unknown>)?.generation_progress as
-          | { total: number; completed: number; failed: number; pending: number }
-          | undefined
+        const gp = session?.generation_progress
         const pct = gp && gp.total > 0 ? Math.round((gp.completed / gp.total) * 100) : 0
         return (
           <div className="rounded-xl border border-edge bg-raised p-8 text-center space-y-4">
@@ -415,6 +414,7 @@ export function VoiceArena() {
 
       {step === 'voting' && currentMatch && (
         <VotingStep
+          key={currentMatch.match_id}
           match={currentMatch}
           candidates={candidates}
           currentRound={currentRound}
