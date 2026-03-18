@@ -263,7 +263,6 @@ export function VoiceArena() {
     try {
       const winner = mapVoteToWinner(vote, currentMatch.display_order)
       const result = await submitArenaVote(currentMatch.match_id, winner, confidence)
-      setVotedMatchIds((prev) => new Set([...prev, currentMatch.match_id]))
       setRevealedMatchId(currentMatch.match_id)
 
       if (result.round_complete) {
@@ -285,6 +284,9 @@ export function VoiceArena() {
   }
 
   function handleNextMatch() {
+    if (revealedMatchId) {
+      setVotedMatchIds((prev) => new Set([...prev, revealedMatchId]))
+    }
     setRevealedMatchId(null)
     setCurrentMatchIndex((prev) => prev + 1)
 
