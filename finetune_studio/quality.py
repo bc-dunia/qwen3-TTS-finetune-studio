@@ -824,6 +824,15 @@ def validate_dataset(raw_jsonl_path: str | Path) -> dict[str, Any]:
         else:
             sr, duration = _safe_audio_info(audio_path)
 
+            if sr is None:
+                issues.append(
+                    DatasetIssue(
+                        severity="error",
+                        code="UNREADABLE_AUDIO",
+                        row_index=idx,
+                        message=f"Audio file exists but could not be read: {audio_path}",
+                    )
+                )
         ref_path = Path(str(row.get("ref_audio", ""))).expanduser()
         if not ref_path.exists():
             missing_ref += 1
@@ -840,6 +849,15 @@ def validate_dataset(raw_jsonl_path: str | Path) -> dict[str, Any]:
                 ref_audio_counts.get(str(ref_path.resolve()), 0) + 1
             )
             ref_sr, ref_dur = _safe_audio_info(ref_path)
+            if ref_sr is None:
+                issues.append(
+                    DatasetIssue(
+                        severity="error",
+                        code="UNREADABLE_REF_AUDIO",
+                        row_index=idx,
+                        message=f"Reference audio file exists but could not be read: {ref_path}",
+                    )
+                )
             if ref_sr is not None and ref_sr != SAMPLE_RATE_HZ:
                 # Training dataset (official) asserts ref_audio is 24kHz when extracting mels.
                 issues.append(

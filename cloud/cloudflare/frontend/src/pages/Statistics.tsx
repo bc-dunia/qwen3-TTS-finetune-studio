@@ -15,6 +15,7 @@ import { LineChart } from '../components/charts/LineChart'
 import { BarChart } from '../components/charts/BarChart'
 import { DotChart } from '../components/charts/DotChart'
 import { MiniSparkline } from '../components/charts/MiniSparkline'
+import { readNumber } from '../lib/training-domain'
 
 type SortKey = 'name' | 'score' | 'delta' | 'jobs' | 'duration' | 'last'
 type SortDirection = 'asc' | 'desc'
@@ -35,14 +36,6 @@ type VoicePerformanceRow = {
   latestStyleScore: number | null
 }
 
-function readNumber(value: unknown): number | null {
-  if (typeof value === 'number' && Number.isFinite(value)) return value
-  if (typeof value === 'string' && value.trim()) {
-    const parsed = Number(value)
-    if (Number.isFinite(parsed)) return parsed
-  }
-  return null
-}
 
 function median(values: number[]): number | null {
   if (values.length === 0) return null

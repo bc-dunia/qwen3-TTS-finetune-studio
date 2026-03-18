@@ -11,8 +11,12 @@ import type { TrainingConfig } from "../types";
 // ── Parsing helpers ────────────────────────────────────────────────────────────
 
 export function readNumber(value: unknown): number | null {
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? numeric : null;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
 }
 
 export function readText(value: unknown): string | null {

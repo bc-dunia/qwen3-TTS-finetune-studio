@@ -31,6 +31,7 @@ import {
   shouldWatchTrainingJob,
 } from '../lib/trainingCheckout'
 import { buildTrainingAdvice } from '../lib/trainingAdvisor'
+import { parseRunNameFromCheckpointPrefix, readNumber } from '../lib/training-domain'
 
 
 // ── Utility functions ─────────────────────────────────────────────────────────
@@ -59,19 +60,7 @@ function getDefaultCompareText(language: string | undefined): string {
   }
 }
 
-function parseRunNameFromPrefix(prefix: string | null | undefined): string | null {
-  if (!prefix) return null
-  const parts = prefix.split('/')
-  if (parts.length < 4 || parts[0] !== 'checkpoints') {
-    return null
-  }
-  return parts[2] || null
-}
 
-function toFiniteNumber(value: unknown): number | null {
-  const numeric = Number(value)
-  return Number.isFinite(numeric) ? numeric : null
-}
 
 function readTimestamp(value: unknown): number | null {
   if (typeof value === 'number' && Number.isFinite(value)) {
@@ -97,7 +86,7 @@ function getJobCompletedAt(job: TrainingJob): number | null {
 }
 
 function getJobDurationMs(job: TrainingJob): number | null {
-  const summaryDuration = toFiniteNumber(job.summary?.duration_ms)
+  const summaryDuration = readNumber(job.summary?.duration_ms)
   if (summaryDuration !== null && summaryDuration >= 0) {
     return summaryDuration
   }
@@ -159,9 +148,6 @@ function getTrainingResetAt(voice: Voice | null): number | null {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null
 }
 
-function getRunOutcomeLabel(run: RunSummary): string {
-  return run.status
-}
 
 function buildCheckpointCandidates(
   voice: Voice | null,
@@ -203,7 +189,7 @@ function buildCheckpointCandidates(
         createdAt: job.created_at,
         completedAt: getJobCompletedAt(job),
         attemptNumber: attemptNumbers.get(job.job_id) ?? null,
-        runName: parseRunNameFromPrefix(input.prefix),
+        runName: input.prefix ? parseRunNameFromCheckpointPrefix(input.prefix) : null,
         isCurrentProduction: currentPrefix === input.prefix,
         isStoredCandidate: storedCandidatePrefix === input.prefix,
         isJobRecommendation: input.isJobRecommendation,
@@ -299,7 +285,7 @@ function buildCheckpointCandidates(
       createdAt: Number(new Date(voice.updated_at ?? voice.created_at).getTime()),
       completedAt: readTimestamp(voice.updated_at ?? voice.created_at),
       attemptNumber: null,
-      runName: voice.run_name ?? parseRunNameFromPrefix(voice.checkpoint_r2_prefix),
+      runName: voice.run_name ?? (voice.checkpoint_r2_prefix ? parseRunNameFromCheckpointPrefix(voice.checkpoint_r2_prefix) : null),
       isCurrentProduction: true,
       isStoredCandidate: false,
       isJobRecommendation: false,
@@ -322,7 +308,7 @@ function buildCheckpointCandidates(
       createdAt: Number(new Date(voice.updated_at ?? voice.created_at).getTime()),
       completedAt: readTimestamp(voice.updated_at ?? voice.created_at),
       attemptNumber: null,
-      runName: voice.candidate_run_name ?? parseRunNameFromPrefix(voice.candidate_checkpoint_r2_prefix),
+      runName: voice.candidate_run_name ?? (voice.candidate_checkpoint_r2_prefix ? parseRunNameFromCheckpointPrefix(voice.candidate_checkpoint_r2_prefix) : null),
       isCurrentProduction: false,
       isStoredCandidate: true,
       isJobRecommendation: true,
@@ -394,7 +380,7 @@ function RecentAttemptsDisclosure({ runSummaries }: { runSummaries: RunSummary[]
                 </div>
               </div>
               <div className="mt-2 flex flex-wrap gap-2 text-[10px] font-mono text-muted">
-                <span>status={getRunOutcomeLabel(run)}</span>
+                <span>status={run.status}</span>
                 <span>score={run.championScore !== null ? run.championScore.toFixed(3) : 'n/a'}</span>
                 <span>epoch={run.championEpoch ?? 'n/a'}</span>
                 <span>preset={run.championPreset ?? 'n/a'}</span>

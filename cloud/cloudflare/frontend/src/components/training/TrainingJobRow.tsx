@@ -24,6 +24,7 @@ import {
   needsTrainingValidationFollowup,
   shouldWatchTrainingJob,
 } from '../../lib/trainingCheckout'
+import { readNumber } from '../../lib/training-domain'
 
 type Props = {
   job: TrainingJob
@@ -139,8 +140,8 @@ export function TrainingJobRow({
   const finishedAt = readTimestamp(job.completed_at) ?? readTimestamp(job.summary?.completed_at)
   const now = Date.now()
   const durationMs = useMemo(() => {
-    const summaryDuration = Number(job.summary?.duration_ms)
-    if (Number.isFinite(summaryDuration) && summaryDuration >= 0) return summaryDuration
+    const summaryDuration = readNumber(job.summary?.duration_ms)
+    if (summaryDuration !== null && summaryDuration >= 0) return summaryDuration
     if (!startedAt) return null
     return Math.max(0, (finishedAt ?? now) - startedAt)
   }, [job.summary?.duration_ms, startedAt, finishedAt, now])

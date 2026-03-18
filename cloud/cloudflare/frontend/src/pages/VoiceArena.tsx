@@ -65,15 +65,12 @@ function getMatchAudioUrl(r2Key: string | null): string {
 
 function getDisplaySamples(
   match: ArenaMatch,
-  candidates: ArenaCandidate[],
 ): { sample1: { candidateId: string; audioUrl: string }; sample2: { candidateId: string; audioUrl: string } } {
   const isSwapped = match.display_order === 'ba'
   const firstId = isSwapped ? match.candidate_b_id : match.candidate_a_id
   const secondId = isSwapped ? match.candidate_a_id : match.candidate_b_id
   const firstAudio = isSwapped ? match.audio_b_r2_key : match.audio_a_r2_key
   const secondAudio = isSwapped ? match.audio_a_r2_key : match.audio_b_r2_key
-
-  void candidates
 
   return {
     sample1: { candidateId: firstId, audioUrl: getMatchAudioUrl(firstAudio) },
@@ -614,7 +611,7 @@ function VotingStep({
   revealedMatchId: string | null
   onNextMatch: () => void
 }) {
-  const { sample1, sample2 } = getDisplaySamples(match, candidates)
+  const { sample1, sample2 } = getDisplaySamples(match)
   const isRevealed = revealedMatchId === match.match_id
 
   const candidateA = getCandidateById(candidates, sample1.candidateId)
