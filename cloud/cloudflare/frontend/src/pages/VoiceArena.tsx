@@ -167,7 +167,6 @@ export function VoiceArena() {
   const [testTextsRaw, setTestTextsRaw] = useState(DEFAULT_TEST_TEXTS.join('\n'))
   const [seed, setSeed] = useState(42)
 
-  const [currentMatchIndex, setCurrentMatchIndex] = useState(0)
   const [confidence, setConfidence] = useState<ArenaVoteConfidence>('clear')
   const [votedMatchIds, setVotedMatchIds] = useState<Set<string>>(new Set())
   const [revealedMatchId, setRevealedMatchId] = useState<string | null>(null)
@@ -241,7 +240,6 @@ export function VoiceArena() {
         if (updated.status === 'active') {
           stopPolling()
           setStep('voting')
-          setCurrentMatchIndex(0)
         } else if (updated.status === 'completed') {
           stopPolling()
           setStep('results')
@@ -288,7 +286,11 @@ export function VoiceArena() {
       setVotedMatchIds((prev) => new Set([...prev, revealedMatchId]))
     }
     setRevealedMatchId(null)
-    setCurrentMatchIndex((prev) => prev + 1)
+
+    if (session?.status === 'completed') {
+      setStep('results')
+      return
+    }
 
     if (unvotedMatches.length <= 1 && session) {
       void getArenaSession(session.session_id).then((updated) => {
