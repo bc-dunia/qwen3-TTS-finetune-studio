@@ -435,9 +435,14 @@ export async function advanceRound(
     const now = Date.now();
     const matchStmts = pairs.map(p =>
       db.prepare(
-        `INSERT INTO arena_matches (match_id, session_id, round_number, candidate_a_id, candidate_b_id, display_order, text_index, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-      ).bind(crypto.randomUUID(), sessionId, nextRound, p.a, p.b, p.displayOrder, p.textIndex, now)
+        `INSERT INTO arena_matches (match_id, session_id, round_number, candidate_a_id, candidate_b_id, display_order, text_index, audio_a_r2_key, audio_b_r2_key, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind(
+        crypto.randomUUID(), sessionId, nextRound, p.a, p.b, p.displayOrder, p.textIndex,
+        `arena/${sessionId}/${p.a}/text${p.textIndex}.wav`,
+        `arena/${sessionId}/${p.b}/text${p.textIndex}.wav`,
+        now,
+      )
     );
     if (matchStmts.length > 0) await db.batch(matchStmts);
   }
