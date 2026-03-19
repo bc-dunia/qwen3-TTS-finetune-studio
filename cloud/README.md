@@ -119,27 +119,39 @@ The planner also tracks exclusion zones (configs that have already been tried), 
 
 ### Quality Validation (Checkpoint Scoring)
 
-Every checkpoint produced by a training job is scored against a set of evaluation samples. Scoring uses a two-stage gated system.
+Every checkpoint produced by a training job is scored against a set of evaluation samples. Scoring uses a two-stage gated system with an optional calibration overlay from the Voice Arena.
 
-**Hard gates** — a checkpoint must pass all of these to be considered usable:
+**Hard safety gates** — non-negotiable minimums that protect against broken checkpoints:
 
-| Metric | Minimum |
-|--------|---------|
-| ASR similarity | 0.80 |
-| Speaker similarity | 0.75 |
-| Health score | 0.72 |
-| Tone similarity | 0.55 |
-| Speed similarity | 0.20 |
+| Metric | Minimum | Bypassed by calibration? |
+|--------|---------|--------------------------|
+| ASR similarity | 0.75 | Never |
+| Speaker similarity | 0.70 | Never |
+| Health score | 0.65 | Never |
 
-**Ranking weights** — applied after gate passage to rank checkpoints:
+**Full validation gates** — used for standard checkpoint filtering:
 
-| Metric | Weight |
-|--------|--------|
+| Metric | Minimum | Role |
+|--------|---------|------|
+| ASR similarity | 0.82 | Hard |
+| Speaker similarity | 0.78 | Hard |
+| Health score | 0.72 | Hard |
+| Tone similarity | 0.50 | Soft (ranking only when arena calibration is active) |
+| Style similarity | 0.55 | Soft |
+| Speed similarity | 0.15 | Soft |
+| Overall score | 0.80 | Soft |
+| Duration accuracy | 0.50 | Soft |
+
+**Ranking weights** — applied after gate passage to rank checkpoints. When arena calibration is `active`, these are blended with learned weights from human preference data:
+
+| Metric | Default Weight |
+|--------|---------------|
 | ASR | 0.25 |
 | Speaker | 0.25 |
-| Tone | 0.20 |
-| Speed | 0.15 |
-| Overall | 0.10 |
+| Style | 0.30 |
+| Tone | 0.00 |
+| Speed | 0.00 |
+| Overall | 0.05 |
 | Duration | 0.05 |
 
 **ASR review (`review-asr.ts`)** — runs Whisper on generated audio and computes Levenshtein similarity against the target transcript.
@@ -171,9 +183,13 @@ The queue system coordinates job dispatch across all voices and campaigns.
 - **Config defaults** — `DEFAULTS_0_6B` and `DEFAULTS_1_7B` presets with batch size, learning rate, epochs, gradient accumulation, subtalker loss weight, save frequency, seed, and GPU type
 - **`getTrainingDefaults(modelSize)`** — returns the correct preset for a given model size
 - **`sanitizeConfig(source, modelSize, language)`** — merges user overrides onto defaults with type-safe coercion
-- **Validation thresholds** — `VALIDATION_GATE_THRESHOLDS` (hard minimums) and `VALIDATION_RANKING_WEIGHTS` (scoring weights)
-- **`passesValidationGate(scores)`** — checks all hard minimums
-- **`computeRankingScore(scores)`** — weighted sum for checkpoint ranking
+- **Validation thresholds** — `VALIDATION_GATE_THRESHOLDS` (full gate), `HARD_SAFETY_THRESHOLDS` (anti-garbage floor), `SOFT_PREFERENCE_THRESHOLDS` (calibration-adjustable)
+- **`passesValidationGate(scores)`** — checks all hard minimums (full gate)
+- **`passesHardSafetyGate(scores)`** — checks only ASR/speaker/health (never bypassed by calibration)
+- **`computeRankingScore(scores, weights?)`** — weighted sum for checkpoint ranking; accepts optional calibrated weights
+- **`computeCalibrationAlpha(matchupCount)`** — returns alpha blend factor based on arena data volume
+- **`getEffectiveWeights(defaults, learned, alpha)`** — blends default and learned weights with per-weight shift cap
+- **`grayZoneRescue(scores, weights)`** — rescues checkpoints that barely miss one soft threshold
 - **Queue constants** — `MAX_CONCURRENT_PODS`, `DEFAULT_MAX_ACTIVE_TRAINING_JOBS_PER_VOICE`, `ACTIVE_JOB_STATUSES`, `TERMINAL_JOB_STATUSES`
 - **Parsing helpers** — `readNumber`, `readText`, `readTimestamp`, `clamp`
 - **Path helpers** — `stripSlashes`, `parseRunNameFromCheckpointPrefix`, `extractDatasetNameFromPrefix`
@@ -194,7 +210,7 @@ The React SPA is deployed to Cloudflare Pages. It uses React Router v7, Tailwind
   /training   VoiceTrainingTab (AutopilotPanel + active jobs + history)
   /dataset    Dataset management
   /compare    Checkpoint comparison (decomposed UI with score bands, filter tabs, sticky compare tray)
-  /arena      Voice Arena — blind A/B checkpoint comparison with Elo rating
+  /arena      Voice Arena — blind A/B checkpoint tournament
 /playground Quick TTS playground
 /queue      Global queue monitor (real pod capacity, per-voice stats)
 ```
@@ -252,6 +268,8 @@ cloud/
     ├── worker-api/
     │   ├── wrangler.toml              # Worker configuration
     │   ├── schema.sql                 # D1 database schema
+    │   ├── schema-arena.sql           # Arena tables (candidates, matches, sessions, calibration)
+    │   ├── schema-arena-migration-001.sql  # Calibration state machine columns
     │   └── src/
     │       ├── index.ts               # Main Hono router
     │       ├── types.ts               # TypeScript types
@@ -264,7 +282,7 @@ cloud/
     │       │   ├── training-callbacks.ts  # RunPod callback handler
     │       │   ├── dataset.ts         # Dataset management
     │       │   ├── upload.ts          # Presigned URL generation
-    │       │   ├── arena.ts           # Voice Arena API (blind A/B, Elo rating)
+    │       │   ├── arena.ts           # Voice Arena API (blind A/B tournament)
     │       │   └── admin.ts           # Admin utilities
     │       └── lib/
     │           ├── training-domain.ts     # Canonical config, validation, helpers
@@ -277,7 +295,7 @@ cloud/
     │           ├── runpod.ts              # RunPod API client
     │           ├── r2.ts                  # R2 presigned URLs
     │           ├── d1.ts                  # D1 query helpers
-    │           ├── arena.ts               # Arena match logic and Elo computation
+    │           ├── arena.ts               # Arena match logic, Swiss/round-robin tournaments
     │           └── arena-calibration.ts   # Arena calibration utilities
     └── frontend/
         ├── package.json
@@ -303,8 +321,8 @@ cloud/
             │   ├── VoiceTrainingTab.tsx
             │   ├── VoiceDataset.tsx
             │   ├── VoiceCompare.tsx       # Orchestrator using compare/* components
-            │   ├── VoiceArena.tsx         # Blind A/B checkpoint comparison with Elo
-            │   ├── ArenaCalibration.tsx   # Arena Elo calibration dashboard
+            │   ├── VoiceArena.tsx         # Blind A/B checkpoint tournament
+            │   ├── ArenaCalibration.tsx   # Arena calibration dashboard
             │   ├── Playground.tsx
             │   └── QueuePage.tsx
             └── components/
@@ -683,6 +701,107 @@ curl -X POST "https://qwen-tts-api.brian-367.workers.dev/v1/training/campaigns/C
 - The cloud pipeline validates checkpoints using ASR similarity plus reference-based speaker/tone/speed similarity when reference metadata is available
 - Use conservative voice settings first; raise style only after the similarity baseline is stable
 - Use the Quality tab in the local Gradio UI for pre-training checks
+
+## Voice Arena
+
+The Voice Arena is a blind A/B tournament system for comparing TTS checkpoints using human preference. Instead of relying solely on automated scores, users listen to anonymized audio samples and vote on which sounds better.
+
+### How It Works
+
+1. **Start Arena** — assembles candidates from the voice's current champion, previously carried 2nd/3rd place checkpoints, and new checkpoints from recent training jobs
+2. **Audio Generation** — fires async RunPod TTS requests for every candidate × test text combination; frontend polls for progress
+3. **Blind Voting** — candidates are shuffled into pairwise matches; the user hears "Sample 1" vs "Sample 2" without knowing which checkpoint produced each. Four vote options: Sample 1, Sample 2, Tie, or Both Bad
+4. **Tournament** — round-robin (≤6 candidates) or Swiss-system (>6 candidates) determines final rankings
+5. **Promote Winner** — the champion checkpoint is applied to the voice, becoming the base for future training
+
+### Tournament Algorithms
+
+| Algorithm | When | Rounds | Matches |
+|-----------|------|--------|---------|
+| Round Robin | ≤6 candidates | 1 | All pairs |
+| Swiss | >6 candidates | ceil(log2(n))+1 | Paired by standing each round; ranked by wins + Buchholz tie-break |
+
+### Candidate Assembly
+
+Candidates are drawn from three sources:
+
+| Source | Behavior |
+|--------|----------|
+| Champion carry | Always included (defending champion) |
+| 2nd/3rd carry | Included unless the checkpoint has appeared as `second_carry` or `third_carry` in ≥2 consecutive sessions |
+| New checkpoints | From recent completed training jobs; must pass hard safety gate |
+
+New checkpoints that fail the full validation gate but pass hard safety can be rescued via **gray-zone rescue** when calibration is in canary or active state (see Calibration below).
+
+### Audio Generation Pipeline
+
+Audio is generated asynchronously via RunPod serverless inference:
+
+1. POST `/v1/arena/sessions/:id/generate` fires all RunPod async requests (batched at concurrency 5)
+2. Job IDs are tracked in the session's `notes` field as JSON
+3. GET `/v1/arena/sessions/:id` lazy-polls up to 5 pending jobs per request
+4. Completed audio is decoded from base64, stored in R2, and match audio keys are assigned
+5. When all jobs finish, the session transitions from `generating` to `active`
+6. GET `/v1/arena/audio/:r2Key` serves WAV files directly from R2
+
+### Calibration Feedback Loop
+
+Arena results feed back into the training pipeline through an automatic calibration system. This reduces training waste by learning which automated scores actually predict human preference for each voice.
+
+**What it learns:** logistic regression over score deltas (ASR, speaker, style, tone, speed, overall, duration) weighted by vote confidence. Adjacent-rank pseudo-pairs from final standings contribute weak signal (weight 0.25).
+
+**Alpha blending** — learned weights are blended with defaults, not replaced:
+
+| Effective Matches | Alpha | Effect |
+|-------------------|-------|--------|
+| <10 | 0 | Defaults only |
+| 10-19 | 0.10 | Barely perceptible |
+| 20-39 | 0.25 | Moderate influence |
+| 40-79 | 0.50 | Equal blend |
+| 80+ | 0.75 | Learned weights dominate |
+
+Per-weight shift is capped at ±0.10 per calibration cycle to prevent wild swings.
+
+**State machine:**
+
+```
+shadow → canary → active
+                → rolled_back
+```
+
+| State | Matches | Effect |
+|-------|---------|--------|
+| shadow | <20 | Compute calibration but don't use it |
+| canary | 20-39 | Only affects gray-zone rescue (lets near-miss checkpoints into arena) |
+| active | 40+ (accuracy ≥0.60) | Affects both ranking weights and gray-zone rescue |
+| rolled_back | Any (accuracy <0.50 or both_bad >0.35) | Auto-disabled, reverts to defaults. Sticky — stays rolled_back until manually re-applied |
+
+**Auto-calibration trigger:** runs automatically via `waitUntil` whenever a session is finalized (through the vote endpoint's round advance or the manual complete endpoint).
+
+**Gate split:**
+
+| Gate Type | Metrics | Behavior |
+|-----------|---------|----------|
+| Hard safety | ASR ≥0.75, Speaker ≥0.70, Health ≥0.65 | Never bypassed, even by calibration |
+| Soft preference | tone, style, speed, duration, overall | Still causes rejection by default, but can be relaxed via gray-zone rescue when calibration is canary/active |
+
+Note: when `style_score` is present, `tone` and `speed` gate checks are skipped (style subsumes them). Similarly, `computeRankingScore` uses `style_score` directly when available, falling back to `tone*0.6 + speed*0.4` when absent.
+
+**Global fallback chain** for calibrated weights: voice-specific → `__global__` → hardcoded defaults.
+
+### How Arena Results Affect Training
+
+The calibration feedback loop connects arena outcomes to the training pipeline through these mechanisms:
+
+1. **Ranking weights** — when calibration is `active`, `computeRankingScore()` uses blended weights instead of hardcoded defaults. This changes which checkpoints are ranked higher during candidate assembly and checkpoint selection.
+
+2. **Gray-zone rescue** — when calibration is `canary` or `active`, checkpoints that barely miss one soft threshold (within 0.03) can enter the arena if their blended ranking score is high enough. Without calibration, these checkpoints would be silently discarded.
+
+3. **Champion promotion** — the arena winner's checkpoint becomes the voice's `checkpoint_r2_prefix`. The next training run uses this as the base, so the training pipeline inherits the human-validated quality signal.
+
+4. **Carry limits** — non-champion candidates that place 2nd/3rd in two consecutive arenas without improving are retired. This prevents stale checkpoints from occupying arena slots indefinitely, giving new training results more opportunities.
+
+---
 
 ### TypeScript errors in Worker
 
