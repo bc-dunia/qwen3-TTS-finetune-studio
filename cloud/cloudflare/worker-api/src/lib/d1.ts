@@ -1847,11 +1847,17 @@ type DbArenaCalibrationOverrideRow = {
   override_id: string;
   voice_id: string;
   weights_json: string;
+  effective_weights_json: string | null;
   matchup_count: number;
   accuracy: number | null;
   confidence: string;
+  state: string;
+  version: number;
+  alpha: number;
   weight_shifts_json: string | null;
   gate_diagnostics_json: string | null;
+  rollback_reason: string | null;
+  shadow_accuracy: number | null;
   created_at: number;
   updated_at: number;
 };
@@ -1918,11 +1924,17 @@ const mapArenaCalibrationOverride = (row: DbArenaCalibrationOverrideRow): ArenaC
   override_id: row.override_id,
   voice_id: row.voice_id,
   weights: parseJson<Record<string, number>>(row.weights_json, {}),
+  effective_weights: parseJson<Record<string, number>>(row.effective_weights_json, {}),
   matchup_count: row.matchup_count,
   accuracy: row.accuracy,
   confidence: row.confidence as ArenaCalibrationConfidence,
+  state: (row.state ?? "shadow") as import("../types").CalibrationState,
+  version: row.version ?? 1,
+  alpha: row.alpha ?? 0,
   weight_shifts: parseJson<Record<string, number> | null>(row.weight_shifts_json, null),
   gate_diagnostics: parseJson<Record<string, unknown> | null>(row.gate_diagnostics_json, null),
+  rollback_reason: row.rollback_reason ?? null,
+  shadow_accuracy: row.shadow_accuracy ?? null,
   created_at: row.created_at,
   updated_at: row.updated_at,
 });
@@ -2331,27 +2343,41 @@ export const upsertArenaCalibrationOverride = async (
   await db
     .prepare(
       `INSERT INTO arena_calibration_overrides (
-        override_id, voice_id, weights_json, matchup_count, accuracy, confidence,
-        weight_shifts_json, gate_diagnostics_json, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        override_id, voice_id, weights_json, effective_weights_json,
+        matchup_count, accuracy, confidence, state, version, alpha,
+        weight_shifts_json, gate_diagnostics_json,
+        rollback_reason, shadow_accuracy, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(voice_id) DO UPDATE SET
         weights_json = excluded.weights_json,
+        effective_weights_json = excluded.effective_weights_json,
         matchup_count = excluded.matchup_count,
         accuracy = excluded.accuracy,
         confidence = excluded.confidence,
+        state = excluded.state,
+        version = excluded.version,
+        alpha = excluded.alpha,
         weight_shifts_json = excluded.weight_shifts_json,
         gate_diagnostics_json = excluded.gate_diagnostics_json,
+        rollback_reason = excluded.rollback_reason,
+        shadow_accuracy = excluded.shadow_accuracy,
         updated_at = excluded.updated_at`
     )
     .bind(
       override.override_id,
       override.voice_id,
       JSON.stringify(override.weights),
+      JSON.stringify(override.effective_weights),
       override.matchup_count,
       override.accuracy,
       override.confidence,
+      override.state,
+      override.version,
+      override.alpha,
       override.weight_shifts ? JSON.stringify(override.weight_shifts) : null,
       override.gate_diagnostics ? JSON.stringify(override.gate_diagnostics) : null,
+      override.rollback_reason,
+      override.shadow_accuracy,
       override.created_at,
       override.updated_at,
     )

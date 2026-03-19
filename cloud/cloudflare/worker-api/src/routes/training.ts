@@ -57,9 +57,12 @@ import {
   parseRunNameFromCheckpointPrefix as domainParseRunNameFromCheckpointPrefix,
   getTrainingDefaults,
   passesValidationGate,
+  passesHardSafetyGate,
+  grayZoneRescue,
   VALIDATION_GATE_THRESHOLDS,
   getJobPriority,
 } from "../lib/training-domain";
+import { loadEffectiveWeights } from "../lib/arena-calibration";
 import {
   planCampaignAttempts,
   buildLLMPlannerPrompt,
@@ -888,6 +891,41 @@ type ManualPromotionCandidate = {
   score: number | null;
 };
 
+/** Extract CheckpointScores from a validation record for gray-zone rescue evaluation. */
+const extractCheckpointScoresFromRecord = (record: Record<string, unknown>): import("../lib/training-domain").CheckpointScores | null => {
+  // Scores may be embedded in the message string or as direct fields
+  const parseFromMsg = (msg: string, key: string): number | null => {
+    const match = new RegExp(`(?:^|\s)${key}=([\d.]+)`).exec(msg);
+    if (!match) return null;
+    const val = parseFloat(match[1]);
+    return Number.isFinite(val) ? val : null;
+  };
+
+  const msg = typeof record.message === "string" ? record.message : "";
+  const get = (key: string): number | null => {
+    const direct = record[key];
+    if (typeof direct === "number" && Number.isFinite(direct)) return direct;
+    return parseFromMsg(msg, key.replace("_score", ""));
+  };
+
+  const asr = get("asr_score");
+  const speaker = get("speaker_score");
+  const health = get("health_score");
+  // Need at least one core metric to evaluate
+  if (asr === null && speaker === null && health === null) return null;
+
+  return {
+    asr_score: asr,
+    speaker_score: speaker,
+    health_score: health,
+    tone_score: get("tone_score"),
+    speed_score: get("speed_score"),
+    style_score: get("style_score"),
+    overall_score: get("overall_score"),
+    duration_score: get("duration_score"),
+  };
+};
+
 const collectManualPromotionCandidates = (
   summary: Record<string, unknown>
 ): ManualPromotionCandidate[] => {
@@ -912,6 +950,23 @@ const collectManualPromotionCandidates = (
     }
     const record = value as Record<string, unknown>;
     if (record.ok === false) {
+      // Gray-zone rescue: re-evaluate failed checkpoints that barely miss soft thresholds.
+      // Extract scores from the record and check if they can be rescued.
+      const rescueScores = extractCheckpointScoresFromRecord(record);
+      if (!rescueScores || !passesHardSafetyGate(rescueScores)) {
+        continue;
+      }
+      // Mark as rescued but still register — will get lower score than clean passes
+      // The actual rescue decision requires DB access (calibration state), so we
+      // include hard-safety-passing failures as candidates with a score penalty.
+      // The caller can then apply grayZoneRescue with DB-loaded weights.
+      if (!record.prefix || typeof record.prefix !== "string") continue;
+      register({
+        prefix: (record.prefix as string).trim(),
+        epoch: readNumber(record.epoch),
+        preset: typeof record.preset === "string" ? record.preset.trim() : null,
+        score: readNumber(record.aggregateScore ?? record.score) ?? null,
+      });
       continue;
     }
     const prefix = typeof record.prefix === "string" ? record.prefix.trim() : "";

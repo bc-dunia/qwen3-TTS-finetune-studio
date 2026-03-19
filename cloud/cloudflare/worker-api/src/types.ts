@@ -358,6 +358,7 @@ export type ArenaVoteConfidence = "clear" | "slight";
 export type ArenaCandidateSource = "champion_carry" | "second_carry" | "third_carry" | "new";
 export type ArenaCandidateRetention = "active" | "champion" | "second" | "third" | "eliminated" | "purged";
 export type ArenaCalibrationConfidence = "preliminary" | "calibrated" | "high";
+export type CalibrationState = "shadow" | "canary" | "active" | "rolled_back";
 
 export interface ArenaSession {
   session_id: string;
@@ -421,24 +422,36 @@ export interface ArenaCalibrationOverride {
   override_id: string;
   voice_id: string;
   weights: Record<string, number>;
+  effective_weights: Record<string, number>;
   matchup_count: number;
   accuracy: number | null;
   confidence: ArenaCalibrationConfidence;
+  state: CalibrationState;
+  version: number;
+  alpha: number;
   weight_shifts: Record<string, number> | null;
   gate_diagnostics: Record<string, unknown> | null;
+  rollback_reason: string | null;
+  shadow_accuracy: number | null;
   created_at: number;
   updated_at: number;
 }
 
 export interface CalibrationResult {
   learned_weights: Record<string, number>;
+  effective_weights: Record<string, number>;
   confidence: ArenaCalibrationConfidence | "insufficient";
+  state: CalibrationState;
   matchup_count: number;
+  effective_matchup_count: number;
   accuracy: number;
+  alpha: number;
+  ranking_pseudo_pairs_count: number;
   weight_shifts: Record<string, number>;
   gate_diagnostics: {
     both_bad_rate: number;
     gate_pass_loss_rate: number;
+    rescued_checkpoint_loss_rate: number;
     suggested_gate_changes: Array<{
       metric: string;
       direction: "tighten" | "loosen";

@@ -222,6 +222,85 @@ export const VALIDATION_RANKING_WEIGHTS: ValidationWeights = {
   duration: 0.05,
 };
 
+// ── Hard safety vs soft preference split ───────────────────────────────────────
+
+/**
+ * Hard safety thresholds — NEVER bypassed, even by calibration.
+ * These protect against objectively broken checkpoints (garbled speech, wrong speaker).
+ */
+export const HARD_SAFETY_THRESHOLDS = {
+  asr_min: 0.75,
+  speaker_min: 0.70,
+  health_min: 0.65,
+} as const;
+
+/**
+ * Soft preference thresholds — these can be relaxed by calibration via gray-zone rescue.
+ * A checkpoint failing only soft thresholds may still sound good to humans.
+ */
+export const SOFT_PREFERENCE_THRESHOLDS = {
+  tone_min: 0.50,
+  speed_min: 0.15,
+  style_min: 0.55,
+  overall_min: 0.80,
+  duration_min: 0.50,
+} as const;
+
+// ── Calibration blending ───────────────────────────────────────────────────────
+
+/**
+ * Compute the blend factor alpha based on effective matchup count.
+ * alpha=0 means "use defaults only"; alpha=1 means "use learned only" (never reached).
+ *
+ * Schedule:
+ *   <10 effective matches: alpha = 0 (no calibration influence)
+ *   10-19: alpha = 0.10 (barely perceptible)
+ *   20-39: alpha = 0.25
+ *   40-79: alpha = 0.50
+ *   80+:   alpha = 0.75 (never full override)
+ */
+export function computeCalibrationAlpha(effectiveMatchupCount: number): number {
+  if (effectiveMatchupCount < 10) return 0;
+  if (effectiveMatchupCount < 20) return 0.10;
+  if (effectiveMatchupCount < 40) return 0.25;
+  if (effectiveMatchupCount < 80) return 0.50;
+  return 0.75;
+}
+
+/**
+ * Blend default weights with learned weights using alpha.
+ * Caps per-weight shift at MAX_WEIGHT_SHIFT to prevent wild swings.
+ * Returns normalized weights that sum to 1.
+ */
+const MAX_WEIGHT_SHIFT = 0.10;
+
+export function getEffectiveWeights(
+  defaults: ValidationWeights,
+  learned: Record<string, number>,
+  alpha: number,
+): ValidationWeights {
+  const keys: (keyof ValidationWeights)[] = ["asr", "speaker", "style", "tone", "speed", "overall", "duration"];
+  const raw: Record<string, number> = {};
+
+  for (const k of keys) {
+    const def = defaults[k];
+    const lrn = learned[k] ?? def;
+    let blended = (1 - alpha) * def + alpha * lrn;
+    const shift = blended - def;
+    if (Math.abs(shift) > MAX_WEIGHT_SHIFT) {
+      blended = def + Math.sign(shift) * MAX_WEIGHT_SHIFT;
+    }
+    raw[k] = Math.max(0, blended);
+  }
+
+  const sum = Object.values(raw).reduce((s, v) => s + v, 0);
+  if (sum > 0) {
+    for (const k of keys) raw[k] = raw[k] / sum;
+  }
+
+  return raw as unknown as ValidationWeights;
+}
+
 export interface CheckpointScores {
   asr_score?: number | null;
   speaker_score?: number | null;
@@ -315,6 +394,85 @@ export function selectBestCheckpoint(
   }
 
   return bestIndex;
+}
+
+// ── Hard safety gate + gray-zone rescue ────────────────────────────────────────
+
+/**
+ * Check if a checkpoint passes only the hard safety gates (anti-garbage).
+ * These are never relaxed by calibration.
+ */
+export function passesHardSafetyGate(scores: CheckpointScores): boolean {
+  const asr = readNumber(scores.asr_score);
+  const speaker = readNumber(scores.speaker_score);
+  const health = readNumber(scores.health_score);
+
+  if (asr !== null && asr < HARD_SAFETY_THRESHOLDS.asr_min) return false;
+  if (speaker !== null && speaker < HARD_SAFETY_THRESHOLDS.speaker_min) return false;
+  if (health !== null && health < HARD_SAFETY_THRESHOLDS.health_min) return false;
+
+  return true;
+}
+
+/**
+ * Gray-zone rescue: a checkpoint that passes hard safety but fails the full gate
+ * can be "rescued" if it only barely misses soft thresholds.
+ *
+ * Rules:
+ * 1. Must pass hard safety gate
+ * 2. Must fail at most 1 soft threshold
+ * 3. The miss must be within maxMissMargin (default 0.03)
+ * 4. Its blended ranking score must be >= minRescueScore
+ */
+export interface GrayZoneResult {
+  rescued: boolean;
+  missedMetric: string | null;
+  missMargin: number;
+  blendedScore: number;
+}
+
+export function grayZoneRescue(
+  scores: CheckpointScores,
+  effectiveWeights: ValidationWeights,
+  minRescueScore: number = 0.70,
+  maxMissMargin: number = 0.03,
+): GrayZoneResult {
+  const noRescue: GrayZoneResult = { rescued: false, missedMetric: null, missMargin: 0, blendedScore: 0 };
+
+  if (!passesHardSafetyGate(scores)) return noRescue;
+  if (passesValidationGate(scores)) return noRescue;
+
+  const hasStyle = readNumber(scores.style_score) !== null;
+  const softChecks: Array<{ metric: string; value: number | null; threshold: number }> = [
+    { metric: "tone", value: readNumber(scores.tone_score), threshold: VALIDATION_GATE_THRESHOLDS.tone_min },
+    { metric: "speed", value: readNumber(scores.speed_score), threshold: VALIDATION_GATE_THRESHOLDS.speed_min },
+    { metric: "style", value: readNumber(scores.style_score), threshold: VALIDATION_GATE_THRESHOLDS.style_min },
+    { metric: "overall", value: readNumber(scores.overall_score), threshold: VALIDATION_GATE_THRESHOLDS.overall_min },
+    { metric: "duration", value: readNumber(scores.duration_score), threshold: VALIDATION_GATE_THRESHOLDS.duration_min },
+  ];
+
+  const missed: Array<{ metric: string; margin: number }> = [];
+
+  for (const check of softChecks) {
+    if (check.value === null) continue;
+    if (hasStyle && (check.metric === "tone" || check.metric === "speed")) continue;
+    if (check.value < check.threshold) {
+      missed.push({ metric: check.metric, margin: check.threshold - check.value });
+    }
+  }
+
+  if (missed.length !== 1) return noRescue;
+  if (missed[0].margin > maxMissMargin) return noRescue;
+
+  const blendedScore = computeRankingScore(scores, effectiveWeights);
+  if (blendedScore < minRescueScore) return noRescue;
+
+  return {
+    rescued: true,
+    missedMetric: missed[0].metric,
+    missMargin: Math.round(missed[0].margin * 1000) / 1000,
+    blendedScore: Math.round(blendedScore * 1000) / 1000,
+  };
 }
 
 // ── Seed utilities ─────────────────────────────────────────────────────────────
