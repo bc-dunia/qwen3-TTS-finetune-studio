@@ -265,9 +265,8 @@ export function VoiceArena() {
 
       if (result.round_complete) {
         const updated = await getArenaSession(session.session_id)
-        setSession(updated)
-
         if (updated.status === 'completed') {
+          setSession(updated)
           setTimeout(() => {
             setRevealedMatchId(null)
             setStep('results')
