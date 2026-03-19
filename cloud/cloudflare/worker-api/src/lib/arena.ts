@@ -7,7 +7,8 @@ import type {
   ArenaCandidateSource,
   VoiceSettings,
 } from "../types";
-import { computeRankingScore, passesValidationGate, type CheckpointScores } from "./training-domain";
+import { computeRankingScore, passesValidationGate, passesHardSafetyGate, grayZoneRescue, type CheckpointScores, type ValidationWeights } from "./training-domain";
+import { loadEffectiveWeights } from "./arena-calibration";
 
 export interface AssembledCandidate {
   checkpoint_r2_prefix: string;
@@ -50,6 +51,10 @@ export async function assembleArenaCandidates(
   db: D1Database,
   voiceId: string,
 ): Promise<AssemblyResult> {
+  // Load calibrated weights for this voice (respects state machine)
+  const { weights: effectiveWeights, state: calState } = await loadEffectiveWeights(db, voiceId);
+  const useCalibrated = calState === "active";
+
   const voice = await db
     .prepare("SELECT checkpoint_r2_prefix, checkpoint_score, run_name, epoch, checkpoint_job_id FROM voices WHERE voice_id = ? LIMIT 1")
     .bind(voiceId)
@@ -104,8 +109,20 @@ export async function assembleArenaCandidates(
     third: "third_carry",
   };
 
+  const MAX_NON_CHAMPION_CARRIES = 2;
+
   for (const row of carried.results ?? []) {
     if (seen.has(row.checkpoint_r2_prefix)) continue;
+
+    if (row.retention_status !== "champion") {
+      const streak = await db.prepare(
+        `SELECT source FROM arena_candidates
+         WHERE voice_id = ? AND checkpoint_r2_prefix = ? AND source IN ('second_carry','third_carry')
+         ORDER BY created_at DESC LIMIT ?`
+      ).bind(voiceId, row.checkpoint_r2_prefix, MAX_NON_CHAMPION_CARRIES).all<{ source: string }>();
+      if ((streak.results?.length ?? 0) >= MAX_NON_CHAMPION_CARRIES) continue;
+    }
+
     seen.add(row.checkpoint_r2_prefix);
     let scores: Record<string, number | null> = {};
     try { scores = JSON.parse(row.auto_scores_json ?? "{}"); } catch { /* empty */ }
@@ -117,7 +134,7 @@ export async function assembleArenaCandidates(
       epoch: row.epoch,
       source: sourceMap[row.retention_status] ?? "champion_carry",
       auto_scores: scores,
-      ranking_score: computeRankingScore(cs),
+      ranking_score: computeRankingScore(cs, useCalibrated ? effectiveWeights : undefined),
     });
   }
 
@@ -166,11 +183,19 @@ export async function assembleArenaCandidates(
       }
 
       const hasAnyScore = Object.values(scores).some((v) => v !== null);
-      if (hasAnyScore && !passesValidationGate(scores)) continue;
+      if (hasAnyScore && !passesValidationGate(scores)) {
+        // Gray-zone rescue: allow if passes hard safety and nearly passes soft thresholds
+        if (calState === "canary" || calState === "active") {
+          const rescue = grayZoneRescue(scores, effectiveWeights);
+          if (!rescue.rescued) continue;
+        } else {
+          continue;
+        }
+      }
 
       seen.add(prefix);
       const rankingScore = hasAnyScore
-        ? computeRankingScore(scores)
+        ? computeRankingScore(scores, useCalibrated ? effectiveWeights : undefined)
         : typeof rec.score === "number" ? rec.score : 0;
       newCandidates.push({
         checkpoint_r2_prefix: prefix,

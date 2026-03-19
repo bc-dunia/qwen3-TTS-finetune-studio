@@ -94,14 +94,20 @@ CREATE INDEX IF NOT EXISTS idx_arena_matches_candidates
 CREATE TABLE IF NOT EXISTS arena_calibration_overrides (
     override_id             TEXT PRIMARY KEY,
     voice_id                TEXT NOT NULL DEFAULT '__global__',
-    -- '__global__' for global override, actual voice_id for per-voice
     weights_json            TEXT NOT NULL,
+    effective_weights_json  TEXT,
     matchup_count           INTEGER NOT NULL,
+    effective_matchup_count INTEGER NOT NULL DEFAULT 0,
+    ranking_pseudo_pairs_count INTEGER NOT NULL DEFAULT 0,
     accuracy                REAL,
     confidence              TEXT NOT NULL,
-    -- 'preliminary' | 'calibrated' | 'high'
+    state                   TEXT NOT NULL DEFAULT 'shadow',
+    version                 INTEGER NOT NULL DEFAULT 1,
+    alpha                   REAL NOT NULL DEFAULT 0,
     weight_shifts_json      TEXT,
     gate_diagnostics_json   TEXT,
+    rollback_reason         TEXT,
+    shadow_accuracy         REAL,
     created_at              INTEGER NOT NULL,
     updated_at              INTEGER NOT NULL
 );

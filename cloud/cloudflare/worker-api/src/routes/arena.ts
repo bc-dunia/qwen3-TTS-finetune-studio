@@ -3,7 +3,6 @@ import {
   createArenaCandidate,
   createArenaMatch,
   createArenaSession,
-  getArenaCalibrationOverride,
   getArenaSession,
   getVoice,
   listArenaCandidates,
@@ -11,7 +10,6 @@ import {
   updateArenaMatch,
   updateArenaSession,
   updateVoice,
-  upsertArenaCalibrationOverride,
 } from "../lib/d1";
 import {
   assembleArenaCandidates,
@@ -24,7 +22,7 @@ import {
 } from "../lib/arena";
 import { invokeServerlessAsync, getServerlessStatus } from "../lib/runpod";
 import { normalizeLanguageCode } from "./tts";
-import { calibrateFromArenaData } from "../lib/arena-calibration";
+import { calibrateFromArenaData, publishCalibration } from "../lib/arena-calibration";
 import { authMiddleware } from "../middleware/auth";
 import type {
   AppContext,
@@ -453,6 +451,17 @@ app.post("/matches/:matchId/vote", async (c) => {
       advanceResult = await advanceRound(c.env.DB, result.sessionId);
     }
 
+    if (advanceResult.finalized) {
+      const voiceRow = await c.env.DB.prepare("SELECT voice_id FROM arena_sessions WHERE session_id = ? LIMIT 1").bind(result.sessionId).first<{ voice_id: string }>();
+      if (voiceRow) {
+        c.executionCtx.waitUntil(
+          calibrateFromArenaData(c.env.DB, voiceRow.voice_id)
+            .then(cal => publishCalibration(c.env.DB, voiceRow.voice_id, cal))
+            .catch(() => {}),
+        );
+      }
+    }
+
     return c.json({
       success: result.success,
       round_complete: result.roundComplete,
@@ -482,6 +491,12 @@ app.post("/sessions/:sessionId/complete", async (c) => {
     }
 
     await finalizeSession(c.env.DB, sessionId);
+
+    c.executionCtx.waitUntil(
+      calibrateFromArenaData(c.env.DB, session.voice_id)
+        .then(cal => publishCalibration(c.env.DB, session.voice_id, cal))
+        .catch(() => {}),
+    );
 
     const updated = await getArenaSession(c.env.DB, sessionId);
     const candidates = await listArenaCandidates(c.env.DB, { session_id: sessionId });
@@ -560,37 +575,16 @@ app.get("/calibration", async (c) => {
 
 app.post("/calibration/apply", async (c) => {
   try {
-    const body = await c.req.json<{
-      voice_id?: string;
-      weights: Record<string, number>;
-    }>();
-
-    if (!body.weights || typeof body.weights !== "object") {
-      return c.json({ detail: { message: "weights object is required" } }, 400);
-    }
-
+    const body = await c.req.json<{ voice_id?: string }>();
     const targetVoiceId = body.voice_id ?? "__global__";
-    const now = Date.now();
 
-    const existing = await getArenaCalibrationOverride(c.env.DB, targetVoiceId);
-
-    await upsertArenaCalibrationOverride(c.env.DB, {
-      override_id: existing?.override_id ?? crypto.randomUUID(),
-      voice_id: targetVoiceId,
-      weights: body.weights,
-      matchup_count: existing?.matchup_count ?? 0,
-      accuracy: existing?.accuracy ?? null,
-      confidence: existing?.confidence ?? "preliminary",
-      weight_shifts: existing?.weight_shifts ?? null,
-      gate_diagnostics: existing?.gate_diagnostics ?? null,
-      created_at: existing?.created_at ?? now,
-      updated_at: now,
-    });
+    const result = await calibrateFromArenaData(c.env.DB, targetVoiceId === "__global__" ? undefined : targetVoiceId);
+    await publishCalibration(c.env.DB, targetVoiceId, result);
 
     return c.json({
       applied: true,
       voice_id: targetVoiceId,
-      weights: body.weights,
+      ...result,
     });
   } catch (err) {
     console.error("POST /calibration/apply error:", err);
