@@ -115,12 +115,17 @@ export async function assembleArenaCandidates(
     if (seen.has(row.checkpoint_r2_prefix)) continue;
 
     if (row.retention_status !== "champion") {
-      const streak = await db.prepare(
+      const history = await db.prepare(
         `SELECT source FROM arena_candidates
-         WHERE voice_id = ? AND checkpoint_r2_prefix = ? AND source IN ('second_carry','third_carry')
-         ORDER BY created_at DESC LIMIT ?`
-      ).bind(voiceId, row.checkpoint_r2_prefix, MAX_NON_CHAMPION_CARRIES).all<{ source: string }>();
-      if ((streak.results?.length ?? 0) >= MAX_NON_CHAMPION_CARRIES) continue;
+         WHERE voice_id = ? AND checkpoint_r2_prefix = ?
+         ORDER BY created_at DESC`
+      ).bind(voiceId, row.checkpoint_r2_prefix).all<{ source: string }>();
+      let consecutiveCarries = 0;
+      for (const h of history.results ?? []) {
+        if (h.source === "second_carry" || h.source === "third_carry") consecutiveCarries++;
+        else break;
+      }
+      if (consecutiveCarries >= MAX_NON_CHAMPION_CARRIES) continue;
     }
 
     seen.add(row.checkpoint_r2_prefix);

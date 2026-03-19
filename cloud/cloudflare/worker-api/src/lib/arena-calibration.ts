@@ -520,21 +520,21 @@ export async function loadEffectiveWeights(
     .bind(voiceId)
     .first<{ effective_weights_json: string | null; state: string; alpha: number }>();
 
-  if (!row) {
+  const needsGlobalFallback = !row || !row.effective_weights_json || row.state === "shadow" || row.state === "rolled_back";
+
+  if (needsGlobalFallback) {
     const global = await db
       .prepare("SELECT effective_weights_json, state, alpha FROM arena_calibration_overrides WHERE voice_id = '__global__' LIMIT 1")
       .first<{ effective_weights_json: string | null; state: string; alpha: number }>();
-    if (!global || !global.effective_weights_json || global.state === "shadow" || global.state === "rolled_back") return defaults;
-    try {
-      return { weights: JSON.parse(global.effective_weights_json) as ValidationWeights, state: global.state as CalibrationState, alpha: global.alpha ?? 0 };
-    } catch { return defaults; }
-  }
-
-  if (!row.effective_weights_json || row.state === "shadow" || row.state === "rolled_back") {
-    return { ...defaults, state: (row.state as CalibrationState) ?? "shadow" };
+    if (global?.effective_weights_json && global.state !== "shadow" && global.state !== "rolled_back") {
+      try {
+        return { weights: JSON.parse(global.effective_weights_json) as ValidationWeights, state: global.state as CalibrationState, alpha: global.alpha ?? 0 };
+      } catch { /* fall through to defaults */ }
+    }
+    return { ...defaults, state: (row?.state as CalibrationState) ?? "shadow" };
   }
 
   try {
-    return { weights: JSON.parse(row.effective_weights_json) as ValidationWeights, state: row.state as CalibrationState, alpha: row.alpha ?? 0 };
+    return { weights: JSON.parse(row!.effective_weights_json!) as ValidationWeights, state: row!.state as CalibrationState, alpha: row!.alpha ?? 0 };
   } catch { return defaults; }
 }

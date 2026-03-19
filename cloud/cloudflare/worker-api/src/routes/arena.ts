@@ -457,7 +457,7 @@ app.post("/matches/:matchId/vote", async (c) => {
         c.executionCtx.waitUntil(
           calibrateFromArenaData(c.env.DB, voiceRow.voice_id)
             .then(cal => publishCalibration(c.env.DB, voiceRow.voice_id, cal))
-            .catch(() => {}),
+            .catch(err => console.error("Auto-calibrate failed (vote):", err)),
         );
       }
     }
@@ -495,7 +495,7 @@ app.post("/sessions/:sessionId/complete", async (c) => {
     c.executionCtx.waitUntil(
       calibrateFromArenaData(c.env.DB, session.voice_id)
         .then(cal => publishCalibration(c.env.DB, session.voice_id, cal))
-        .catch(() => {}),
+        .catch(err => console.error("Auto-calibrate failed (complete):", err)),
     );
 
     const updated = await getArenaSession(c.env.DB, sessionId);
@@ -579,13 +579,12 @@ app.post("/calibration/apply", async (c) => {
     const targetVoiceId = body.voice_id ?? "__global__";
 
     const result = await calibrateFromArenaData(c.env.DB, targetVoiceId === "__global__" ? undefined : targetVoiceId);
-    await publishCalibration(c.env.DB, targetVoiceId, result);
+    const applied = result.confidence !== "insufficient";
+    if (applied) {
+      await publishCalibration(c.env.DB, targetVoiceId, result);
+    }
 
-    return c.json({
-      applied: true,
-      voice_id: targetVoiceId,
-      ...result,
-    });
+    return c.json({ applied, voice_id: targetVoiceId, ...result });
   } catch (err) {
     console.error("POST /calibration/apply error:", err);
     return c.json({ detail: { message: err instanceof Error ? err.message : "Internal server error" } }, 500);
