@@ -16,18 +16,18 @@
  *   exploratory  = 25% exploit / 35% repair / 40% explore
  */
 
-import type { TrainingConfig, TrainingJob, Voice, TrainingCampaign } from "../types";
-import { buildTrainingCheckoutSearch } from "./training-checkout";
-import { sanitizeConfig } from "./training-advisor";
-import { readNumber as readNum, clamp } from "./training-domain";
+import type { TrainingConfig, TrainingJob, Voice, TrainingCampaign } from '../types';
+import { buildTrainingCheckoutSearch } from './training-checkout';
+import { sanitizeConfig } from './training-advisor';
+import { readNumber as readNum, clamp } from './training-domain';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-export type CampaignDirection = "conservative" | "balanced" | "exploratory";
-export type StrategyLane = "exploit" | "repair" | "explore";
-export type CampaignPhase = "bootstrap" | "searching" | "exploiting" | "infeasible";
+export type CampaignDirection = 'conservative' | 'balanced' | 'exploratory';
+export type StrategyLane = 'exploit' | 'repair' | 'explore';
+export type CampaignPhase = 'bootstrap' | 'searching' | 'exploiting' | 'infeasible';
 
 export interface PlannerCandidate {
   lane: StrategyLane;
@@ -38,14 +38,14 @@ export interface PlannerCandidate {
 
 export interface PlannerResult {
   phase: CampaignPhase;
-  stop_recommendation: "continue" | "stop_model_unfit" | "stop_diminishing_returns";
+  stop_recommendation: 'continue' | 'stop_model_unfit' | 'stop_diminishing_returns';
   candidates: PlannerCandidate[];
   /** Persisted across sweeps in campaign.planner_state */
   state_patch: Record<string, unknown>;
 }
 
 interface FailureCluster {
-  reason: "speed" | "asr" | "tone" | "overall" | "infra" | "unknown";
+  reason: 'speed' | 'asr' | 'tone' | 'overall' | 'infra' | 'unknown';
   count: number;
   configs: Array<{
     lr: number;
@@ -88,8 +88,6 @@ const LANE_WEIGHTS: Record<CampaignDirection, Record<StrategyLane, number>> = {
 // Helpers
 // ---------------------------------------------------------------------------
 
-
-
 function getCheckout(job: TrainingJob) {
   if (!job.checkout_search) {
     job.checkout_search = buildTrainingCheckoutSearch(job);
@@ -102,15 +100,21 @@ function getScore(job: TrainingJob): number | null {
   return cs.selected?.score ?? cs.manual_promoted?.score ?? cs.champion?.score ?? null;
 }
 
-function getFailureReason(job: TrainingJob): FailureCluster["reason"] {
+function getFailureReason(job: TrainingJob): FailureCluster['reason'] {
   const cs = getCheckout(job);
-  const msg = (cs.message ?? job.error_message ?? "").toLowerCase();
-  if (msg.includes("speed_score") || msg.includes("speed drift")) return "speed";
-  if (msg.includes("asr_score") || msg.includes("missing asr")) return "asr";
-  if (msg.includes("tone_score")) return "tone";
-  if (msg.includes("overall_score") || msg.includes("quality threshold")) return "overall";
-  if (msg.includes("no audio") || msg.includes("stalled") || msg.includes("supply_constraint") || msg.includes("recovery")) return "infra";
-  return "unknown";
+  const msg = (cs.message ?? job.error_message ?? '').toLowerCase();
+  if (msg.includes('speed_score') || msg.includes('speed drift')) return 'speed';
+  if (msg.includes('asr_score') || msg.includes('missing asr')) return 'asr';
+  if (msg.includes('tone_score')) return 'tone';
+  if (msg.includes('overall_score') || msg.includes('quality threshold')) return 'overall';
+  if (
+    msg.includes('no audio') ||
+    msg.includes('stalled') ||
+    msg.includes('supply_constraint') ||
+    msg.includes('recovery')
+  )
+    return 'infra';
+  return 'unknown';
 }
 
 function parseMessageKeyValues(message: string | null | undefined): Record<string, number> {
@@ -119,7 +123,7 @@ function parseMessageKeyValues(message: string | null | undefined): Record<strin
   const kvPattern = /([a-zA-Z_][a-zA-Z0-9_]*)=([^\s]+)/g;
   for (const match of message.matchAll(kvPattern)) {
     const key = match[1].toLowerCase();
-    const raw = match[2].replace(/[;,)]$/, "").trim();
+    const raw = match[2].replace(/[;,)]$/, '').trim();
     const num = Number(raw);
     if (Number.isFinite(num)) {
       values[key] = num;
@@ -130,19 +134,19 @@ function parseMessageKeyValues(message: string | null | undefined): Record<strin
 
 function metricGateThreshold(metric: string): number | null {
   const key = metric.toLowerCase();
-  if (key === "speed" || key === "speed_score") return 0.2;
-  if (key === "asr" || key === "asr_score") return 0.8;
-  if (key === "tone" || key === "tone_score") return 0.4;
-  if (key === "overall" || key === "overall_score" || key === "score") return 0.85;
-  if (key === "speaker" || key === "speaker_score") return 0.75;
-  if (key === "health" || key === "health_score") return 0.72;
-  if (key === "duration" || key === "duration_score") return 0.45;
+  if (key === 'speed' || key === 'speed_score') return 0.2;
+  if (key === 'asr' || key === 'asr_score') return 0.8;
+  if (key === 'tone' || key === 'tone_score') return 0.4;
+  if (key === 'overall' || key === 'overall_score' || key === 'score') return 0.85;
+  if (key === 'speaker' || key === 'speaker_score') return 0.75;
+  if (key === 'health' || key === 'health_score') return 0.72;
+  if (key === 'duration' || key === 'duration_score') return 0.45;
   return null;
 }
 
 function normalizeMetricName(metric: string): string {
   const key = metric.toLowerCase();
-  if (key.endsWith("_score")) return key.slice(0, -6);
+  if (key.endsWith('_score')) return key.slice(0, -6);
   return key;
 }
 
@@ -150,8 +154,10 @@ function detectFailedGate(
   message: string | null | undefined,
   parsedValues: Record<string, number>,
 ): string {
-  const msg = (message ?? "").toLowerCase();
-  const explicit = ["speed_score", "asr_score", "tone_score", "overall_score"].find((k) => msg.includes(k));
+  const msg = (message ?? '').toLowerCase();
+  const explicit = ['speed_score', 'asr_score', 'tone_score', 'overall_score'].find((k) =>
+    msg.includes(k),
+  );
   if (explicit) return normalizeMetricName(explicit);
 
   const failed = Object.entries(parsedValues)
@@ -162,11 +168,11 @@ function detectFailedGate(
     return failed[0].key;
   }
 
-  if (msg.includes("speed")) return "speed";
-  if (msg.includes("asr")) return "asr";
-  if (msg.includes("tone")) return "tone";
-  if (msg.includes("overall") || msg.includes("quality")) return "overall";
-  return "unknown";
+  if (msg.includes('speed')) return 'speed';
+  if (msg.includes('asr')) return 'asr';
+  if (msg.includes('tone')) return 'tone';
+  if (msg.includes('overall') || msg.includes('quality')) return 'overall';
+  return 'unknown';
 }
 
 function pickBestSubScore(
@@ -187,42 +193,55 @@ function pickBestSubScore(
   return best ? { metric: best.metric, value: best.value } : null;
 }
 
-function summarizeCheckpointEvaluation(evaluation: { epoch: number; ok: boolean; score: number; message: string }): string {
-  if (evaluation.ok) {
-    return `e${evaluation.epoch}=${evaluation.score.toFixed(3)}✓`;
+type TrajectoryTrend =
+  | 'improving'
+  | 'degrading'
+  | 'peaked_then_regressed'
+  | 'flat'
+  | 'volatile'
+  | 'unknown';
+
+function computeTrajectoryTrend(
+  evaluations: Array<{ epoch: number; ok: boolean; score: number }>,
+): TrajectoryTrend {
+  const sorted = [...evaluations].sort((a, b) => a.epoch - b.epoch);
+  if (sorted.length < 3) return 'unknown';
+
+  const scores = sorted.map((e) => e.score);
+  const bestIdx = scores.indexOf(Math.max(...scores));
+  const range = Math.max(...scores) - Math.min(...scores);
+
+  if (range < 0.005) return 'flat';
+
+  // Check if best is in first half and then regresses
+  if (bestIdx <= scores.length * 0.5 && scores[scores.length - 1] < scores[bestIdx] - 0.01) {
+    return 'peaked_then_regressed';
   }
-  const parsed = parseMessageKeyValues(evaluation.message);
-  const failedGate = detectFailedGate(evaluation.message, parsed);
-  const metricCandidates = [
-    failedGate,
-    `${failedGate}_score`,
-    "speed_score",
-    "asr_score",
-    "tone_score",
-    "overall_score",
-    "speed",
-    "asr",
-    "tone",
-    "overall",
-    "score",
-  ];
-  let metricValue: number | null = null;
-  let metricLabel = failedGate;
-  for (const key of metricCandidates) {
-    if (typeof parsed[key] === "number") {
-      metricValue = parsed[key];
-      metricLabel = normalizeMetricName(key);
-      break;
-    }
+
+  // Count direction changes
+  let increases = 0;
+  let decreases = 0;
+  for (let i = 1; i < scores.length; i++) {
+    if (scores[i] > scores[i - 1] + 0.003) increases++;
+    else if (scores[i] < scores[i - 1] - 0.003) decreases++;
   }
-  if (metricValue !== null && metricLabel !== "unknown") {
-    return `e${evaluation.epoch}=${metricLabel}:${metricValue.toFixed(3)}✗`;
-  }
-  return `e${evaluation.epoch}=${evaluation.score.toFixed(3)}✗`;
+
+  if (increases > 0 && decreases === 0) return 'improving';
+  if (decreases > 0 && increases === 0) return 'degrading';
+  if (increases >= 2 && decreases >= 2) return 'volatile';
+
+  // Best score near end → improving tendency
+  if (bestIdx >= scores.length * 0.7) return 'improving';
+  // Best score near start → degrading tendency
+  if (bestIdx <= scores.length * 0.3) return 'degrading';
+
+  return 'volatile';
 }
 
-function parseFamilyKey(familyKey: string): { lr: number; epochs: number; subtalker: number } | null {
-  const [lrRaw, epochsRaw, subtalkerRaw] = familyKey.split("|");
+function parseFamilyKey(
+  familyKey: string,
+): { lr: number; epochs: number; subtalker: number } | null {
+  const [lrRaw, epochsRaw, subtalkerRaw] = familyKey.split('|');
   const lr = Number(lrRaw);
   const epochs = Number(epochsRaw);
   const subtalker = Number(subtalkerRaw);
@@ -230,8 +249,11 @@ function parseFamilyKey(familyKey: string): { lr: number; epochs: number; subtal
   return { lr, epochs, subtalker };
 }
 
-function configDistance(a: { lr: number; epochs: number; subtalker: number }, b: { lr: number; epochs: number; subtalker: number }): { lr_pct: number; epochs_abs: number; subtalker_abs: number } {
-  const lr_pct = Math.abs(a.lr - b.lr) / Math.max(a.lr, b.lr, 1e-8) * 100;
+function configDistance(
+  a: { lr: number; epochs: number; subtalker: number },
+  b: { lr: number; epochs: number; subtalker: number },
+): { lr_pct: number; epochs_abs: number; subtalker_abs: number } {
+  const lr_pct = (Math.abs(a.lr - b.lr) / Math.max(a.lr, b.lr, 1e-8)) * 100;
   return {
     lr_pct,
     epochs_abs: Math.abs(a.epochs - b.epochs),
@@ -285,11 +307,14 @@ function isFamilyBlocked(
 // Analysis: extract anchors and failure clusters from history
 // ---------------------------------------------------------------------------
 
-function analyzeHistory(voice: Voice, allVoiceJobs: TrainingJob[]): {
+function analyzeHistory(
+  voice: Voice,
+  allVoiceJobs: TrainingJob[],
+): {
   successAnchors: SuccessAnchor[];
   nearPassAnchors: SuccessAnchor[];
-  failureClusters: Map<FailureCluster["reason"], FailureCluster>;
-  dominantFailure: FailureCluster["reason"] | null;
+  failureClusters: Map<FailureCluster['reason'], FailureCluster>;
+  dominantFailure: FailureCluster['reason'] | null;
   bestScore: number | null;
   phase: CampaignPhase;
   familyStats: Map<string, { completed: number; active: number; passes: number; failures: number }>;
@@ -297,23 +322,26 @@ function analyzeHistory(voice: Voice, allVoiceJobs: TrainingJob[]): {
   nearMissSignals: NearMissSignal[];
   allAttemptedConfigs: Array<{ lr: number; epochs: number; subtalker: number }>;
 } {
-  const is06b = voice.model_size.includes("0.6");
+  const is06b = voice.model_size.includes('0.6');
   const passThreshold = is06b ? 0.82 : 0.85;
   const nearPassDelta = 0.05;
 
   const completedJobs = allVoiceJobs
-    .filter((j) => j.status === "completed" || j.status === "failed" || j.status === "cancelled")
+    .filter((j) => j.status === 'completed' || j.status === 'failed' || j.status === 'cancelled')
     .sort((a, b) => (a.created_at || 0) - (b.created_at || 0));
 
   const activeJobs = allVoiceJobs.filter(
-    (j) => j.status !== "completed" && j.status !== "failed" && j.status !== "cancelled",
+    (j) => j.status !== 'completed' && j.status !== 'failed' && j.status !== 'cancelled',
   );
 
   const successAnchors: SuccessAnchor[] = [];
   const nearPassAnchors: SuccessAnchor[] = [];
   const nearMissSignals: NearMissSignal[] = [];
-  const failureMap = new Map<FailureCluster["reason"], FailureCluster>();
-  const familyStats = new Map<string, { completed: number; active: number; passes: number; failures: number }>();
+  const failureMap = new Map<FailureCluster['reason'], FailureCluster>();
+  const familyStats = new Map<
+    string,
+    { completed: number; active: number; passes: number; failures: number }
+  >();
 
   const ensureFamily = (key: string) => {
     if (!familyStats.has(key)) {
@@ -349,7 +377,7 @@ function analyzeHistory(voice: Voice, allVoiceJobs: TrainingJob[]): {
     } else if (score !== null && score > 0.01 && score >= passThreshold - nearPassDelta) {
       nearPassAnchors.push({ score, lr, epochs, subtalker, seed, job_id: job.job_id });
       family.failures++;
-    } else if (cs.status === "rejected" || job.status === "failed") {
+    } else if (cs.status === 'rejected' || job.status === 'failed') {
       const reason = getFailureReason(job);
       if (!failureMap.has(reason)) {
         failureMap.set(reason, { reason, count: 0, configs: [] });
@@ -386,15 +414,15 @@ function analyzeHistory(voice: Voice, allVoiceJobs: TrainingJob[]): {
   const recentFailures = completedJobs
     .filter((j) => {
       const cs = getCheckout(j);
-      return cs.status === "rejected" || j.status === "failed";
+      return cs.status === 'rejected' || j.status === 'failed';
     })
     .slice(-10);
-  let dominantFailure: FailureCluster["reason"] | null = null;
+  let dominantFailure: FailureCluster['reason'] | null = null;
   let maxCount = 0;
-  const recentReasonCounts = new Map<FailureCluster["reason"], number>();
+  const recentReasonCounts = new Map<FailureCluster['reason'], number>();
   for (const job of recentFailures) {
     const reason = getFailureReason(job);
-    if (reason !== "infra") {
+    if (reason !== 'infra') {
       const c = (recentReasonCounts.get(reason) ?? 0) + 1;
       recentReasonCounts.set(reason, c);
       if (c > maxCount) {
@@ -417,17 +445,19 @@ function analyzeHistory(voice: Voice, allVoiceJobs: TrainingJob[]): {
 
   let phase: CampaignPhase;
   if (is06b && completedJobs.length >= 8 && (bestScore === null || bestScore < 0.83)) {
-    phase = "infeasible";
+    phase = 'infeasible';
   } else if (successAnchors.length >= 2) {
-    phase = "exploiting";
+    phase = 'exploiting';
   } else if (successAnchors.length >= 1 || nearPassAnchors.length >= 2) {
-    phase = "searching";
+    phase = 'searching';
   } else {
-    phase = "bootstrap";
+    phase = 'bootstrap';
   }
 
   const allAttemptedConfigs: Array<{ lr: number; epochs: number; subtalker: number }> = [];
-  for (const job of [...completedJobs, ...activeJobs].sort((a, b) => (a.created_at || 0) - (b.created_at || 0))) {
+  for (const job of [...completedJobs, ...activeJobs].sort(
+    (a, b) => (a.created_at || 0) - (b.created_at || 0),
+  )) {
     const cfg = job.config;
     const lr = readNum(cfg.learning_rate) ?? 0;
     const epochs = readNum(cfg.num_epochs) ?? 0;
@@ -437,7 +467,18 @@ function analyzeHistory(voice: Voice, allVoiceJobs: TrainingJob[]): {
     }
   }
 
-  return { successAnchors, nearPassAnchors, failureClusters: failureMap, dominantFailure, bestScore, phase, familyStats, blockedFamilies, nearMissSignals, allAttemptedConfigs };
+  return {
+    successAnchors,
+    nearPassAnchors,
+    failureClusters: failureMap,
+    dominantFailure,
+    bestScore,
+    phase,
+    familyStats,
+    blockedFamilies,
+    nearMissSignals,
+    allAttemptedConfigs,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -447,7 +488,7 @@ function analyzeHistory(voice: Voice, allVoiceJobs: TrainingJob[]): {
 function generateExploitCandidate(
   anchors: SuccessAnchor[],
   nearPass: SuccessAnchor[],
-  failureClusters: Map<FailureCluster["reason"], FailureCluster>,
+  failureClusters: Map<FailureCluster['reason'], FailureCluster>,
   voice: Voice,
   attemptIndex: number,
   allAttemptedConfigs: Array<{ lr: number; epochs: number; subtalker: number }>,
@@ -457,7 +498,7 @@ function generateExploitCandidate(
 
   // Pick the best anchor and perturb slightly
   const best = pool[0];
-  const is06b = voice.model_size.includes("0.6");
+  const is06b = voice.model_size.includes('0.6');
 
   // Small perturbation around best config
   const lrJitter = best.lr * (1 + (((attemptIndex * 7) % 5) - 2) * 0.05); // +/-10%
@@ -473,34 +514,41 @@ function generateExploitCandidate(
     subtalker_loss_weight: clamp(subtalkerJitter, is06b ? 0.15 : 0.14, is06b ? 0.35 : 0.32),
     save_every_n_epochs: 1,
     seed: best.seed + attemptIndex * 97,
-    gpu_type_id: is06b ? "NVIDIA L40S" : "NVIDIA A100-SXM4-80GB",
+    gpu_type_id: is06b ? 'NVIDIA L40S' : 'NVIDIA A100-SXM4-80GB',
   };
 
-    for (let shift = 0; shift < 3; shift++) {
-      if (!isInExclusionZone(
-        { lr: Number(config.learning_rate), epochs: Number(config.num_epochs), subtalker: Number(config.subtalker_loss_weight) },
+  for (let shift = 0; shift < 3; shift++) {
+    if (
+      !isInExclusionZone(
+        {
+          lr: Number(config.learning_rate),
+          epochs: Number(config.num_epochs),
+          subtalker: Number(config.subtalker_loss_weight),
+        },
         allAttemptedConfigs,
-      )) break;
-      config.learning_rate = Number(config.learning_rate) * 1.15;
-      config.num_epochs = Number(config.num_epochs) + 1;
-    }
+      )
+    )
+      break;
+    config.learning_rate = Number(config.learning_rate) * 1.15;
+    config.num_epochs = Number(config.num_epochs) + 1;
+  }
 
   return {
-    lane: "exploit",
+    lane: 'exploit',
     config: sanitizeConfig(config, voice.model_size, voice.labels?.language),
     reasoning: `Refining around best anchor (score=${best.score.toFixed(3)}) with small perturbation`,
   };
 }
 
 function generateRepairCandidate(
-  dominantFailure: FailureCluster["reason"] | null,
-  failureClusters: Map<FailureCluster["reason"], FailureCluster>,
+  dominantFailure: FailureCluster['reason'] | null,
+  failureClusters: Map<FailureCluster['reason'], FailureCluster>,
   anchors: SuccessAnchor[],
   voice: Voice,
   attemptIndex: number,
   allAttemptedConfigs: Array<{ lr: number; epochs: number; subtalker: number }>,
 ): PlannerCandidate {
-  const is06b = voice.model_size.includes("0.6");
+  const is06b = voice.model_size.includes('0.6');
   const bestAnchor = anchors[0] ?? null;
 
   // Start from best known config or default
@@ -511,13 +559,13 @@ function generateRepairCandidate(
   let lr = baseLr;
   let epochs = baseEpochs;
   let subtalker = baseSubtalker;
-  let reasoning = "";
+  let reasoning = '';
 
   switch (dominantFailure) {
-    case "speed": {
+    case 'speed': {
       const step = Math.min(attemptIndex, 4);
       const ladder = [
-        { lrMul: 1.00, epochsDelta: -1, subDelta: 0.00 },
+        { lrMul: 1.0, epochsDelta: -1, subDelta: 0.0 },
         { lrMul: 0.92, epochsDelta: -1, subDelta: -0.02 },
         { lrMul: 0.85, epochsDelta: -2, subDelta: -0.02 },
         { lrMul: 0.78, epochsDelta: -2, subDelta: -0.04 },
@@ -529,31 +577,31 @@ function generateRepairCandidate(
       reasoning = `Speed repair step ${step}: shorter training (ep${rung.epochsDelta}) and LR×${rung.lrMul}`;
       break;
     }
-    case "tone": {
+    case 'tone': {
       lr = baseLr * 0.8;
       subtalker = Math.max(is06b ? 0.15 : 0.12, baseSubtalker - 0.03);
       epochs = baseEpochs + 2;
-      reasoning = "Tone repair: lower LR + more epochs to preserve speaker timbre";
+      reasoning = 'Tone repair: lower LR + more epochs to preserve speaker timbre';
       break;
     }
-    case "asr": {
+    case 'asr': {
       lr = baseLr * 0.7;
       subtalker = baseSubtalker + 0.02;
       epochs = Math.max(is06b ? 6 : 5, baseEpochs - 2);
-      reasoning = "ASR repair: conservative LR + fewer epochs to avoid transcript drift";
+      reasoning = 'ASR repair: conservative LR + fewer epochs to avoid transcript drift';
       break;
     }
-    case "overall": {
+    case 'overall': {
       lr = baseLr * 0.75;
       subtalker = baseSubtalker + 0.03;
       epochs = baseEpochs;
-      reasoning = "Overall quality repair: lower LR + higher subtalker for stability";
+      reasoning = 'Overall quality repair: lower LR + higher subtalker for stability';
       break;
     }
     default: {
       lr = baseLr * 0.85;
       epochs = baseEpochs - 1;
-      reasoning = "General repair: slightly conservative config";
+      reasoning = 'General repair: slightly conservative config';
     }
   }
 
@@ -562,7 +610,7 @@ function generateRepairCandidate(
     lr *= 0.85;
     epochs = Math.max(is06b ? 5 : 4, epochs - 1);
     subtalker = Math.max(is06b ? 0.1 : 0.08, subtalker - 0.03);
-    reasoning += " (shifted away from exclusion zone)";
+    reasoning += ' (shifted away from exclusion zone)';
   }
 
   const config: TrainingConfig = {
@@ -574,11 +622,11 @@ function generateRepairCandidate(
     subtalker_loss_weight: clamp(subtalker, is06b ? 0.1 : 0.08, is06b ? 0.4 : 0.35),
     save_every_n_epochs: 1,
     seed: (bestAnchor?.seed ?? 303) + attemptIndex * 131,
-    gpu_type_id: is06b ? "NVIDIA L40S" : "NVIDIA A100-SXM4-80GB",
+    gpu_type_id: is06b ? 'NVIDIA L40S' : 'NVIDIA A100-SXM4-80GB',
   };
 
   return {
-    lane: "repair",
+    lane: 'repair',
     config: sanitizeConfig(config, voice.model_size, voice.labels?.language),
     reasoning,
     target_failure: dominantFailure ?? undefined,
@@ -587,13 +635,13 @@ function generateRepairCandidate(
 
 function generateExploreCandidate(
   anchors: SuccessAnchor[],
-  failureClusters: Map<FailureCluster["reason"], FailureCluster>,
+  failureClusters: Map<FailureCluster['reason'], FailureCluster>,
   voice: Voice,
   attemptIndex: number,
   blockedFamilies: Set<string>,
   allAttemptedConfigs: Array<{ lr: number; epochs: number; subtalker: number }>,
 ): PlannerCandidate {
-  const is06b = voice.model_size.includes("0.6");
+  const is06b = voice.model_size.includes('0.6');
   const anchor = anchors[0] ?? null;
 
   const centerLr = anchor?.lr ?? (is06b ? 3e-6 : 4.75e-6);
@@ -617,7 +665,11 @@ function generateExploreCandidate(
   let candidate = { lr, epochs, subtalker };
   let shifted = false;
 
-  const candidateFk = configFamilyKey(candidate.lr, Math.round(candidate.epochs), Math.round(candidate.subtalker * 100) / 100);
+  const candidateFk = configFamilyKey(
+    candidate.lr,
+    Math.round(candidate.epochs),
+    Math.round(candidate.subtalker * 100) / 100,
+  );
   if (blockedFamilies.has(candidateFk)) {
     candidate = {
       lr: candidate.lr * 0.82,
@@ -657,13 +709,13 @@ function generateExploreCandidate(
     subtalker_loss_weight: clamp(candidate.subtalker, is06b ? 0.1 : 0.08, is06b ? 0.4 : 0.35),
     save_every_n_epochs: 1,
     seed,
-    gpu_type_id: is06b ? "NVIDIA L40S" : "NVIDIA A100-SXM4-80GB",
+    gpu_type_id: is06b ? 'NVIDIA L40S' : 'NVIDIA A100-SXM4-80GB',
   };
 
   return {
-    lane: "explore",
+    lane: 'explore',
     config: sanitizeConfig(config, voice.model_size, voice.labels?.language),
-    reasoning: `Exploring anchor-relative region: lr=${config.learning_rate} ep=${config.num_epochs} sub=${config.subtalker_loss_weight}${shifted ? " (shifted from blocked/exclusion zone)" : ""}`,
+    reasoning: `Exploring anchor-relative region: lr=${config.learning_rate} ep=${config.num_epochs} sub=${config.subtalker_loss_weight}${shifted ? ' (shifted from blocked/exclusion zone)' : ''}`,
   };
 }
 
@@ -682,37 +734,39 @@ function assignLanes(
 
   // Adjust weights based on phase
   let effectiveWeights = { ...weights };
-  if (phase === "bootstrap") {
+  if (phase === 'bootstrap') {
     // No proven zones yet — boost repair and explore
     effectiveWeights = { exploit: 0.2, repair: 0.4, explore: 0.4 };
-  } else if (phase === "exploiting") {
+  } else if (phase === 'exploiting') {
     // Proven zones exist — boost exploit
     effectiveWeights = {
       exploit: Math.max(weights.exploit, 0.6),
       repair: Math.min(weights.repair, 0.25),
       explore: Math.min(weights.explore, 0.15),
     };
-  } else if (phase === "infeasible") {
+  } else if (phase === 'infeasible') {
     // Stop wasting money
     return [];
   }
 
   // For 1 slot: pick highest weight lane
   if (slotsToFill === 1) {
-    const best = (Object.entries(effectiveWeights) as [StrategyLane, number][])
-      .sort(([, a], [, b]) => b - a)[0][0];
+    const best = (Object.entries(effectiveWeights) as [StrategyLane, number][]).sort(
+      ([, a], [, b]) => b - a,
+    )[0][0];
     return [best];
   }
 
   // For 2 slots: top 2 weighted lanes
   if (slotsToFill === 2) {
-    const sorted = (Object.entries(effectiveWeights) as [StrategyLane, number][])
-      .sort(([, a], [, b]) => b - a);
+    const sorted = (Object.entries(effectiveWeights) as [StrategyLane, number][]).sort(
+      ([, a], [, b]) => b - a,
+    );
     return [sorted[0][0], sorted[1][0]];
   }
 
   // For 3 slots: one of each
-  return ["exploit", "repair", "explore"];
+  return ['exploit', 'repair', 'explore'];
 }
 
 // ---------------------------------------------------------------------------
@@ -732,20 +786,30 @@ export function planCampaignAttempts(
   nextAttemptIndex: number,
 ): PlannerResult {
   const direction: CampaignDirection =
-    (campaign.planner_state?.direction as CampaignDirection) ?? "balanced";
+    (campaign.planner_state?.direction as CampaignDirection) ?? 'balanced';
 
-  const { successAnchors, nearPassAnchors, failureClusters, dominantFailure, bestScore, phase, familyStats, blockedFamilies, nearMissSignals, allAttemptedConfigs } =
-    analyzeHistory(voice, allVoiceJobs);
+  const {
+    successAnchors,
+    nearPassAnchors,
+    failureClusters,
+    dominantFailure,
+    bestScore,
+    phase,
+    familyStats,
+    blockedFamilies,
+    nearMissSignals,
+    allAttemptedConfigs,
+  } = analyzeHistory(voice, allVoiceJobs);
 
   // Infeasibility stop for 0.6B
-  if (phase === "infeasible") {
+  if (phase === 'infeasible') {
     return {
-      phase: "infeasible",
-      stop_recommendation: "stop_model_unfit",
+      phase: 'infeasible',
+      stop_recommendation: 'stop_model_unfit',
       candidates: [],
       state_patch: {
-        phase: "infeasible",
-        stop_recommendation: "stop_model_unfit",
+        phase: 'infeasible',
+        stop_recommendation: 'stop_model_unfit',
         best_score: bestScore,
         dominant_failure: dominantFailure,
         updated_at: Date.now(),
@@ -758,12 +822,12 @@ export function planCampaignAttempts(
     .filter((j) => getScore(j) !== null)
     .sort((a, b) => (a.created_at || 0) - (b.created_at || 0))
     .map((j) => getScore(j)!);
-  let stopRec: PlannerResult["stop_recommendation"] = "continue";
+  let stopRec: PlannerResult['stop_recommendation'] = 'continue';
   if (completedScores.length >= 5) {
     const last4 = completedScores.slice(-4);
     const range = Math.max(...last4) - Math.min(...last4);
-    if (range < 0.003 && phase === "exploiting") {
-      stopRec = "stop_diminishing_returns";
+    if (range < 0.003 && phase === 'exploiting') {
+      stopRec = 'stop_diminishing_returns';
     }
   }
 
@@ -777,26 +841,46 @@ export function planCampaignAttempts(
     let candidate: PlannerCandidate | null = null;
 
     switch (lane) {
-      case "exploit":
+      case 'exploit':
         candidate = generateExploitCandidate(
-          successAnchors, nearPassAnchors, failureClusters, voice, idx, allAttemptedConfigs,
+          successAnchors,
+          nearPassAnchors,
+          failureClusters,
+          voice,
+          idx,
+          allAttemptedConfigs,
         );
         break;
-      case "repair":
+      case 'repair':
         candidate = generateRepairCandidate(
-          dominantFailure, failureClusters, successAnchors, voice, idx, allAttemptedConfigs,
+          dominantFailure,
+          failureClusters,
+          successAnchors,
+          voice,
+          idx,
+          allAttemptedConfigs,
         );
         break;
-      case "explore":
+      case 'explore':
         candidate = generateExploreCandidate(
-          successAnchors, failureClusters, voice, idx, blockedFamilies, allAttemptedConfigs,
+          successAnchors,
+          failureClusters,
+          voice,
+          idx,
+          blockedFamilies,
+          allAttemptedConfigs,
         );
         break;
     }
 
     if (!candidate) {
       candidate = generateRepairCandidate(
-        dominantFailure, failureClusters, successAnchors, voice, idx, allAttemptedConfigs,
+        dominantFailure,
+        failureClusters,
+        successAnchors,
+        voice,
+        idx,
+        allAttemptedConfigs,
       );
     }
 
@@ -806,9 +890,14 @@ export function planCampaignAttempts(
     const candFk = configFamilyKey(candLr, candEp, candSub);
     if (blockedFamilies.has(candFk)) {
       candidate = generateExploreCandidate(
-        successAnchors, failureClusters, voice, idx + 10, blockedFamilies, allAttemptedConfigs,
+        successAnchors,
+        failureClusters,
+        voice,
+        idx + 10,
+        blockedFamilies,
+        allAttemptedConfigs,
       );
-      candidate.reasoning += " (original candidate was in blocked family)";
+      candidate.reasoning += ' (original candidate was in blocked family)';
     }
 
     const candidateNums = {
@@ -832,7 +921,7 @@ export function planCampaignAttempts(
           voice.model_size,
           voice.labels?.language,
         );
-        candidate.reasoning += " (diversified from parallel run)";
+        candidate.reasoning += ' (diversified from parallel run)';
       }
     }
 
@@ -842,18 +931,27 @@ export function planCampaignAttempts(
       readNum(candidate.config.subtalker_loss_weight) ?? 0,
     );
     if (blockedFamilies.has(finalFk)) {
-      const is06b = voice.model_size.includes("0.6");
+      const is06b = voice.model_size.includes('0.6');
       const escapeLr = (readNum(candidate.config.learning_rate) ?? (is06b ? 3e-6 : 5e-6)) * 0.7;
       const escapeEp = Math.max(is06b ? 5 : 4, (readNum(candidate.config.num_epochs) ?? 6) - 2);
-      const escapeSub = Math.max(is06b ? 0.1 : 0.08, (readNum(candidate.config.subtalker_loss_weight) ?? 0.26) - 0.06);
+      const escapeSub = Math.max(
+        is06b ? 0.1 : 0.08,
+        (readNum(candidate.config.subtalker_loss_weight) ?? 0.26) - 0.06,
+      );
       candidate.config = sanitizeConfig(
-        { ...candidate.config, learning_rate: escapeLr, num_epochs: escapeEp, subtalker_loss_weight: escapeSub },
-        voice.model_size, voice.labels?.language,
+        {
+          ...candidate.config,
+          learning_rate: escapeLr,
+          num_epochs: escapeEp,
+          subtalker_loss_weight: escapeSub,
+        },
+        voice.model_size,
+        voice.labels?.language,
       );
       candidateNums.lr = escapeLr;
       candidateNums.epochs = escapeEp;
       candidateNums.subtalker = escapeSub;
-      candidate.reasoning += " (escape hatch: all nearby families blocked)";
+      candidate.reasoning += ' (escape hatch: all nearby families blocked)';
     }
 
     usedConfigs.push(candidateNums);
@@ -878,9 +976,7 @@ export function planCampaignAttempts(
       lanes_assigned: lanes,
       candidates_generated: candidates.length,
       blocked_families: [...blockedFamilies],
-      family_stats: Object.fromEntries(
-        [...familyStats.entries()].map(([k, v]) => [k, v]),
-      ),
+      family_stats: Object.fromEntries([...familyStats.entries()].map(([k, v]) => [k, v])),
       near_miss_signals: nearMissSignals,
       updated_at: Date.now(),
     },
@@ -906,216 +1002,185 @@ export interface LLMPlannerInput {
  */
 export function buildLLMPlannerPrompt(input: LLMPlannerInput): string {
   const { voice, campaign, allVoiceJobs, heuristicResult } = input;
-  const is06b = voice.model_size.includes("0.6");
-  const direction = (campaign.planner_state?.direction as CampaignDirection) ?? "balanced";
+  const is06b = voice.model_size.includes('0.6');
+  const direction = (campaign.planner_state?.direction as CampaignDirection) ?? 'balanced';
 
   const completedJobs = allVoiceJobs
-    .filter((j) => j.status === "completed" || j.status === "failed" || j.status === "cancelled")
+    .filter((j) => j.status === 'completed' || j.status === 'failed' || j.status === 'cancelled')
     .sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
   const activeJobs = allVoiceJobs
-    .filter((j) => j.status !== "completed" && j.status !== "failed" && j.status !== "cancelled")
+    .filter((j) => j.status !== 'completed' && j.status !== 'failed' && j.status !== 'cancelled')
     .sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
 
   const blockedFamilies = Array.isArray(heuristicResult.state_patch.blocked_families)
-    ? heuristicResult.state_patch.blocked_families.filter((value): value is string => typeof value === "string")
-    : [];
-  const familyStatsRecord = (heuristicResult.state_patch.family_stats && typeof heuristicResult.state_patch.family_stats === "object")
-    ? (heuristicResult.state_patch.family_stats as Record<string, { failures?: number }>)
-    : {};
-  const nearMissSignals = Array.isArray(heuristicResult.state_patch.near_miss_signals)
-    ? heuristicResult.state_patch.near_miss_signals.filter((value): value is NearMissSignal => {
-      if (!value || typeof value !== "object") return false;
-      const entry = value as Record<string, unknown>;
-      return typeof entry.lr === "number"
-        && typeof entry.epochs === "number"
-        && typeof entry.subtalker === "number"
-        && typeof entry.seed === "number"
-        && typeof entry.bestSubScore === "string"
-        && typeof entry.bestSubValue === "number"
-        && typeof entry.failedGate === "string";
-    })
+    ? heuristicResult.state_patch.blocked_families.filter(
+        (value): value is string => typeof value === 'string',
+      )
     : [];
 
   const lines: string[] = [];
 
   // Context
-  lines.push("## Campaign Context");
-  lines.push(`Voice: ${voice.name}, Model: ${voice.model_size}, Language: ${voice.labels?.language ?? "ko"}`);
+  lines.push('## Campaign Context');
+  lines.push(
+    `Voice: ${voice.name}, Model: ${voice.model_size}, Language: ${voice.labels?.language ?? 'ko'}`,
+  );
   lines.push(`Direction: ${direction}`);
   lines.push(`Phase: ${heuristicResult.phase}`);
   lines.push(`Slots to fill: ${input.slotsToFill}`);
-  lines.push(`Current champion score: ${voice.checkpoint_score?.toFixed(3) ?? "none"}`);
+  lines.push(`Current champion score: ${voice.checkpoint_score?.toFixed(3) ?? 'none'}`);
   lines.push(`Validation threshold: ${is06b ? 0.82 : 0.85}`);
-  lines.push("");
+  lines.push('');
 
   // Success anchors (top 5)
   const anchors = heuristicResult.state_patch;
-  lines.push("## Success Anchors (passing configs)");
+  lines.push('## Success Anchors (passing configs)');
   const passJobs = completedJobs
     .filter((j) => getCheckout(j).validation_passed)
     .sort((a, b) => (getScore(b) ?? 0) - (getScore(a) ?? 0))
     .slice(0, 5);
   if (passJobs.length === 0) {
-    lines.push("No passing runs yet.");
+    lines.push('No passing runs yet.');
   } else {
     for (const j of passJobs) {
       const c = j.config;
-      lines.push(`  score=${getScore(j)?.toFixed(3)} lr=${c.learning_rate} ep=${c.num_epochs} sub=${c.subtalker_loss_weight} seed=${c.seed}`);
+      lines.push(
+        `  score=${getScore(j)?.toFixed(3)} lr=${c.learning_rate} ep=${c.num_epochs} sub=${c.subtalker_loss_weight} seed=${c.seed}`,
+      );
     }
   }
-  lines.push("");
+  lines.push('');
 
   // Near-pass anchors
-  lines.push("## Near-Pass Runs (within 0.02 of threshold)");
+  lines.push('## Near-Pass Runs (within 0.02 of threshold)');
   const nearPass = completedJobs
     .filter((j) => {
       const s = getScore(j);
-      return s !== null && !getCheckout(j).validation_passed && s >= (is06b ? 0.80 : 0.83);
+      return s !== null && !getCheckout(j).validation_passed && s >= (is06b ? 0.8 : 0.83);
     })
     .slice(0, 5);
   if (nearPass.length === 0) {
-    lines.push("None.");
+    lines.push('None.');
   } else {
     for (const j of nearPass) {
       const c = j.config;
-      lines.push(`  score=${getScore(j)?.toFixed(3)} lr=${c.learning_rate} ep=${c.num_epochs} sub=${c.subtalker_loss_weight} seed=${c.seed} fail=${getFailureReason(j)}`);
+      lines.push(
+        `  score=${getScore(j)?.toFixed(3)} lr=${c.learning_rate} ep=${c.num_epochs} sub=${c.subtalker_loss_weight} seed=${c.seed} fail=${getFailureReason(j)}`,
+      );
     }
   }
-  lines.push("");
+  lines.push('');
 
-  lines.push("## Active Runs (do NOT suggest similar configs)");
+  lines.push('## Active Runs (do NOT suggest similar configs)');
   if (activeJobs.length === 0) {
-    lines.push("None.");
+    lines.push('None.');
   } else {
     for (const j of activeJobs.slice(0, 10)) {
       const c = j.config;
-      lines.push(`  lr=${c.learning_rate} ep=${c.num_epochs} sub=${c.subtalker_loss_weight} seed=${c.seed} (${j.status})`);
+      lines.push(
+        `  lr=${c.learning_rate} ep=${c.num_epochs} sub=${c.subtalker_loss_weight} seed=${c.seed} (${j.status})`,
+      );
     }
   }
-  lines.push("");
+  lines.push('');
 
   // Failure clusters
-  lines.push("## Failure Clusters (grouped by reason)");
+  lines.push('## Failure Clusters (grouped by reason)');
   const failMap = new Map<string, number>();
-  for (const j of completedJobs.filter((j) => getCheckout(j).status === "rejected" || j.status === "failed")) {
+  for (const j of completedJobs.filter(
+    (j) => getCheckout(j).status === 'rejected' || j.status === 'failed',
+  )) {
     const r = getFailureReason(j);
     failMap.set(r, (failMap.get(r) ?? 0) + 1);
   }
   for (const [reason, count] of [...failMap.entries()].sort(([, a], [, b]) => b - a)) {
     lines.push(`  ${reason}: ${count} failures`);
   }
-  lines.push(`Dominant failure: ${anchors.dominant_failure ?? "none"}`);
-  lines.push("");
+  lines.push(`Dominant failure: ${anchors.dominant_failure ?? 'none'}`);
+  lines.push('');
 
-  lines.push("## Blocked Config Families (>=3 failures, 0 passes — DO NOT USE)");
+  lines.push('## Blocked Config Families (>=3 failures, 0 passes — DO NOT USE)');
   if (blockedFamilies.length === 0) {
-    lines.push("None.");
+    lines.push('None.');
   } else {
-    const familyFailureReasonCounts = new Map<string, Map<string, number>>();
-    for (const j of completedJobs.filter((job) => getCheckout(job).status === "rejected" || job.status === "failed")) {
-      const c = j.config;
-      const fk = configFamilyKey(
-        readNum(c.learning_rate) ?? 0,
-        readNum(c.num_epochs) ?? 0,
-        readNum(c.subtalker_loss_weight) ?? 0,
-      );
-      if (!blockedFamilies.includes(fk)) continue;
-      if (!familyFailureReasonCounts.has(fk)) {
-        familyFailureReasonCounts.set(fk, new Map<string, number>());
-      }
-      const reason = getFailureReason(j);
-      const reasonMap = familyFailureReasonCounts.get(fk)!;
-      reasonMap.set(reason, (reasonMap.get(reason) ?? 0) + 1);
-    }
-
     for (const familyKey of blockedFamilies.slice(0, 5)) {
       const parsed = parseFamilyKey(familyKey);
       if (!parsed) continue;
-      const failCount = familyStatsRecord[familyKey]?.failures ?? 0;
-      const reasonMap = familyFailureReasonCounts.get(familyKey);
-      const reasonParts = reasonMap
-        ? [...reasonMap.entries()]
-          .sort(([, a], [, b]) => b - a)
-          .map(([reason, count]) => `${reason}=${count}`)
-          .join(", ")
-        : "unknown=0";
-      lines.push(`  lr=${parsed.lr.toExponential(2)} ep=${parsed.epochs} sub=${parsed.subtalker.toFixed(2)}: ${failCount} failures (${reasonParts})`);
+      const dominantReason = (() => {
+        const reasonCounts = new Map<string, number>();
+        for (const j of completedJobs.filter(
+          (job) => getCheckout(job).status === 'rejected' || job.status === 'failed',
+        )) {
+          const c = j.config;
+          const fk = configFamilyKey(
+            readNum(c.learning_rate) ?? 0,
+            readNum(c.num_epochs) ?? 0,
+            readNum(c.subtalker_loss_weight) ?? 0,
+          );
+          if (fk !== familyKey) continue;
+          const r = getFailureReason(j);
+          reasonCounts.set(r, (reasonCounts.get(r) ?? 0) + 1);
+        }
+        if (reasonCounts.size === 0) return 'unknown';
+        return [...reasonCounts.entries()].sort(([, a], [, b]) => b - a)[0][0];
+      })();
+      lines.push(
+        `  lr=${parsed.lr.toExponential(2)} ep=${parsed.epochs} sub=${parsed.subtalker.toFixed(2)} → blocked(${dominantReason})`,
+      );
     }
   }
-  lines.push("");
+  lines.push('');
 
-  lines.push("## Near-Miss Signals (interesting sub-components from failed runs)");
-  if (nearMissSignals.length === 0) {
-    lines.push("None.");
-  } else {
-    for (const [idx, signal] of nearMissSignals.slice(0, 12).entries()) {
-      lines.push(`  #${idx + 1} lr=${signal.lr.toExponential(2)} ep=${signal.epochs} sub=${signal.subtalker.toFixed(2)} seed=${signal.seed}: ${signal.bestSubScore}=${signal.bestSubValue.toFixed(3)} (passed gate), but ${signal.failedGate} failed`);
-    }
-  }
-  lines.push("");
-
-  // Recent 10 runs (detailed)
-  lines.push("## Recent 10 Runs (most recent first)");
+  lines.push('## Recent 10 Runs (most recent first)');
   for (const j of completedJobs.slice(0, 10)) {
     const c = j.config;
     const cs = getCheckout(j);
     const score = getScore(j);
-    const reason = cs.validation_passed ? "none" : getFailureReason(j);
+    const reason = cs.validation_passed ? 'none' : getFailureReason(j);
     const bestEpoch = cs.selected?.epoch ?? cs.champion?.epoch ?? null;
     const maxEpoch = cs.evaluated.length > 0 ? Math.max(...cs.evaluated.map((e) => e.epoch)) : null;
-    const peakTiming = bestEpoch !== null && maxEpoch !== null
-      ? bestEpoch <= maxEpoch * 0.4 ? "early" : bestEpoch <= maxEpoch * 0.7 ? "mid" : "late"
-      : null;
+    const peakTiming =
+      bestEpoch !== null && maxEpoch !== null
+        ? bestEpoch <= maxEpoch * 0.4
+          ? 'early'
+          : bestEpoch <= maxEpoch * 0.7
+            ? 'mid'
+            : 'late'
+        : null;
+    const trend = cs.evaluated.length >= 3 ? computeTrajectoryTrend(cs.evaluated) : null;
 
-    lines.push(`  [${cs.validation_passed ? "PASS" : cs.status === "rejected" ? "REJECT" : "FAIL"}] score=${score?.toFixed(3) ?? "n/a"} lr=${c.learning_rate} ep=${c.num_epochs} sub=${c.subtalker_loss_weight} seed=${c.seed} fail=${reason}${peakTiming ? ` peak=${peakTiming}` : ""}`);
-    if (cs.evaluated.length > 0) {
-      const checkpoints = [...cs.evaluated]
-        .sort((a, b) => a.epoch - b.epoch)
-        .map((evaluation) => summarizeCheckpointEvaluation(evaluation))
-        .join(" ");
-      lines.push(`    checkpoints: ${checkpoints}`);
-    }
+    lines.push(
+      `  [${cs.validation_passed ? 'PASS' : cs.status === 'rejected' ? 'REJECT' : 'FAIL'}] score=${score?.toFixed(3) ?? 'n/a'} lr=${c.learning_rate} ep=${c.num_epochs} sub=${c.subtalker_loss_weight} seed=${c.seed} fail=${reason}${peakTiming ? ` peak=${peakTiming}` : ''}${trend && trend !== 'unknown' ? ` trend=${trend}` : ''}`,
+    );
   }
-  lines.push("");
+  lines.push('');
 
-  // Heuristic candidates as reference
-  lines.push("## Heuristic Candidates (for reference)");
-  for (const cand of heuristicResult.candidates) {
-    lines.push(`  lane=${cand.lane}: lr=${cand.config.learning_rate} ep=${cand.config.num_epochs} sub=${cand.config.subtalker_loss_weight} seed=${cand.config.seed} — ${cand.reasoning}`);
+  lines.push('## Heuristic Baseline (top 3)');
+  for (const cand of heuristicResult.candidates.slice(0, 3)) {
+    lines.push(
+      `  ${cand.lane}: lr=${cand.config.learning_rate} ep=${cand.config.num_epochs} sub=${cand.config.subtalker_loss_weight} seed=${cand.config.seed}`,
+    );
   }
-  lines.push("");
+  lines.push('');
 
-  lines.push(`Generate ${input.slotsToFill} candidate configs that are meaningfully different from each other.`);
-  lines.push("Each candidate must differ in at least 2 primary knobs (LR ≥20%, epochs ≥2, subtalker ≥0.03).");
-  lines.push("Do NOT suggest configs within the exclusion zone of recent failures (LR ±12%, epochs ±1, subtalker ±0.02).");
-  lines.push("Seed-only changes are forbidden unless replicating a known-passing config.");
+  lines.push(
+    `Generate ${input.slotsToFill} candidate configs that are meaningfully different from each other.`,
+  );
 
-  return lines.join("\n");
+  return lines.join('\n');
 }
 
-export const LLM_PLANNER_SYSTEM_PROMPT = `You are an autonomous TTS fine-tuning researcher, inspired by the autoresearch methodology.
+export type LLMPlannerDecision = 'skip' | 'normal' | 'escalated';
 
-Your job: analyze ALL training history and generate the next batch of hyperparameter configurations.
-
-## Strategy Lanes
-- exploit: Small perturbations around proven-good configs (passing or near-pass)
-- repair: Targeted fixes for the dominant failure mode (speed, tone, ASR, overall)
-- explore: Meaningfully different configs to discover new regions
-
-## Constraints
-- Each candidate MUST specify: learning_rate, num_epochs, subtalker_loss_weight, seed
-- Parallel candidates MUST differ in ≥2 primary knobs
-- Do NOT suggest configs in the exclusion zone of recent failures
-- Seed-only variation is FORBIDDEN (except to replicate passing configs)
-
-## Speed Failures (most common)
+const SPEED_REPAIR_LADDER = `
+## Speed Failures
 Speed failures mean the model drifts from the speaker's natural pace. Fix with:
 - Step 1: epochs −1, LR ×1.00, subtalker unchanged (shorter training)
 - Step 2: epochs −1, LR ×0.92, subtalker −0.02
 - Step 3: epochs −2, LR ×0.85, subtalker −0.02
-- Step 4: epochs −2, LR ×0.78, subtalker −0.04
+- Step 4: epochs −2, LR ×0.78, subtalker −0.04`;
 
-## Response Format (STRICT JSON)
+const LLM_PLANNER_RESPONSE_FORMAT = `## Response Format (STRICT JSON)
 {
   "phase": "bootstrap|searching|exploiting|infeasible",
   "stop_recommendation": "continue|stop_model_unfit|stop_diminishing_returns",
@@ -1134,6 +1199,62 @@ Speed failures mean the model drifts from the speaker's natural pace. Fix with:
   ]
 }`;
 
+export function buildLLMPlannerSystemPrompt(dominantFailure: string): string {
+  const lines: string[] = [
+    'You are an autonomous TTS fine-tuning researcher.',
+    'Analyze training history and generate the next batch of hyperparameter configurations.',
+    '',
+    '## Strategy Lanes',
+    '- exploit: Small perturbations around proven-good configs (passing or near-pass)',
+    '- repair: Targeted fixes for the dominant failure mode',
+    '- explore: Meaningfully different configs to discover new regions',
+    '',
+    '## Constraints',
+    '- Each candidate MUST specify: learning_rate, num_epochs, subtalker_loss_weight, seed',
+    '- Parallel candidates MUST differ in ≥2 primary knobs (LR ≥20%, epochs ≥2, subtalker ≥0.03)',
+    '- Do NOT suggest configs in the exclusion zone of recent failures (LR ±12%, epochs ±1, subtalker ±0.02)',
+    '- Seed-only variation is FORBIDDEN (except to replicate passing configs)',
+  ];
+
+  if (dominantFailure === 'speed') {
+    lines.push(SPEED_REPAIR_LADDER);
+  } else if (dominantFailure && dominantFailure !== 'none' && dominantFailure !== 'unknown') {
+    lines.push(
+      '',
+      `## Repair Focus`,
+      `Focus repair candidates on fixing ${dominantFailure} failures.`,
+    );
+  }
+
+  lines.push('', LLM_PLANNER_RESPONSE_FORMAT);
+  return lines.join('\n');
+}
+
+export function buildLLMPlannerStateHash(
+  voiceId: string,
+  voiceJobs: TrainingJob[],
+  slotsToFill: number,
+  direction: string,
+): string {
+  const terminal = voiceJobs
+    .filter((j) => j.status === 'completed' || j.status === 'failed' || j.status === 'cancelled')
+    .sort((a, b) => a.job_id.localeCompare(b.job_id))
+    .map((j) => {
+      const score = getScore(j);
+      const configKey = `${j.config.learning_rate}|${j.config.num_epochs}|${j.config.subtalker_loss_weight}`;
+      return `${j.job_id}:${j.status}:${configKey}:${score?.toFixed(3) ?? 'x'}:${j.updated_at ?? 0}`;
+    })
+    .join(';');
+
+  const active = voiceJobs
+    .filter((j) => j.status !== 'completed' && j.status !== 'failed' && j.status !== 'cancelled')
+    .sort((a, b) => a.job_id.localeCompare(b.job_id))
+    .map((j) => `${j.job_id}:${j.status}`)
+    .join(';');
+
+  return `${voiceId}|${terminal}|${active}|${slotsToFill}|${direction}`;
+}
+
 /**
  * Parse a structured LLM planner response into PlannerResult candidates.
  */
@@ -1142,39 +1263,55 @@ export function parseLLMPlannerResponse(
   voice: Voice,
   heuristicResult: PlannerResult,
 ): PlannerResult {
-  if (!raw || typeof raw !== "object") return heuristicResult;
+  if (!raw || typeof raw !== 'object') return heuristicResult;
   const data = raw as Record<string, unknown>;
 
-  const phase = typeof data.phase === "string"
-    ? (data.phase as CampaignPhase)
-    : heuristicResult.phase;
+  const VALID_PHASES: ReadonlySet<string> = new Set([
+    'bootstrap',
+    'searching',
+    'exploiting',
+    'infeasible',
+  ]);
+  const VALID_STOP_RECS: ReadonlySet<string> = new Set([
+    'continue',
+    'stop_model_unfit',
+    'stop_diminishing_returns',
+  ]);
 
-  const stopRec = typeof data.stop_recommendation === "string"
-    ? (data.stop_recommendation as PlannerResult["stop_recommendation"])
-    : heuristicResult.stop_recommendation;
+  const phase =
+    typeof data.phase === 'string' && VALID_PHASES.has(data.phase)
+      ? (data.phase as CampaignPhase)
+      : heuristicResult.phase;
+
+  const stopRec =
+    typeof data.stop_recommendation === 'string' && VALID_STOP_RECS.has(data.stop_recommendation)
+      ? (data.stop_recommendation as PlannerResult['stop_recommendation'])
+      : heuristicResult.stop_recommendation;
 
   const rawCandidates = Array.isArray(data.candidates) ? data.candidates : [];
   const candidates: PlannerCandidate[] = [];
 
   for (const rc of rawCandidates) {
-    if (!rc || typeof rc !== "object") continue;
+    if (!rc || typeof rc !== 'object') continue;
     const entry = rc as Record<string, unknown>;
 
-    const lane = typeof entry.lane === "string" && ["exploit", "repair", "explore"].includes(entry.lane)
-      ? (entry.lane as StrategyLane)
-      : "repair";
+    const lane =
+      typeof entry.lane === 'string' && ['exploit', 'repair', 'explore'].includes(entry.lane)
+        ? (entry.lane as StrategyLane)
+        : 'repair';
 
     const rawConfig = entry.config;
-    if (!rawConfig || typeof rawConfig !== "object") continue;
+    if (!rawConfig || typeof rawConfig !== 'object') continue;
     const cfg = rawConfig as Record<string, unknown>;
 
     const config: TrainingConfig = sanitizeConfig(
       {
         model_size: voice.model_size,
-        learning_rate: typeof cfg.learning_rate === "number" ? cfg.learning_rate : undefined,
-        num_epochs: typeof cfg.num_epochs === "number" ? cfg.num_epochs : undefined,
-        subtalker_loss_weight: typeof cfg.subtalker_loss_weight === "number" ? cfg.subtalker_loss_weight : undefined,
-        seed: typeof cfg.seed === "number" ? cfg.seed : undefined,
+        learning_rate: typeof cfg.learning_rate === 'number' ? cfg.learning_rate : undefined,
+        num_epochs: typeof cfg.num_epochs === 'number' ? cfg.num_epochs : undefined,
+        subtalker_loss_weight:
+          typeof cfg.subtalker_loss_weight === 'number' ? cfg.subtalker_loss_weight : undefined,
+        seed: typeof cfg.seed === 'number' ? cfg.seed : undefined,
         save_every_n_epochs: 1,
         batch_size: 2,
         gradient_accumulation_steps: 4,
@@ -1186,8 +1323,8 @@ export function parseLLMPlannerResponse(
     candidates.push({
       lane,
       config,
-      reasoning: typeof entry.reasoning === "string" ? entry.reasoning : "",
-      target_failure: typeof entry.target_failure === "string" ? entry.target_failure : undefined,
+      reasoning: typeof entry.reasoning === 'string' ? entry.reasoning : '',
+      target_failure: typeof entry.target_failure === 'string' ? entry.target_failure : undefined,
     });
   }
 
