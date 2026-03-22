@@ -4,6 +4,7 @@ import adminRoutes from "./routes/admin";
 import arenaRoutes from "./routes/arena";
 import datasetRoutes from "./routes/dataset";
 import modelsRoutes from "./routes/models";
+import researchRoutes from "./routes/research";
 import trainingCallbacksRoutes from "./routes/training-callbacks";
 import trainingRoutes, { runTrainingSupervisorSweep } from "./routes/training";
 import ttsRoutes from "./routes/tts";
@@ -33,6 +34,7 @@ app.route("/v1/internal/training", trainingCallbacksRoutes);
 app.route("/v1/upload", uploadRoutes);
 app.route("/v1/dataset", datasetRoutes);
 app.route("/v1/arena", arenaRoutes);
+app.route("/v1/research", researchRoutes);
 
 app.onError((err, c) => {
   if (err instanceof SyntaxError) {

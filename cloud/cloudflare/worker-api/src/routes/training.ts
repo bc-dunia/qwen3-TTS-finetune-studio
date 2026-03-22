@@ -73,6 +73,7 @@ import {
   type PlannerResult,
 } from '../lib/campaign-planner';
 import { enrichOutputWithReviewAsr } from '../lib/review-asr';
+import { buildStrategyBrief, maybeAdvanceResearchLoop } from '../lib/research-loop';
 import { authMiddleware } from '../middleware/auth';
 import type {
   AppContext,
@@ -2139,12 +2140,20 @@ const runCampaignPlanner = async (
   slotsToFill: number,
   nextAttemptIndex: number,
 ): Promise<PlannerResult> => {
+  let brief: import('../types').StrategyBrief | undefined;
+  try {
+    brief = await buildStrategyBrief(c.env.DB, voice.voice_id);
+  } catch {
+    brief = undefined;
+  }
+
   const heuristicResult = planCampaignAttempts(
     voice,
     campaign,
     voiceJobs,
     slotsToFill,
     nextAttemptIndex,
+    brief,
   );
 
   if (heuristicResult.phase === 'infeasible' || heuristicResult.candidates.length === 0) {
@@ -2506,6 +2515,22 @@ const enqueueCampaignAttemptWithConfig = async (
   return enqueueCampaignAttempt(c, patchedCampaign, voice, 1, voiceJobs);
 };
 
+const fireResearchHookOnCampaignEnd = (
+  c: Context<AppContext>,
+  voiceId: string,
+  campaignId: string,
+): void => {
+  c.executionCtx.waitUntil(
+    maybeAdvanceResearchLoop(
+      c.env.DB,
+      { OPENAI_API_KEY: c.env.OPENAI_API_KEY, OPENAI_ADVISOR_MODEL: c.env.OPENAI_ADVISOR_MODEL },
+      voiceId,
+      "campaign_completed",
+      { linked_ids: { campaign_id: campaignId } },
+    ).catch((err) => console.error("Research loop failed (campaign end):", err)),
+  );
+};
+
 const advanceTrainingCampaign = async (
   c: Context<AppContext>,
   campaignId: string,
@@ -2567,6 +2592,7 @@ const advanceTrainingCampaign = async (
       },
       completed_at: Date.now(),
     });
+    fireResearchHookOnCampaignEnd(c, voice.voice_id, campaignId);
     return getTrainingCampaign(c.env.DB, campaignId);
   }
 
@@ -2581,6 +2607,7 @@ const advanceTrainingCampaign = async (
       },
       completed_at: Date.now(),
     });
+    fireResearchHookOnCampaignEnd(c, voice.voice_id, campaignId);
     return getTrainingCampaign(c.env.DB, campaignId);
   }
 
@@ -2620,6 +2647,7 @@ const advanceTrainingCampaign = async (
           },
           completed_at: Date.now(),
         });
+        fireResearchHookOnCampaignEnd(c, voice.voice_id, campaignId);
         return getTrainingCampaign(c.env.DB, campaignId);
       }
     }
@@ -2640,6 +2668,7 @@ const advanceTrainingCampaign = async (
       },
       completed_at: Date.now(),
     });
+    fireResearchHookOnCampaignEnd(c, voice.voice_id, campaignId);
     return getTrainingCampaign(c.env.DB, campaignId);
   }
 
@@ -2682,6 +2711,7 @@ const advanceTrainingCampaign = async (
       },
       completed_at: Date.now(),
     });
+    fireResearchHookOnCampaignEnd(c, voice.voice_id, campaignId);
     return getTrainingCampaign(c.env.DB, campaignId);
   }
 
@@ -2704,6 +2734,7 @@ const advanceTrainingCampaign = async (
       },
       completed_at: Date.now(),
     });
+    fireResearchHookOnCampaignEnd(c, voice.voice_id, campaignId);
     return getTrainingCampaign(c.env.DB, campaignId);
   }
 
