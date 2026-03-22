@@ -1,8 +1,5 @@
 import { Hono } from "hono";
 import {
-  createArenaCandidate,
-  createArenaMatch,
-  createArenaSession,
   getArenaSession,
   getVoice,
   listArenaCandidates,
@@ -12,10 +9,8 @@ import {
   updateVoice,
 } from "../lib/d1";
 import {
-  assembleArenaCandidates,
-  computeTotalRounds,
-  generateSwissPairings,
-  generateRoundRobinSchedule,
+  bootstrapArenaSession,
+  type BootstrapArenaResult,
   submitVote,
   advanceRound,
   finalizeSession,
@@ -23,12 +18,10 @@ import {
 import { invokeServerlessAsync, getServerlessStatus } from "../lib/runpod";
 import { normalizeLanguageCode } from "./tts";
 import { calibrateFromArenaData, publishCalibration } from "../lib/arena-calibration";
+import { maybeAdvanceResearchLoop } from "../lib/research-loop";
 import { authMiddleware } from "../middleware/auth";
 import type {
   AppContext,
-  ArenaCandidate,
-  ArenaMatch,
-  ArenaSession,
   ArenaVoteConfidence,
   ArenaVoteWinner,
   VoiceSettings,
@@ -83,136 +76,17 @@ app.post("/sessions", async (c) => {
       return c.json({ detail: { message: "Voice not found" } }, 404);
     }
 
-    const { candidates: assembled, algorithm } = await assembleArenaCandidates(c.env.DB, body.voice_id);
-    if (assembled.length < 2) {
-      return c.json({ detail: { message: "Need at least 2 candidates for an arena session" } }, 400);
-    }
-
-    const totalRounds = computeTotalRounds(assembled.length, algorithm);
-    const seed = body.seed ?? 42;
-    const now = Date.now();
-    const sessionId = crypto.randomUUID();
-
-    const session: ArenaSession = {
-      session_id: sessionId,
-      voice_id: body.voice_id,
-      status: "assembling",
-      algorithm,
-      current_round: 1,
-      total_rounds: totalRounds,
-      test_texts: body.test_texts,
-      seed,
+    const result: BootstrapArenaResult | null = await bootstrapArenaSession(c.env.DB, {
+      voiceId: body.voice_id,
+      testTexts: body.test_texts,
+      seed: body.seed ?? 42,
       settings: body.settings ?? {},
-      ranking: {},
-      winner_candidate_id: null,
-      promoted: false,
-      notes: null,
-      created_at: now,
-      completed_at: null,
-    };
-
-    await createArenaSession(c.env.DB, session);
-
-    const candidateRecords: ArenaCandidate[] = assembled.map((ac, idx) => ({
-      candidate_id: crypto.randomUUID(),
-      session_id: sessionId,
-      voice_id: body.voice_id,
-      checkpoint_r2_prefix: ac.checkpoint_r2_prefix,
-      job_id: ac.job_id,
-      run_name: ac.run_name,
-      epoch: ac.epoch,
-      source: ac.source,
-      seed_rank: idx + 1,
-      final_rank: null,
-      wins: 0,
-      losses: 0,
-      ties: 0,
-      bye_count: 0,
-      buchholz: 0,
-      retention_status: "active",
-      auto_scores: ac.auto_scores,
-      created_at: now,
-      eliminated_at: null,
-    }));
-
-    for (const candidate of candidateRecords) {
-      await createArenaCandidate(c.env.DB, candidate);
+    });
+    if (!result) {
+      return c.json({ detail: { message: "Need at least 2 candidates" } }, 400);
     }
 
-    const matchRecords: ArenaMatch[] = [];
-    if (algorithm === "round_robin") {
-      const pairs = generateRoundRobinSchedule(
-        candidateRecords.map((cr) => cr.candidate_id),
-        body.test_texts.length,
-      );
-      for (const p of pairs) {
-        matchRecords.push({
-          match_id: crypto.randomUUID(),
-          session_id: sessionId,
-          round_number: 1,
-          candidate_a_id: p.a,
-          candidate_b_id: p.b,
-          display_order: p.displayOrder,
-          text_index: p.textIndex,
-          audio_a_r2_key: null,
-          audio_b_r2_key: null,
-          winner: null,
-          confidence: null,
-          replay_count_a: 0,
-          replay_count_b: 0,
-          created_at: now,
-          voted_at: null,
-        });
-      }
-    } else {
-      const standings = candidateRecords.map((cr) => ({
-        candidate_id: cr.candidate_id,
-        wins: 0,
-        losses: 0,
-        ties: 0,
-        bye_count: 0,
-        buchholz: 0,
-      }));
-      const { pairs, byeCandidateId } = generateSwissPairings(standings, 1, [], body.test_texts.length);
-
-      if (byeCandidateId) {
-        const byeCandidate = candidateRecords.find((cr) => cr.candidate_id === byeCandidateId);
-        if (byeCandidate) {
-          byeCandidate.wins = 1;
-          byeCandidate.bye_count = 1;
-        }
-      }
-
-      for (const p of pairs) {
-        matchRecords.push({
-          match_id: crypto.randomUUID(),
-          session_id: sessionId,
-          round_number: 1,
-          candidate_a_id: p.a,
-          candidate_b_id: p.b,
-          display_order: p.displayOrder,
-          text_index: p.textIndex,
-          audio_a_r2_key: null,
-          audio_b_r2_key: null,
-          winner: null,
-          confidence: null,
-          replay_count_a: 0,
-          replay_count_b: 0,
-          created_at: now,
-          voted_at: null,
-        });
-      }
-    }
-
-    for (const match of matchRecords) {
-      await createArenaMatch(c.env.DB, match);
-    }
-
-    return c.json({
-      ...session,
-      candidates: candidateRecords,
-      matches: matchRecords,
-    }, 201);
+    return c.json(result, 201);
   } catch (err) {
     console.error("POST /sessions error:", err);
     return c.json({ detail: { message: err instanceof Error ? err.message : "Internal server error" } }, 500);
@@ -459,6 +333,15 @@ app.post("/matches/:matchId/vote", async (c) => {
             .then(cal => publishCalibration(c.env.DB, voiceRow.voice_id, cal))
             .catch(err => console.error("Auto-calibrate failed (vote):", err)),
         );
+        c.executionCtx.waitUntil(
+          maybeAdvanceResearchLoop(
+            c.env.DB,
+            { OPENAI_API_KEY: c.env.OPENAI_API_KEY, OPENAI_ADVISOR_MODEL: c.env.OPENAI_ADVISOR_MODEL },
+            voiceRow.voice_id,
+            "arena_completed",
+            { linked_ids: { session_id: result.sessionId } },
+          ).catch(err => console.error("Research loop failed (vote):", err)),
+        );
       }
     }
 
@@ -496,6 +379,15 @@ app.post("/sessions/:sessionId/complete", async (c) => {
       calibrateFromArenaData(c.env.DB, session.voice_id)
         .then(cal => publishCalibration(c.env.DB, session.voice_id, cal))
         .catch(err => console.error("Auto-calibrate failed (complete):", err)),
+    );
+    c.executionCtx.waitUntil(
+      maybeAdvanceResearchLoop(
+        c.env.DB,
+        { OPENAI_API_KEY: c.env.OPENAI_API_KEY, OPENAI_ADVISOR_MODEL: c.env.OPENAI_ADVISOR_MODEL },
+        session.voice_id,
+        "arena_completed",
+        { linked_ids: { session_id: sessionId } },
+      ).catch(err => console.error("Research loop failed (complete):", err)),
     );
 
     const updated = await getArenaSession(c.env.DB, sessionId);

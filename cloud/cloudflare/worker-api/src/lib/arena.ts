@@ -7,6 +7,11 @@ import type {
   ArenaCandidateSource,
   VoiceSettings,
 } from "../types";
+import {
+  createArenaCandidate,
+  createArenaMatch,
+  createArenaSession,
+} from "./d1";
 import { computeRankingScore, passesValidationGate, passesHardSafetyGate, grayZoneRescue, type CheckpointScores, type ValidationWeights } from "./training-domain";
 import { loadEffectiveWeights } from "./arena-calibration";
 
@@ -560,4 +565,150 @@ export async function finalizeSession(
   }
 
   await db.batch(stmts);
+}
+
+export interface BootstrapArenaInput {
+  voiceId: string;
+  testTexts: string[];
+  seed: number;
+  settings: VoiceSettings;
+}
+
+export interface BootstrapArenaResult {
+  session: ArenaSession;
+  candidates: ArenaCandidate[];
+  matches: ArenaMatch[];
+}
+
+export async function bootstrapArenaSession(
+  db: D1Database,
+  input: BootstrapArenaInput,
+): Promise<BootstrapArenaResult | null> {
+  const { candidates: assembled, algorithm } = await assembleArenaCandidates(db, input.voiceId);
+  if (assembled.length < 2) {
+    return null;
+  }
+
+  const now = Date.now();
+  const sessionId = crypto.randomUUID();
+  const totalRounds = computeTotalRounds(assembled.length, algorithm);
+
+  const session: ArenaSession = {
+    session_id: sessionId,
+    voice_id: input.voiceId,
+    status: "assembling",
+    algorithm,
+    current_round: 1,
+    total_rounds: totalRounds,
+    test_texts: input.testTexts,
+    seed: input.seed,
+    settings: input.settings,
+    ranking: {},
+    winner_candidate_id: null,
+    promoted: false,
+    notes: null,
+    created_at: now,
+    completed_at: null,
+  };
+
+  const candidateRecords: ArenaCandidate[] = assembled.map((ac, idx) => ({
+    candidate_id: crypto.randomUUID(),
+    session_id: sessionId,
+    voice_id: input.voiceId,
+    checkpoint_r2_prefix: ac.checkpoint_r2_prefix,
+    job_id: ac.job_id,
+    run_name: ac.run_name,
+    epoch: ac.epoch,
+    source: ac.source,
+    seed_rank: idx + 1,
+    final_rank: null,
+    wins: 0,
+    losses: 0,
+    ties: 0,
+    bye_count: 0,
+    buchholz: 0,
+    retention_status: "active",
+    auto_scores: ac.auto_scores,
+    created_at: now,
+    eliminated_at: null,
+  }));
+
+  const matchRecords: ArenaMatch[] = [];
+  if (algorithm === "round_robin") {
+    const pairs = generateRoundRobinSchedule(
+      candidateRecords.map((cr) => cr.candidate_id),
+      input.testTexts.length,
+    );
+    for (const p of pairs) {
+      matchRecords.push({
+        match_id: crypto.randomUUID(),
+        session_id: sessionId,
+        round_number: 1,
+        candidate_a_id: p.a,
+        candidate_b_id: p.b,
+        display_order: p.displayOrder,
+        text_index: p.textIndex,
+        audio_a_r2_key: null,
+        audio_b_r2_key: null,
+        winner: null,
+        confidence: null,
+        replay_count_a: 0,
+        replay_count_b: 0,
+        created_at: now,
+        voted_at: null,
+      });
+    }
+  } else {
+    const standings = candidateRecords.map((cr) => ({
+      candidate_id: cr.candidate_id,
+      wins: 0,
+      losses: 0,
+      ties: 0,
+      bye_count: 0,
+      buchholz: 0,
+    }));
+    const { pairs, byeCandidateId } = generateSwissPairings(standings, 1, [], input.testTexts.length);
+
+    if (byeCandidateId) {
+      const byeCandidate = candidateRecords.find((cr) => cr.candidate_id === byeCandidateId);
+      if (byeCandidate) {
+        byeCandidate.wins = 1;
+        byeCandidate.bye_count = 1;
+      }
+    }
+
+    for (const p of pairs) {
+      matchRecords.push({
+        match_id: crypto.randomUUID(),
+        session_id: sessionId,
+        round_number: 1,
+        candidate_a_id: p.a,
+        candidate_b_id: p.b,
+        display_order: p.displayOrder,
+        text_index: p.textIndex,
+        audio_a_r2_key: null,
+        audio_b_r2_key: null,
+        winner: null,
+        confidence: null,
+        replay_count_a: 0,
+        replay_count_b: 0,
+        created_at: now,
+        voted_at: null,
+      });
+    }
+  }
+
+  await createArenaSession(db, session);
+  for (const candidate of candidateRecords) {
+    await createArenaCandidate(db, candidate);
+  }
+  for (const match of matchRecords) {
+    await createArenaMatch(db, match);
+  }
+
+  return {
+    session,
+    candidates: candidateRecords,
+    matches: matchRecords,
+  };
 }
