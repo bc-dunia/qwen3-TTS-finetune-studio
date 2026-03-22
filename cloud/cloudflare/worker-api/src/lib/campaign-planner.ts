@@ -16,7 +16,7 @@
  *   exploratory  = 25% exploit / 35% repair / 40% explore
  */
 
-import type { TrainingConfig, TrainingJob, Voice, TrainingCampaign } from '../types';
+import type { TrainingConfig, TrainingJob, Voice, TrainingCampaign, StrategyBrief, ResearchBottleneck } from '../types';
 import { buildTrainingCheckoutSearch } from './training-checkout';
 import { sanitizeConfig } from './training-advisor';
 import { readNumber as readNum, clamp } from './training-domain';
@@ -723,10 +723,57 @@ function generateExploreCandidate(
 // Assign lanes based on direction and open slots
 // ---------------------------------------------------------------------------
 
+function applyBottleneckBias(
+  weights: Record<StrategyLane, number>,
+  bottleneck: ResearchBottleneck,
+  calibrationAlpha?: number,
+): Record<StrategyLane, number> {
+  const w = { ...weights };
+  if (!bottleneck) return w;
+
+  // Dataset/ASR issues → repair lane knows how to address these
+  if (bottleneck === 'dataset_quality' || bottleneck === 'asr') {
+    w.repair = Math.min(w.repair + 0.15, 0.55);
+    w.exploit = Math.max(w.exploit - 0.10, 0.15);
+    w.explore = Math.max(w.explore - 0.05, 0.05);
+  }
+  // Specific metric bottleneck → exploit lane can target it with focused perturbation
+  else if (bottleneck === 'tone' || bottleneck === 'speed' || bottleneck === 'speaker' || bottleneck === 'style') {
+    w.exploit = Math.min(w.exploit + 0.10, 0.70);
+    w.repair = Math.max(w.repair - 0.05, 0.10);
+    w.explore = Math.max(w.explore - 0.05, 0.05);
+  }
+  // Overall weakness → explore different approaches
+  else if (bottleneck === 'overall') {
+    w.explore = Math.min(w.explore + 0.10, 0.50);
+    w.exploit = Math.max(w.exploit - 0.10, 0.15);
+  }
+  // balanced = improving steadily, no special bias needed
+
+  // High calibration alpha means good signal quality — lean into exploit
+  if (typeof calibrationAlpha === 'number' && calibrationAlpha > 0.4) {
+    const exploitBoost = Math.min(calibrationAlpha * 0.08, 0.06);
+    w.exploit = Math.min(w.exploit + exploitBoost, 0.75);
+    w.explore = Math.max(w.explore - exploitBoost, 0.05);
+  }
+
+  // Normalize so weights sum to ~1.0
+  const total = w.exploit + w.repair + w.explore;
+  if (total > 0) {
+    w.exploit /= total;
+    w.repair /= total;
+    w.explore /= total;
+  }
+
+  return w;
+}
+
 function assignLanes(
   direction: CampaignDirection,
   slotsToFill: number,
   phase: CampaignPhase,
+  bottleneckHint?: ResearchBottleneck,
+  calibrationAlpha?: number,
 ): StrategyLane[] {
   if (slotsToFill === 0) return [];
 
@@ -747,6 +794,11 @@ function assignLanes(
   } else if (phase === 'infeasible') {
     // Stop wasting money
     return [];
+  }
+
+  // Apply research controller bottleneck bias when available
+  if (bottleneckHint) {
+    effectiveWeights = applyBottleneckBias(effectiveWeights, bottleneckHint, calibrationAlpha);
   }
 
   // For 1 slot: pick highest weight lane
@@ -784,6 +836,7 @@ export function planCampaignAttempts(
   allVoiceJobs: TrainingJob[],
   slotsToFill: number,
   nextAttemptIndex: number,
+  strategyBrief?: StrategyBrief,
 ): PlannerResult {
   const direction: CampaignDirection =
     (campaign.planner_state?.direction as CampaignDirection) ?? 'balanced';
@@ -831,7 +884,13 @@ export function planCampaignAttempts(
     }
   }
 
-  const lanes = assignLanes(direction, slotsToFill, phase);
+  const lanes = assignLanes(
+    direction,
+    slotsToFill,
+    phase,
+    strategyBrief?.bottleneck,
+    strategyBrief?.calibration_insights?.alpha,
+  );
   const candidates: PlannerCandidate[] = [];
   const usedConfigs: Array<{ lr: number; epochs: number; subtalker: number }> = [];
 
@@ -978,6 +1037,7 @@ export function planCampaignAttempts(
       blocked_families: [...blockedFamilies],
       family_stats: Object.fromEntries([...familyStats.entries()].map(([k, v]) => [k, v])),
       near_miss_signals: nearMissSignals,
+      strategy_brief: strategyBrief ?? null,
       updated_at: Date.now(),
     },
   };
@@ -1162,6 +1222,24 @@ export function buildLLMPlannerPrompt(input: LLMPlannerInput): string {
     );
   }
   lines.push('');
+
+  const brief = heuristicResult.state_patch.strategy_brief as StrategyBrief | null | undefined;
+  if (brief) {
+    lines.push('## Research Controller Context');
+    if (brief.bottleneck) lines.push(`Bottleneck: ${brief.bottleneck}`);
+    if (brief.calibration_insights) {
+      lines.push(`Calibration: alpha=${brief.calibration_insights.alpha.toFixed(2)} state=${brief.calibration_insights.state} both_bad=${brief.calibration_insights.both_bad_rate.toFixed(2)}`);
+    }
+    if (brief.dataset_flags.length > 0) lines.push(`Flags: ${brief.dataset_flags.join(', ')}`);
+    if (brief.arena_winner_patterns) lines.push(`Arena winners: ${brief.arena_winner_patterns}`);
+    if (brief.lessons.length > 0) {
+      lines.push('Lessons:');
+      for (const lesson of brief.lessons.slice(0, 5)) {
+        lines.push(`  [${lesson.confidence}] ${lesson.lesson} (evidence=${lesson.evidence_count})`);
+      }
+    }
+    lines.push('');
+  }
 
   lines.push(
     `Generate ${input.slotsToFill} candidate configs that are meaningfully different from each other.`,
