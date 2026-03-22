@@ -460,3 +460,131 @@ export interface CalibrationResult {
     }>;
   };
 }
+
+export type ResearchTrigger =
+  | "campaign_completed"
+  | "arena_completed"
+  | "calibration_updated"
+  | "manual"
+  | "round_completed";
+
+export type ResearchBottleneck =
+  | "tone"
+  | "asr"
+  | "speed"
+  | "speaker"
+  | "style"
+  | "overall"
+  | "dataset_quality"
+  | "balanced"
+  | null;
+
+export type ResearchActionType =
+  | "train"
+  | "start_arena"
+  | "request_dataset_review"
+  | "propose_scoring_change"
+  | "hold";
+
+export type AutonomyMode = "supervised" | "semi_auto" | "auto";
+
+export interface StableLesson {
+  lesson: string;
+  confidence: "low" | "medium" | "high";
+  evidence_count: number;
+  created_at: number;
+  expires_at: number | null;
+}
+
+export interface CalibrationSummary {
+  alpha: number;
+  state: CalibrationState;
+  biggest_shifts: Record<string, number>;
+  both_bad_rate: number;
+  matchup_count: number;
+  accuracy: number;
+}
+
+export interface StrategyBrief {
+  bottleneck: ResearchBottleneck;
+  calibration_insights: CalibrationSummary | null;
+  dataset_flags: string[];
+  lessons: StableLesson[];
+  arena_winner_patterns: string | null;
+}
+
+export interface VoiceResearchState {
+  voice_id: string;
+  cycle_count: number;
+  current_bottleneck: ResearchBottleneck;
+  active_hypothesis: string | null;
+  stable_lessons: StableLesson[];
+  pending_action: ResearchActionType | null;
+  pending_action_params: Record<string, unknown> | null;
+  dataset_snapshot_id: string | null;
+  calibration_summary: CalibrationSummary | null;
+  scoring_policy_version: number;
+  autonomy_mode: AutonomyMode;
+  last_retrospective: Record<string, unknown> | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface VoiceResearchJournal {
+  entry_id: string;
+  voice_id: string;
+  cycle_id: number;
+  trigger: ResearchTrigger;
+  linked_ids: {
+    round_id?: string;
+    campaign_id?: string;
+    session_id?: string;
+    snapshot_id?: string;
+  } | null;
+  observations: string;
+  hypothesis: string | null;
+  decision: ResearchActionType;
+  decision_params: Record<string, unknown> | null;
+  expected_signal: string | null;
+  outcome: string | null;
+  confidence: "low" | "medium" | "high";
+  created_at: number;
+}
+
+export interface ResearchSnapshot {
+  voice: Voice;
+  state: VoiceResearchState | null;
+  recentJournal: VoiceResearchJournal[];
+  calibrationSummary: CalibrationSummary | null;
+  recentJobs: Array<{
+    job_id: string;
+    status: string;
+    config: TrainingConfig;
+    score: number | null;
+    failure_reason: string | null;
+    created_at: number;
+  }>;
+  arenaHistory: Array<{
+    session_id: string;
+    status: string;
+    winner_run_name: string | null;
+    ranking: Array<{ rank: number; candidate_id: string; wins: number }>;
+    completed_at: number | null;
+  }>;
+  championScore: number | null;
+}
+
+export interface Retrospective {
+  observations: string[];
+  hypothesis_update: "maintain" | "revise" | "discard" | "new";
+  new_hypothesis: string | null;
+  lesson: string | null;
+  bottleneck_diagnosis: ResearchBottleneck;
+  confidence: "low" | "medium" | "high";
+}
+
+export interface ResearchAction {
+  type: ResearchActionType;
+  params: Record<string, unknown>;
+  reasoning: string;
+}
