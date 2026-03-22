@@ -20,6 +20,8 @@ import type {
   TrainingProgress,
   TrainingRound,
   Voice,
+  VoiceResearchJournal,
+  VoiceResearchState,
   VoiceSettings,
 } from "../types";
 
@@ -2381,5 +2383,265 @@ export const upsertArenaCalibrationOverride = async (
       override.created_at,
       override.updated_at,
     )
+    .run();
+};
+
+type DbVoiceResearchStateRow = {
+  voice_id: string;
+  cycle_count: number;
+  current_bottleneck: string | null;
+  active_hypothesis: string | null;
+  stable_lessons_json: string | null;
+  pending_action: string | null;
+  pending_action_params_json: string | null;
+  dataset_snapshot_id: string | null;
+  calibration_summary_json: string | null;
+  scoring_policy_version: number;
+  autonomy_mode: string;
+  last_retrospective_json: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+type DbVoiceResearchJournalRow = {
+  entry_id: string;
+  voice_id: string;
+  cycle_id: number;
+  trigger: string;
+  linked_ids_json: string | null;
+  observations: string;
+  hypothesis: string | null;
+  decision: string;
+  decision_params_json: string | null;
+  expected_signal: string | null;
+  outcome: string | null;
+  confidence: string;
+  created_at: number;
+};
+
+const mapVoiceResearchState = (row: DbVoiceResearchStateRow): VoiceResearchState => ({
+  voice_id: row.voice_id,
+  cycle_count: row.cycle_count,
+  current_bottleneck: row.current_bottleneck as VoiceResearchState["current_bottleneck"],
+  active_hypothesis: row.active_hypothesis,
+  stable_lessons: parseJson<VoiceResearchState["stable_lessons"]>(row.stable_lessons_json, []),
+  pending_action: row.pending_action as VoiceResearchState["pending_action"],
+  pending_action_params: parseJson<Record<string, unknown> | null>(row.pending_action_params_json, null),
+  dataset_snapshot_id: row.dataset_snapshot_id,
+  calibration_summary: parseJson<VoiceResearchState["calibration_summary"]>(row.calibration_summary_json, null),
+  scoring_policy_version: row.scoring_policy_version,
+  autonomy_mode: row.autonomy_mode as VoiceResearchState["autonomy_mode"],
+  last_retrospective: parseJson<Record<string, unknown> | null>(row.last_retrospective_json, null),
+  created_at: row.created_at,
+  updated_at: row.updated_at,
+});
+
+const mapVoiceResearchJournal = (row: DbVoiceResearchJournalRow): VoiceResearchJournal => ({
+  entry_id: row.entry_id,
+  voice_id: row.voice_id,
+  cycle_id: row.cycle_id,
+  trigger: row.trigger as VoiceResearchJournal["trigger"],
+  linked_ids: parseJson<VoiceResearchJournal["linked_ids"]>(row.linked_ids_json, null),
+  observations: row.observations,
+  hypothesis: row.hypothesis,
+  decision: row.decision as VoiceResearchJournal["decision"],
+  decision_params: parseJson<Record<string, unknown> | null>(row.decision_params_json, null),
+  expected_signal: row.expected_signal,
+  outcome: row.outcome,
+  confidence: row.confidence as VoiceResearchJournal["confidence"],
+  created_at: row.created_at,
+});
+
+export const getVoiceResearchState = async (
+  db: D1Database,
+  voiceId: string,
+): Promise<VoiceResearchState | null> => {
+  const row = await db
+    .prepare("SELECT * FROM voice_research_state WHERE voice_id = ? LIMIT 1")
+    .bind(voiceId)
+    .first<DbVoiceResearchStateRow>();
+
+  return row ? mapVoiceResearchState(row) : null;
+};
+
+export const upsertVoiceResearchState = async (
+  db: D1Database,
+  state: VoiceResearchState,
+): Promise<void> => {
+  await db
+    .prepare(
+      `INSERT INTO voice_research_state (
+        voice_id, cycle_count, current_bottleneck, active_hypothesis,
+        stable_lessons_json, pending_action, pending_action_params_json,
+        dataset_snapshot_id, calibration_summary_json, scoring_policy_version,
+        autonomy_mode, last_retrospective_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(voice_id) DO UPDATE SET
+        cycle_count = excluded.cycle_count,
+        current_bottleneck = excluded.current_bottleneck,
+        active_hypothesis = excluded.active_hypothesis,
+        stable_lessons_json = excluded.stable_lessons_json,
+        pending_action = excluded.pending_action,
+        pending_action_params_json = excluded.pending_action_params_json,
+        dataset_snapshot_id = excluded.dataset_snapshot_id,
+        calibration_summary_json = excluded.calibration_summary_json,
+        scoring_policy_version = excluded.scoring_policy_version,
+        autonomy_mode = excluded.autonomy_mode,
+        last_retrospective_json = excluded.last_retrospective_json,
+        updated_at = excluded.updated_at`
+    )
+    .bind(
+      state.voice_id,
+      state.cycle_count,
+      state.current_bottleneck,
+      state.active_hypothesis,
+      JSON.stringify(state.stable_lessons),
+      state.pending_action,
+      state.pending_action_params ? JSON.stringify(state.pending_action_params) : null,
+      state.dataset_snapshot_id,
+      state.calibration_summary ? JSON.stringify(state.calibration_summary) : null,
+      state.scoring_policy_version,
+      state.autonomy_mode,
+      state.last_retrospective ? JSON.stringify(state.last_retrospective) : null,
+      state.created_at,
+      state.updated_at,
+    )
+    .run();
+};
+
+export const listVoiceResearchJournal = async (
+  db: D1Database,
+  voiceId: string,
+  limit = 20,
+): Promise<VoiceResearchJournal[]> => {
+  const pageSize = Math.max(1, Math.min(limit, 200));
+  const result = await db
+    .prepare(
+      `SELECT * FROM voice_research_journal
+       WHERE voice_id = ?
+       ORDER BY cycle_id DESC, created_at DESC
+       LIMIT ?`
+    )
+    .bind(voiceId, pageSize)
+    .all<DbVoiceResearchJournalRow>();
+
+  return (result.results ?? []).map(mapVoiceResearchJournal);
+};
+
+export const appendVoiceResearchJournal = async (
+  db: D1Database,
+  entry: VoiceResearchJournal,
+): Promise<void> => {
+  await db
+    .prepare(
+      `INSERT INTO voice_research_journal (
+        entry_id, voice_id, cycle_id, trigger, linked_ids_json,
+        observations, hypothesis, decision, decision_params_json,
+        expected_signal, outcome, confidence, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      entry.entry_id,
+      entry.voice_id,
+      entry.cycle_id,
+      entry.trigger,
+      entry.linked_ids ? JSON.stringify(entry.linked_ids) : null,
+      entry.observations,
+      entry.hypothesis,
+      entry.decision,
+      entry.decision_params ? JSON.stringify(entry.decision_params) : null,
+      entry.expected_signal,
+      entry.outcome,
+      entry.confidence,
+      entry.created_at,
+    )
+    .run();
+};
+
+export const casUpsertVoiceResearchState = async (
+  db: D1Database,
+  state: VoiceResearchState,
+  expectedUpdatedAt: number | null,
+): Promise<boolean> => {
+  if (expectedUpdatedAt === null) {
+    const insertResult = await db
+      .prepare(
+        `INSERT OR IGNORE INTO voice_research_state (
+          voice_id, cycle_count, current_bottleneck, active_hypothesis,
+          stable_lessons_json, pending_action, pending_action_params_json,
+          dataset_snapshot_id, calibration_summary_json, scoring_policy_version,
+          autonomy_mode, last_retrospective_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        state.voice_id,
+        state.cycle_count,
+        state.current_bottleneck,
+        state.active_hypothesis,
+        JSON.stringify(state.stable_lessons),
+        state.pending_action,
+        state.pending_action_params ? JSON.stringify(state.pending_action_params) : null,
+        state.dataset_snapshot_id,
+        state.calibration_summary ? JSON.stringify(state.calibration_summary) : null,
+        state.scoring_policy_version,
+        state.autonomy_mode,
+        state.last_retrospective ? JSON.stringify(state.last_retrospective) : null,
+        state.created_at,
+        state.updated_at,
+      )
+      .run();
+    return (insertResult.meta.changes ?? 0) > 0;
+  }
+
+  const result = await db
+    .prepare(
+      `UPDATE voice_research_state SET
+        cycle_count = ?, current_bottleneck = ?, active_hypothesis = ?,
+        stable_lessons_json = ?, pending_action = ?, pending_action_params_json = ?,
+        dataset_snapshot_id = ?, calibration_summary_json = ?, scoring_policy_version = ?,
+        autonomy_mode = ?, last_retrospective_json = ?, updated_at = ?
+       WHERE voice_id = ? AND updated_at = ?`
+    )
+    .bind(
+      state.cycle_count,
+      state.current_bottleneck,
+      state.active_hypothesis,
+      JSON.stringify(state.stable_lessons),
+      state.pending_action,
+      state.pending_action_params ? JSON.stringify(state.pending_action_params) : null,
+      state.dataset_snapshot_id,
+      state.calibration_summary ? JSON.stringify(state.calibration_summary) : null,
+      state.scoring_policy_version,
+      state.autonomy_mode,
+      state.last_retrospective ? JSON.stringify(state.last_retrospective) : null,
+      state.updated_at,
+      state.voice_id,
+      expectedUpdatedAt,
+    )
+    .run();
+
+  return (result.meta.changes ?? 0) > 0;
+};
+
+export const updateResearchStateAutonomy = async (
+  db: D1Database,
+  voiceId: string,
+  mode: VoiceResearchState["autonomy_mode"],
+): Promise<boolean> => {
+  const result = await db
+    .prepare("UPDATE voice_research_state SET autonomy_mode = ?, updated_at = ? WHERE voice_id = ?")
+    .bind(mode, Date.now(), voiceId)
+    .run();
+  return (result.meta.changes ?? 0) > 0;
+};
+
+export const updateJournalOutcome = async (
+  db: D1Database,
+  entryId: string,
+  outcome: string,
+): Promise<void> => {
+  await db
+    .prepare("UPDATE voice_research_journal SET outcome = ? WHERE entry_id = ?")
+    .bind(outcome, entryId)
     .run();
 };
