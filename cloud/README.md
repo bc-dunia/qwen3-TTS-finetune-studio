@@ -136,9 +136,9 @@ Every checkpoint produced by a training job is scored against a set of evaluatio
 | ASR similarity | 0.82 | Hard |
 | Speaker similarity | 0.78 | Hard |
 | Health score | 0.72 | Hard |
-| Tone similarity | 0.50 | Soft (ranking only when arena calibration is active) |
+| Tone similarity | 0.50 | Soft (gate skipped when style_score is present) |
 | Style similarity | 0.55 | Soft |
-| Speed similarity | 0.15 | Soft |
+| Speed similarity | 0.15 | Soft (gate skipped when style_score is present) |
 | Overall score | 0.80 | Soft |
 | Duration accuracy | 0.50 | Soft |
 
