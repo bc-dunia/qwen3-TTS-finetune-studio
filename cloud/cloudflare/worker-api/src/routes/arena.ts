@@ -86,7 +86,7 @@ app.post("/sessions", async (c) => {
       return c.json({ detail: { message: "Need at least 2 candidates" } }, 400);
     }
 
-    return c.json(result, 201);
+    return c.json({ ...result.session, candidates: result.candidates, matches: result.matches }, 201);
   } catch (err) {
     console.error("POST /sessions error:", err);
     return c.json({ detail: { message: err instanceof Error ? err.message : "Internal server error" } }, 500);
