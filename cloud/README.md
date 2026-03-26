@@ -1,10 +1,10 @@
 # Qwen3-TTS Studio — Cloud Deployment
 
-Cloud-native voice cloning platform built on Cloudflare and RunPod. The Worker API exposes an ElevenLabs-compatible REST interface backed by a React dashboard, with training fully automated through a 3-layer auto-adjusting algorithm that runs multi-attempt campaigns without manual intervention. Training jobs are queued, dispatched, and scored automatically; the system picks the best checkpoint and advances or terminates the campaign based on quality signals.
+Voice cloning on Cloudflare and RunPod. The Worker API is ElevenLabs-compatible; a React dashboard drives a 3-layer autopilot that runs, scores, and advances multi-attempt training campaigns without manual intervention.
 
 **Key capabilities:**
 
-- ElevenLabs-compatible API — drop-in replacement for any ElevenLabs SDK client
+- ElevenLabs-compatible API — drop-in for any ElevenLabs SDK client
 - Autopilot campaign system with goal-first UI (get first checkpoint / improve best score / fix failed campaign)
 - 3-layer auto-adjustment: heuristic advisor, LLM advisor (gpt-5.4), and 3-lane campaign planner
 - Gated weighted checkpoint scoring (ASR, speaker similarity, tone, speed, health)
@@ -35,17 +35,15 @@ Cloudflare Workers (Hono API — ElevenLabs-compatible)
 - **D1** — SQLite-backed relational store for voices, training jobs, campaigns, and checkpoint scores
 - **KV** — TTS audio cache keyed by voice + text hash
 - **RunPod Training Pods** — on-demand GPU pods launched per training job via the RunPod API
-- **RunPod Serverless** — always-available (scale-to-zero) inference endpoint for TTS generation
+- **RunPod Serverless** — scale-to-zero inference endpoint for TTS generation
 
 ---
 
 ## Training Pipeline
 
-The training pipeline is the core of the cloud product. It covers everything from dataset upload through checkpoint scoring and campaign progression.
-
 ### Autopilot Campaign System
 
-A campaign is a multi-attempt training plan for a single voice. Instead of configuring hyperparameters directly, the user picks a goal:
+A campaign is a multi-attempt training plan for a single voice. The user picks a goal:
 
 | Goal | Direction | Behavior |
 |------|-----------|----------|
@@ -53,7 +51,7 @@ A campaign is a multi-attempt training plan for a single voice. Instead of confi
 | Improve best score | `conservative` | Favor proven presets and stable quality |
 | Fix failed campaign | `exploratory` | Search aggressively for better checkpoints |
 
-The direction maps to lane weights in the campaign planner (see below). Campaigns have an attempt budget (1-12) and a parallelism setting that controls how many jobs run concurrently within the campaign.
+The direction maps to lane weights in the campaign planner (see below). Campaigns have an attempt budget (1-12) and a parallelism setting for concurrent jobs.
 
 **Campaign state machine:**
 
@@ -86,11 +84,11 @@ Analyzes job history and emits one of six modes:
 
 **Layer 2: LLM Advisor (`training-advisor-llm.ts`)**
 
-Calls gpt-5.4 with `reasoning: { effort: "high" }` to produce a richer analysis of job history and recommend the next config. Falls back to the heuristic advisor if the LLM call fails or returns invalid JSON.
+Calls gpt-5.4 with `reasoning: { effort: "high" }` for richer analysis and config recommendation. Falls back to the heuristic advisor on failure or invalid JSON.
 
 **Layer 3: Campaign Planner (`campaign-planner.ts`)**
 
-Generates concrete training configs using a 3-lane strategy. Each lane targets a different part of the search space:
+Generates training configs using a 3-lane strategy:
 
 | Lane | Purpose |
 |------|---------|
@@ -115,11 +113,11 @@ Lane weights by direction:
 | `exploiting` | At least one passing checkpoint exists | Shifts toward exploit |
 | `infeasible` | Budget exhausted, no passing checkpoint | Campaign terminates |
 
-The planner also tracks exclusion zones (configs that have already been tried), family blocking (avoid configs too similar to known failures), and near-miss signals (configs that almost passed the gate).
+The planner tracks exclusion zones (already-tried configs), family blocking (avoid configs similar to known failures), and near-miss signals (configs that almost passed the gate).
 
 ### Quality Validation (Checkpoint Scoring)
 
-Every checkpoint is scored against a set of evaluation samples using a two-stage pipeline: a **gate** (pass/fail) followed by **ranking** (weighted score) for checkpoints that pass. All seven metrics are evaluated independently — no metric suppresses or substitutes for another.
+Every checkpoint runs through a two-stage pipeline: a **gate** (pass/fail) then **ranking** (weighted score). All seven metrics are independent.
 
 **Hard safety gates** — applied before all other checks; never bypassed by calibration:
 
@@ -142,7 +140,7 @@ Every checkpoint is scored against a set of evaluation samples using a two-stage
 | Overall score | 0.80 | Soft |
 | Duration accuracy | 0.50 | Soft |
 
-**Ranking weights** — applied after gate passage to rank checkpoints. When arena calibration is `active`, these are blended with learned weights from human preference data:
+**Ranking weights** — applied after gate passage. Blended with learned weights when arena calibration is `active`:
 
 | Metric | Default Weight |
 |--------|---------------|
@@ -164,8 +162,6 @@ Every checkpoint is scored against a set of evaluation samples using a two-stage
 
 ### Queue Management
 
-The queue system coordinates job dispatch across all voices and campaigns.
-
 - **Global limit:** 3 concurrent pods (`MAX_CONCURRENT_PODS`)
 - **Per-voice limit:** 1 active job by default, with spillover to idle global capacity when no other voices are queued
 - **Priority tiers:** manual runs > first-checkpoint campaigns > improvement campaigns
@@ -178,7 +174,7 @@ The queue system coordinates job dispatch across all voices and campaigns.
 
 ## Training Domain Module (`training-domain.ts`)
 
-`cloud/cloudflare/worker-api/src/lib/training-domain.ts` is the single source of truth for all training configuration. Every other module imports from here.
+`cloud/cloudflare/worker-api/src/lib/training-domain.ts` — single source of truth for training configuration; all other modules import from here.
 
 **Contents:**
 
@@ -200,7 +196,7 @@ The queue system coordinates job dispatch across all voices and campaigns.
 
 ## Frontend Architecture
 
-The React SPA is deployed to Cloudflare Pages. It uses React Router v7, Tailwind CSS v4 (CSS-first config via `@theme` directive), and a dark-first theme with full light mode support (`data-theme="light"`).
+React SPA on Cloudflare Pages. React Router v7, Tailwind CSS v4 (CSS-first via `@theme`), dark-first theme with light mode support (`data-theme="light"`).
 
 **Page routes:**
 
@@ -221,24 +217,24 @@ The React SPA is deployed to Cloudflare Pages. It uses React Router v7, Tailwind
 
 **Key components:**
 
-- `AutopilotPanel` — unified goal-first training interface. Merges the former `AutopilotCard` and `TrainingAdviceCard` into a single component. Exposes goal selector (first checkpoint / improve score / fix failed), attempt count, parallelism, and base config overrides.
-- `TrainingJobRow` — single job status row with live progress
+- `AutopilotPanel` — goal-first training interface; merges `AutopilotCard` + `TrainingAdviceCard`. Goal selector, attempt count, parallelism, and base config overrides.
+- `TrainingJobRow` — live job progress row
 - `TrainingHistoryList` — paginated job history with checkpoint scores
-- `QueuePage` — global queue view showing real pod capacity and per-voice queue depth
-- `VoiceCompare` — checkpoint comparison page decomposed into focused sub-components (see Compare Components below)
+- `QueuePage` — global queue view: pod capacity and per-voice depth
+- `VoiceCompare` — checkpoint comparison; see Compare Components below
 
 **Compare Components (`components/compare/`):**
 
-The checkpoint comparison page was refactored from a 1159-line monolith into composable sub-components:
+Refactored from a 1159-line monolith:
 
-- `DecisionHeader` — compact Trusted vs Recommended comparison header with score bands and one-line comparison summary
-- `ComparisonSetupForm` — comparison text and seed always visible; stability/similarity/style/speed sliders and prompt controls collapse into an "Advanced Settings" accordion
+- `DecisionHeader` — Trusted vs Recommended header with score bands
+- `ComparisonSetupForm` — text + seed always visible; sliders and prompt controls collapse into Advanced Settings accordion
 - `CandidateGrid` — filterable grid (All / Passed / Rejected tabs) with quick-selection presets (Trusted + Recommended, Recommended + Rejected, Clear)
-- `CandidateCard` — dual-mode card: browse mode (selection, score band pill, role badges, validation message) and listening mode (AudioPlayer, trait bars, Apply button)
-- `ScoreBand` — visual score grade pill (Excellent / Strong / Borderline / Weak) replacing raw numeric display
+- `CandidateCard` — dual-mode: browse (selection, score band, role badges) and listening (AudioPlayer, trait bars, Apply)
+- `ScoreBand` — score grade pill (Excellent / Strong / Borderline / Weak)
 - `TraitBars` — horizontal mini-bars for style, tone, and speed sub-scores
 - `CompareTray` — sticky bottom bar showing selected checkpoint chips with a Generate CTA
-- `RecommendationBanner` — post-generation decision support comparing trusted vs recommended scores with Promote / Keep Current actions
+- `RecommendationBanner` — trusted vs recommended with Promote / Keep Current actions
 - `RunDetailsDisclosure` — collapsible expert-detail panel (run IDs, epochs, timestamps, raw scores)
 
 ---
@@ -569,7 +565,7 @@ with open("output.wav", "wb") as f:
 
 ### Single Training Job
 
-Launches one training job immediately with explicit config overrides. Useful for manual experimentation or when you know exactly what config to run.
+One job with explicit config overrides. Use for manual experimentation.
 
 ```bash
 curl -X POST "https://qwen-tts-api.brian-367.workers.dev/v1/training/start" \
@@ -592,7 +588,7 @@ curl -X POST "https://qwen-tts-api.brian-367.workers.dev/v1/training/start" \
 
 ### Autopilot Campaign
 
-Creates a multi-attempt training plan. Campaign state is tracked in D1 and progressed by the cron sweep and `waitUntil` callbacks. The 3-layer advisor system selects configs for each round automatically.
+Multi-attempt training plan; state tracked in D1, progressed by the cron sweep and `waitUntil` callbacks. The 3-layer advisor selects configs per round.
 
 ```bash
 curl -X POST "https://qwen-tts-api.brian-367.workers.dev/v1/training/campaigns" \
@@ -706,15 +702,15 @@ curl -X POST "https://qwen-tts-api.brian-367.workers.dev/v1/training/campaigns/C
 
 ## Voice Arena
 
-The Voice Arena is a blind A/B tournament system for comparing TTS checkpoints using human preference. Instead of relying solely on automated scores, users listen to anonymized audio samples and vote on which sounds better.
+Blind A/B tournament for comparing TTS checkpoints via human preference. Users listen to anonymized samples and vote.
 
 ### How It Works
 
-1. **Start Arena** — assembles candidates from the voice's current champion, previously carried 2nd/3rd place checkpoints, and new checkpoints from recent training jobs
+1. **Start Arena** — assembles candidates: current champion, carried 2nd/3rd, and new checkpoints from recent jobs
 2. **Audio Generation** — fires async RunPod TTS requests for every candidate × test text combination; frontend polls for progress
-3. **Blind Voting** — candidates are shuffled into pairwise matches; the user hears "Sample 1" vs "Sample 2" without knowing which checkpoint produced each. Four vote options: Sample 1, Sample 2, Tie, or Both Bad
+3. **Blind Voting** — pairwise matches; "Sample 1" vs "Sample 2" with no labels. Four options: Sample 1, Sample 2, Tie, Both Bad
 4. **Tournament** — round-robin (≤6 candidates) or Swiss-system (>6 candidates) determines final rankings
-5. **Promote Winner** — the champion checkpoint is applied to the voice, becoming the base for future training
+5. **Promote Winner** — sets the arena winner as the voice's checkpoint
 
 ### Tournament Algorithms
 
@@ -748,7 +744,7 @@ Audio is generated asynchronously via RunPod serverless inference:
 
 ### Calibration Feedback Loop
 
-Arena results feed back into the training pipeline through an automatic calibration system. This reduces training waste by learning which automated scores actually predict human preference for each voice.
+Arena results feed back into the training pipeline via automatic calibration: logistic regression over human votes adjusts the ranking weights used to score and rank checkpoints.
 
 **What it learns:** logistic regression over score deltas (ASR, speaker, style, tone, speed, overall, duration) weighted by vote confidence. Adjacent-rank pseudo-pairs from final standings contribute weak signal (weight 0.25).
 
@@ -793,15 +789,13 @@ Note: when `style_score` is absent from the scoring payload, `computeRankingScor
 
 ### How Arena Results Affect Training
 
-The calibration feedback loop connects arena outcomes to the training pipeline through these mechanisms:
+1. **Ranking weights** — when `active`, `computeRankingScore()` uses blended weights. Affects candidate assembly and checkpoint selection.
 
-1. **Ranking weights** — when calibration is `active`, `computeRankingScore()` uses blended weights instead of hardcoded defaults. This changes which checkpoints are ranked higher during candidate assembly and checkpoint selection.
+2. **Gray-zone rescue** — when `canary` or `active`, checkpoints within 0.03 of one soft threshold can enter the arena if their blended score is high enough.
 
-2. **Gray-zone rescue** — when calibration is `canary` or `active`, checkpoints that barely miss one soft threshold (within 0.03) can enter the arena if their blended ranking score is high enough. Without calibration, these checkpoints would be silently discarded.
+3. **Champion promotion** — the winner's checkpoint becomes the voice's `checkpoint_r2_prefix`; the next training run inherits the human-validated baseline.
 
-3. **Champion promotion** — the arena winner's checkpoint becomes the voice's `checkpoint_r2_prefix`. The next training run uses this as the base, so the training pipeline inherits the human-validated quality signal.
-
-4. **Carry limits** — non-champion candidates that place 2nd/3rd in two consecutive arenas without improving are retired. This prevents stale checkpoints from occupying arena slots indefinitely, giving new training results more opportunities.
+4. **Carry limits** — candidates placing 2nd/3rd in two consecutive arenas without improving are retired, freeing slots for new checkpoints.
 
 ---
 
