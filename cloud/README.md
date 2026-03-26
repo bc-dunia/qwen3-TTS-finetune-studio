@@ -119,9 +119,9 @@ The planner also tracks exclusion zones (configs that have already been tried), 
 
 ### Quality Validation (Checkpoint Scoring)
 
-Every checkpoint produced by a training job is scored against a set of evaluation samples. Scoring uses a two-stage gated system with an optional calibration overlay from the Voice Arena.
+Every checkpoint is scored against a set of evaluation samples using a two-stage pipeline: a **gate** (pass/fail) followed by **ranking** (weighted score) for checkpoints that pass. All seven metrics are evaluated independently — no metric suppresses or substitutes for another.
 
-**Hard safety gates** — non-negotiable minimums that protect against broken checkpoints:
+**Hard safety gates** — applied before all other checks; never bypassed by calibration:
 
 | Metric | Minimum | Bypassed by calibration? |
 |--------|---------|--------------------------|
@@ -153,6 +153,8 @@ Every checkpoint produced by a training job is scored against a set of evaluatio
 | Speed | 0.05 |
 | Overall | 0.05 |
 | Duration | 0.05 |
+
+**Scoring design** — `style_score` is a prosody composite (spectral envelope + rhythm). `tone_score` measures pitch register match against the reference. `speed_score` measures speaking rate match against the reference profile. These are distinct signals: a high style score does not suppress tone or speed, and all seven weights always apply when the metric is present. When `style_score` is absent from the payload, `computeRankingScore` substitutes `tone * 0.6 + speed * 0.4` for the style slot as a fallback; tone and speed still contribute via their own weights regardless. Arena calibration adjusts the ranking weights via logistic regression over vote deltas, blended by alpha (0 below 10 matchups, 0.75 at 80+), with per-weight shift capped at ±0.10 per cycle.
 
 **ASR review (`review-asr.ts`)** — runs Whisper on generated audio and computes Levenshtein similarity against the target transcript.
 
@@ -785,7 +787,7 @@ shadow → canary → active
 | Hard safety | ASR ≥0.75, Speaker ≥0.70, Health ≥0.65 | Never bypassed, even by calibration |
 | Soft preference | tone, style, speed, duration, overall | Still causes rejection by default, but can be relaxed via gray-zone rescue when calibration is canary/active |
 
-Note: `tone`, `speed`, and `style` gate checks all apply independently. `computeRankingScore` uses `style_score` directly when available (falling back to `tone*0.6 + speed*0.4` when absent for the style weight), plus tone and speed always contribute via their own weights.
+Note: when `style_score` is absent from the scoring payload, `computeRankingScore` falls back to `tone * 0.6 + speed * 0.4` for the style weight slot; tone and speed still apply via their own weights regardless.
 
 **Global fallback chain** for calibrated weights: voice-specific → `__global__` → hardcoded defaults.
 
