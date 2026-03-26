@@ -3682,37 +3682,15 @@ const buildValidationScoreParts = ({
 }): Array<{ value: number; weight: number }> => {
   const hasStyle = typeof style === 'number' && Number.isFinite(style);
   const baseWeights = is06b
-    ? hasStyle
-      ? { asr: 0.25, health: 0.1, duration: 0.08, passRate: 0.08, speaker: 0.22, style: 0.27 }
-      : {
-          asr: 0.28,
-          health: 0.14,
-          duration: 0.1,
-          passRate: 0.1,
-          speaker: 0.24,
-          tone: 0.1,
-          speed: 0.04,
-        }
-    : hasStyle
-      ? {
-          asr: 0.22,
-          health: 0.08,
-          duration: 0.06,
-          passRate: 0.06,
-          speaker: 0.22,
-          style: 0.3,
-          stability: 0.06,
-        }
-      : {
-          asr: 0.22,
-          health: 0.12,
-          duration: 0.08,
-          passRate: 0.08,
-          speaker: 0.22,
-          tone: 0.18,
-          speed: 0.06,
-          stability: 0.04,
-        };
+    ? {
+        asr: 0.25, health: 0.10, duration: 0.08, passRate: 0.08,
+        speaker: 0.22, style: 0.17, tone: 0.06, speed: 0.04,
+      }
+    : {
+        asr: 0.22, health: 0.08, duration: 0.06, passRate: 0.06,
+        speaker: 0.22, style: 0.20, tone: 0.05, speed: 0.05,
+        stability: 0.06,
+      };
 
   const parts: Array<{ value: number; weight: number }> = [
     { value: asr, weight: baseWeights.asr },
@@ -3721,21 +3699,20 @@ const buildValidationScoreParts = ({
     { value: passRate, weight: baseWeights.passRate },
   ];
 
-  if (!is06b && 'stability' in baseWeights) {
-    parts.push({ value: overall, weight: (baseWeights as { stability: number }).stability });
+  if (!is06b && baseWeights.stability) {
+    parts.push({ value: overall, weight: baseWeights.stability });
   }
   if (Number.isFinite(speaker)) {
     parts.push({ value: speaker, weight: baseWeights.speaker });
   }
   if (hasStyle) {
-    parts.push({ value: style, weight: (baseWeights as { style: number }).style });
-  } else {
-    if (Number.isFinite(tone) && 'tone' in baseWeights) {
-      parts.push({ value: tone, weight: (baseWeights as { tone: number }).tone });
-    }
-    if (Number.isFinite(speed) && 'speed' in baseWeights) {
-      parts.push({ value: speed, weight: (baseWeights as { speed: number }).speed });
-    }
+    parts.push({ value: style, weight: baseWeights.style });
+  }
+  if (Number.isFinite(tone)) {
+    parts.push({ value: tone, weight: baseWeights.tone });
+  }
+  if (Number.isFinite(speed)) {
+    parts.push({ value: speed, weight: baseWeights.speed });
   }
 
   return parts;
@@ -4219,7 +4196,6 @@ const evaluateValidationSample = ({
   }
   if (
     referenceAudioKey &&
-    !Number.isFinite(style) &&
     Number.isFinite(tone) &&
     tone < minToneScore
   ) {
@@ -4227,7 +4203,6 @@ const evaluateValidationSample = ({
   }
   if (
     referenceAudioKey &&
-    !Number.isFinite(style) &&
     referenceText &&
     Number.isFinite(speed) &&
     speed < VALIDATION_GATE_THRESHOLDS.speed_min
@@ -4520,7 +4495,6 @@ const scoreSingleValidationOutput = ({
   }
   if (
     referenceAudioKey &&
-    !Number.isFinite(style) &&
     Number.isFinite(tone) &&
     tone < minToneScore
   ) {
@@ -4528,7 +4502,6 @@ const scoreSingleValidationOutput = ({
   }
   if (
     referenceAudioKey &&
-    !Number.isFinite(style) &&
     referenceText &&
     Number.isFinite(speed) &&
     speed < VALIDATION_GATE_THRESHOLDS.speed_min
@@ -5739,7 +5712,7 @@ const validateTrainedCheckpoint = async (
           if (
             referenceAudioKey &&
             Number.isFinite(style) &&
-            style < (is06b ? 0.4 : VALIDATION_GATE_THRESHOLDS.tone_min)
+            style < (is06b ? 0.4 : VALIDATION_GATE_THRESHOLDS.style_min)
           ) {
             if (!firstFailureMessage) {
               firstFailureMessage = `sample ${i + 1} seed ${seed} style_score=${style.toFixed(3)}`;
@@ -5748,7 +5721,6 @@ const validateTrainedCheckpoint = async (
           }
           if (
             referenceAudioKey &&
-            !Number.isFinite(style) &&
             Number.isFinite(tone) &&
             tone < (is06b ? 0.4 : VALIDATION_GATE_THRESHOLDS.tone_min)
           ) {
@@ -5759,7 +5731,6 @@ const validateTrainedCheckpoint = async (
           }
           if (
             referenceAudioKey &&
-            !Number.isFinite(style) &&
             referenceText &&
             Number.isFinite(speed) &&
             speed < VALIDATION_GATE_THRESHOLDS.speed_min

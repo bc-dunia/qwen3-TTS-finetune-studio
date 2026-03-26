@@ -215,9 +215,9 @@ export const VALIDATION_GATE_THRESHOLDS: ValidationThresholds = {
 export const VALIDATION_RANKING_WEIGHTS: ValidationWeights = {
   asr: 0.25,
   speaker: 0.25,
-  style: 0.30,
-  tone: 0.00,
-  speed: 0.00,
+  style: 0.20,
+  tone: 0.05,
+  speed: 0.05,
   overall: 0.05,
   duration: 0.05,
 };
@@ -332,8 +332,8 @@ export function passesValidationGate(
   if (speaker !== null && speaker < thresholds.speaker_min) return false;
   if (health !== null && health < thresholds.health_min) return false;
   if (style !== null && style < thresholds.style_min) return false;
-  if (tone !== null && style === null && tone < thresholds.tone_min) return false;
-  if (speed !== null && style === null && speed < thresholds.speed_min) return false;
+  if (tone !== null && tone < thresholds.tone_min) return false;
+  if (speed !== null && speed < thresholds.speed_min) return false;
   if (overall !== null && overall < thresholds.overall_min) return false;
   if (duration !== null && duration < thresholds.duration_min) return false;
 
@@ -442,7 +442,6 @@ export function grayZoneRescue(
   if (!passesHardSafetyGate(scores)) return noRescue;
   if (passesValidationGate(scores)) return noRescue;
 
-  const hasStyle = readNumber(scores.style_score) !== null;
   const softChecks: Array<{ metric: string; value: number | null; threshold: number }> = [
     { metric: "tone", value: readNumber(scores.tone_score), threshold: VALIDATION_GATE_THRESHOLDS.tone_min },
     { metric: "speed", value: readNumber(scores.speed_score), threshold: VALIDATION_GATE_THRESHOLDS.speed_min },
@@ -455,7 +454,6 @@ export function grayZoneRescue(
 
   for (const check of softChecks) {
     if (check.value === null) continue;
-    if (hasStyle && (check.metric === "tone" || check.metric === "speed")) continue;
     if (check.value < check.threshold) {
       missed.push({ metric: check.metric, margin: check.threshold - check.value });
     }

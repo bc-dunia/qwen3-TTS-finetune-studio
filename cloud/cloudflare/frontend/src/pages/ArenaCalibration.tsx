@@ -9,9 +9,9 @@ import {
 const VALIDATION_RANKING_WEIGHTS: Record<string, number> = {
   asr: 0.25,
   speaker: 0.25,
-  style: 0.30,
-  tone: 0.00,
-  speed: 0.00,
+  style: 0.20,
+  tone: 0.05,
+  speed: 0.05,
   overall: 0.05,
   duration: 0.05,
 }

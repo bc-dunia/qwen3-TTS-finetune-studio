@@ -136,9 +136,9 @@ Every checkpoint produced by a training job is scored against a set of evaluatio
 | ASR similarity | 0.82 | Hard |
 | Speaker similarity | 0.78 | Hard |
 | Health score | 0.72 | Hard |
-| Tone similarity | 0.50 | Soft (gate skipped when style_score is present) |
+| Tone similarity | 0.50 | Soft |
 | Style similarity | 0.55 | Soft |
-| Speed similarity | 0.15 | Soft (gate skipped when style_score is present) |
+| Speed similarity | 0.15 | Soft |
 | Overall score | 0.80 | Soft |
 | Duration accuracy | 0.50 | Soft |
 
@@ -148,9 +148,9 @@ Every checkpoint produced by a training job is scored against a set of evaluatio
 |--------|---------------|
 | ASR | 0.25 |
 | Speaker | 0.25 |
-| Style | 0.30 |
-| Tone | 0.00 |
-| Speed | 0.00 |
+| Style | 0.20 |
+| Tone | 0.05 |
+| Speed | 0.05 |
 | Overall | 0.05 |
 | Duration | 0.05 |
 
@@ -785,7 +785,7 @@ shadow → canary → active
 | Hard safety | ASR ≥0.75, Speaker ≥0.70, Health ≥0.65 | Never bypassed, even by calibration |
 | Soft preference | tone, style, speed, duration, overall | Still causes rejection by default, but can be relaxed via gray-zone rescue when calibration is canary/active |
 
-Note: when `style_score` is present, `tone` and `speed` gate checks are skipped (style subsumes them). Similarly, `computeRankingScore` uses `style_score` directly when available, falling back to `tone*0.6 + speed*0.4` when absent.
+Note: `tone`, `speed`, and `style` gate checks all apply independently. `computeRankingScore` uses `style_score` directly when available (falling back to `tone*0.6 + speed*0.4` when absent for the style weight), plus tone and speed always contribute via their own weights.
 
 **Global fallback chain** for calibrated weights: voice-specific → `__global__` → hardcoded defaults.
 

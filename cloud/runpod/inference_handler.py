@@ -2,6 +2,7 @@ from __future__ import annotations
 import base64
 import gc
 import hashlib
+import math
 import importlib
 import importlib.util
 import io
@@ -1355,17 +1356,14 @@ def _verify_quality(
         tone_score = reference_metrics.get("tone_score")
         speed_score = reference_metrics.get("speed_score")
         style_score = reference_metrics.get("style_score")
-        if isinstance(speaker_score, (int, float)):
+        if isinstance(speaker_score, (int, float)) and math.isfinite(speaker_score):
             weighted_parts.append((_clamp(float(speaker_score), 0.0, 1.0), 0.20))
-        if isinstance(style_score, (int, float)):
-            weighted_parts.append((_clamp(float(style_score), 0.0, 1.0), 0.30))
-        elif isinstance(tone_score, (int, float)) or isinstance(
-            speed_score, (int, float)
-        ):
-            if isinstance(tone_score, (int, float)):
-                weighted_parts.append((_clamp(float(tone_score), 0.0, 1.0), 0.03))
-            if isinstance(speed_score, (int, float)):
-                weighted_parts.append((_clamp(float(speed_score), 0.0, 1.0), 0.02))
+        if isinstance(style_score, (int, float)) and math.isfinite(style_score):
+            weighted_parts.append((_clamp(float(style_score), 0.0, 1.0), 0.20))
+        if isinstance(tone_score, (int, float)) and math.isfinite(tone_score):
+            weighted_parts.append((_clamp(float(tone_score), 0.0, 1.0), 0.05))
+        if isinstance(speed_score, (int, float)) and math.isfinite(speed_score):
+            weighted_parts.append((_clamp(float(speed_score), 0.0, 1.0), 0.05))
         total_weight = sum(weight for _, weight in weighted_parts) or 1.0
         overall_score = (
             sum(score * weight for score, weight in weighted_parts) / total_weight
