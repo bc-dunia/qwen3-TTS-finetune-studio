@@ -17,9 +17,9 @@ import {
 type ArenaStep = 'setup' | 'generating' | 'voting' | 'results'
 
 const DEFAULT_TEST_TEXTS = [
-  '안녕하세요. 오늘 날씨가 정말 좋네요.',
-  '이 제품은 품질이 매우 우수하며, 고객 만족도가 높습니다.',
-  '내일 오전 열 시에 회의가 있으니 준비해 주세요.',
+  'Hello. The weather is great today.',
+  'This product has excellent quality and high customer satisfaction.',
+  'Please prepare for the meeting tomorrow at 10 a.m.',
 ]
 
 function getSourceBadge(source: string): { label: string; className: string } {

@@ -358,7 +358,7 @@ app.post("/:voice_id/retranscribe", async (c) => {
       const transcription = await transcribeAudioWithReviewAsr({
         env: c.env,
         audioBase64: arrayBufferToBase64(await obj.arrayBuffer()),
-        languageHint: body.language_code ?? voice.labels?.language ?? "ko",
+        languageHint: body.language_code ?? "auto",
       });
 
       return {
@@ -373,7 +373,7 @@ app.post("/:voice_id/retranscribe", async (c) => {
 
   return c.json({
     voice_id: voiceId,
-    language_code: body.language_code ?? voice.labels?.language ?? "ko",
+    language_code: body.language_code ?? "auto",
     results,
   });
 });

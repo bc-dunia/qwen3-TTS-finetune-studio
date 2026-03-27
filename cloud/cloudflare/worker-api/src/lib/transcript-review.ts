@@ -7,12 +7,12 @@ const DEFAULT_OPENAI_REVIEW_MODEL = "gpt-5-mini";
 const normalizeLanguageCode = (value: string | undefined): string => {
   const normalized = (value ?? "").trim().toLowerCase();
   if (!normalized) {
+    return "en";
+  }
+  if (normalized === "kr" || normalized === "ko-kr") {
     return "ko";
   }
-  if (normalized === "kr") {
-    return "ko";
-  }
-  if (normalized === "jp") {
+  if (normalized === "jp" || normalized === "ja-jp") {
     return "ja";
   }
   if (
@@ -39,8 +39,9 @@ const getReviewLanguageLabel = (languageCode: string | undefined): string => {
     case "zh":
       return "Chinese";
     case "ko":
-    default:
       return "Korean";
+    default:
+      return "English";
   }
 };
 

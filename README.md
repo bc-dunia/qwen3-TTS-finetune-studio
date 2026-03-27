@@ -1,8 +1,6 @@
 # Qwen3-TTS Finetune Studio
 
-> **Warning:** This project is under active development and currently in an experimental/testing phase. APIs, CLI interfaces, and default behaviors may change without notice. Use at your own risk.
-
-A unified fine-tuning and operations toolkit for **Qwen3-TTS**, built on top of the official [`QwenLM/Qwen3-TTS` finetuning scripts](https://github.com/QwenLM/Qwen3-TTS). It provides a Gradio-based web UI and a CLI for the full lifecycle: data curation, quality validation, training orchestration, inference, and checkpoint export.
+A unified fine-tuning and operations toolkit for **Qwen3-TTS**, built on top of the official [`QwenLM/Qwen3-TTS` finetuning scripts](https://github.com/QwenLM/Qwen3-TTS). It provides a Gradio UI and CLI for data curation, quality validation, training orchestration, inference, LLM-assisted evaluation/optimization, and Arena-based checkpoint ranking/promotion.
 
 > **Note:** Only **single-speaker fine-tuning** is supported per the official specification.
 
@@ -32,12 +30,12 @@ A unified fine-tuning and operations toolkit for **Qwen3-TTS**, built on top of 
 
 | Area | Capabilities |
 |---|---|
-| **Data Upload & Curation** | Multi-audio upload, transcript import (CSV / JSON / JSONL), automatic path resolution, dataset preview & statistics |
-| **Quality & Preparation** | Validation reports, preflight risk assessment (device / disk / model / signal quality), audio normalization (24 kHz mono, peak normalize), recommended hyperparameters by data volume |
-| **Training Orchestration** | Official `prepare_data.py` and `sft_12hz.py` execution, live log streaming with epoch/step/loss parsing, safety gate (blocks training on `NO-GO`/`BLOCKED` preflight), full pipeline (prepare + train) |
-| **Post-Training** | Single & batch inference, decoding parameter presets (Fast / Balanced / Similarity / Quality), default-on post-generation review (ASR / speaker cosine / speed), checkpoint export as ZIP |
-| **Workspace Management** | Run registry, run summary inspection, workspace overview, environment check |
-| **Automation** | Full CLI with subcommands (`validate`, `preflight`, `precheck`, `normalize`, `prepare`, `train`, `pipeline`, `infer`, `review-generation`) for scripting and CI integration |
+| **Data Curation** | Multi-audio upload, transcript import (CSV / JSON / JSONL), path resolution, dataset preview and stats |
+| **Quality Gate** | Validation + preflight risk checks (device / disk / model / signal), normalization (24 kHz mono), and data-size-based hyperparameter guidance |
+| **Training Pipeline** | Official `prepare_data.py` + `sft_12hz.py`, live epoch/step/loss parsing, safety gate, and one-click prepare+train pipeline |
+| **Evaluation & Optimization** | Default post-generation review (ASR / speaker cosine / speed) plus LLM-assisted evaluation and optimization of next iterations |
+| **Arena Selection** | Blind A/B Voice Arena workflow for checkpoint ranking and promotion |
+| **Operations & Automation** | Run registry/summary, workspace inspection, export, and full CLI (`validate`, `preflight`, `precheck`, `normalize`, `prepare`, `train`, `pipeline`, `infer`, `review-generation`) |
 
 For the complete feature matrix, see [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md).
 
@@ -53,7 +51,9 @@ Raw data (audio / text / ref_audio)
   -> train_with_codes.jsonl
   -> sft_12hz.py  (supervised fine-tuning)
   -> checkpoint-epoch-*
-  -> inference (single / batch) + export (ZIP)
+  -> inference (single / batch) + review + export (ZIP)
+  -> LLM evaluation loop (optional)
+  -> Arena ranking/promotion (optional)
 ```
 
 **Layer breakdown:**
@@ -556,4 +556,5 @@ cd /path/to/qwen3-tts-finetune-studio
 ## 15) Additional Documentation
 
 - **Feature Matrix:** [`FEATURE_MATRIX.md`](FEATURE_MATRIX.md)
+- **Cloud Workflows (LLM loop + Arena):** [`cloud/README.md`](cloud/README.md)
 - **Official Fine-tuning Guide (vendored):** [`third_party/Qwen3-TTS/finetuning/README.md`](third_party/Qwen3-TTS/finetuning/README.md)

@@ -669,9 +669,9 @@ const addLesson = (lessons: StableLesson[], retrospective: Retrospective, now: n
 };
 
 const getDefaultArenaTexts = (): string[] => [
-  "안녕하세요. 오늘은 목소리 품질을 점검하는 테스트 문장입니다.",
+  "Hello. This is a test sentence for checking voice quality.",
   "The quick brown fox jumps over the lazy dog while keeping natural rhythm.",
-  "지금부터 억양, 발음, 그리고 속도 일관성을 확인해 보겠습니다.",
+  "Next, we will check intonation, pronunciation, and speaking-rate consistency.",
 ];
 
 const normalizeArenaTexts = (context?: Record<string, unknown>): string[] => {

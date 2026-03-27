@@ -3482,7 +3482,7 @@ const inferValidationLanguage = (...values: Array<string | null | undefined>): s
     return directMap[normalizedHint];
   }
 
-  if (/[가-힣]/.test(joined)) {
+  if (/[\uAC00-\uD7A3]/.test(joined)) {
     return 'ko';
   }
   if (/[ぁ-ゖァ-ヺ]/.test(joined)) {

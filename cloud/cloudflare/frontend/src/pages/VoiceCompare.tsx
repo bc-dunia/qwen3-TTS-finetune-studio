@@ -47,7 +47,23 @@ function normalizeVoiceSettings(value: Partial<VoiceSettings> | null | undefined
 }
 
 function getDefaultCompareText(language: string | undefined): string {
-  switch ((language ?? '').toLowerCase()) {
+  const normalized = (language ?? '').toLowerCase().trim().replace(/_/g, '-')
+  const locale = (() => {
+    if (normalized === 'ko' || normalized === 'ko-kr' || normalized === 'kr') return 'ko'
+    if (normalized === 'en' || normalized === 'en-us' || normalized === 'en-gb') return 'en'
+    if (normalized === 'ja' || normalized === 'ja-jp' || normalized === 'jp') return 'ja'
+    if (
+      normalized === 'zh' ||
+      normalized === 'zh-cn' ||
+      normalized === 'zh-tw' ||
+      normalized === 'zh-hans' ||
+      normalized === 'zh-hant' ||
+      normalized === 'cn'
+    ) return 'zh'
+    return normalized
+  })()
+
+  switch (locale) {
     case 'en':
       return 'Hello. This sample compares checkpoint quality, tone preservation, and speaker similarity.'
     case 'ja':
@@ -55,8 +71,9 @@ function getDefaultCompareText(language: string | undefined): string {
     case 'zh':
       return '你好。这段样例用于比较各个检查点的音色、语气和整体稳定性。'
     case 'ko':
-    default:
       return '안녕하세요. 이 샘플은 체크포인트별 화자 유사도와 말투 보존을 비교하기 위한 문장입니다.'
+    default:
+      return 'Hello. This sample compares checkpoint-level speaker similarity and speaking-style preservation.'
   }
 }
 

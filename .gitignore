@@ -25,3 +25,22 @@ cloud/cloudflare/frontend/tsconfig.tsbuildinfo
 # RunPod local testing
 cloud/runpod/__pycache__/
 cloud/runpod/*.egg-info/
+
+# Local agent metadata
+.sisyphus/
+.openchrome/
+
+# Exclude GitHub workflow definitions from tracking
+.github/workflows/
+
+# Privacy: never track voice sample media
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+*.aac
+*.opus
+*.webm
+samples/
+voice_samples/

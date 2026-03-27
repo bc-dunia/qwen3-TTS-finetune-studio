@@ -378,7 +378,7 @@ app.post("/:voice_id/review", async (c) => {
   const text =
     typeof body.text === "string" && body.text.trim()
       ? body.text.trim()
-      : reviewReference.referenceText || getDefaultReviewText(body.language_code ?? voice.labels?.language ?? "ko");
+      : reviewReference.referenceText || getDefaultReviewText(body.language_code ?? voice.labels?.language ?? "en");
 
   const inputPayload = {
     ...buildInputPayload(voiceId, modelId, voice, { ...body, text }, seed),

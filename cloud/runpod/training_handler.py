@@ -36,7 +36,7 @@ TRAINING_PROGRESS_RE = re.compile(
 )
 CHECKPOINT_DIR_RE = re.compile(r"checkpoint-epoch-(\d+)$")
 SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9._-]{1,128}$")
-NORMALIZED_TEXT_RE = re.compile(r"[^0-9a-zA-Z가-힣]+")
+NORMALIZED_TEXT_RE = re.compile(r"[^0-9a-zA-Z\uAC00-\uD7A3]+")
 
 JOB_ID_ENV = "JOB_ID"
 JOB_TOKEN_ENV = "JOB_TOKEN"

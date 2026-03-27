@@ -1134,7 +1134,7 @@ def save_preflight_report(report: dict[str, Any], output_path: str | Path) -> st
 
 
 def _normalize_text_for_compare(text: str) -> str:
-    return re.sub(r"[^0-9a-zA-Z가-힣]+", "", (text or "").lower())
+    return re.sub(r"[^0-9a-zA-Z\uAC00-\uD7A3]+", "", (text or "").lower())
 
 
 def _levenshtein_ratio(a: str, b: str) -> float:

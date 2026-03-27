@@ -241,8 +241,8 @@ Refactored from a 1159-line monolith:
 
 ## Current Stack (Mar 2026)
 
-- **Worker API:** `https://qwen-tts-api.brian-367.workers.dev`
-- **Frontend:** `https://qwen-tts-studio.pages.dev`
+- **Worker API:** `https://qwen-tts-api.YOUR_SUBDOMAIN.workers.dev`
+- **Frontend:** `https://YOUR_FRONTEND.pages.dev`
 - **Cron schedule:** `*/2 * * * *` (training supervisor sweep + campaign progression)
 - **D1 database:** `qwen-tts-db`
 - **R2 bucket:** `qwen-tts-studio`
@@ -568,7 +568,7 @@ with open("output.wav", "wb") as f:
 One job with explicit config overrides. Use for manual experimentation.
 
 ```bash
-curl -X POST "https://qwen-tts-api.brian-367.workers.dev/v1/training/start" \
+curl -X POST "https://qwen-tts-api.YOUR_SUBDOMAIN.workers.dev/v1/training/start" \
   -H "xi-api-key: YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -591,7 +591,7 @@ curl -X POST "https://qwen-tts-api.brian-367.workers.dev/v1/training/start" \
 Multi-attempt training plan; state tracked in D1, progressed by the cron sweep and `waitUntil` callbacks. The 3-layer advisor selects configs per round.
 
 ```bash
-curl -X POST "https://qwen-tts-api.brian-367.workers.dev/v1/training/campaigns" \
+curl -X POST "https://qwen-tts-api.YOUR_SUBDOMAIN.workers.dev/v1/training/campaigns" \
   -H "xi-api-key: YOUR_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -618,10 +618,10 @@ curl -X POST "https://qwen-tts-api.brian-367.workers.dev/v1/training/campaigns" 
 Poll or cancel a campaign:
 
 ```bash
-curl "https://qwen-tts-api.brian-367.workers.dev/v1/training/campaigns/CAMPAIGN_ID" \
+curl "https://qwen-tts-api.YOUR_SUBDOMAIN.workers.dev/v1/training/campaigns/CAMPAIGN_ID" \
   -H "xi-api-key: YOUR_API_KEY"
 
-curl -X POST "https://qwen-tts-api.brian-367.workers.dev/v1/training/campaigns/CAMPAIGN_ID/cancel" \
+curl -X POST "https://qwen-tts-api.YOUR_SUBDOMAIN.workers.dev/v1/training/campaigns/CAMPAIGN_ID/cancel" \
   -H "xi-api-key: YOUR_API_KEY"
 ```
 

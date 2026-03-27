@@ -16,7 +16,7 @@ import type { AppContext } from "../types";
 const app = new Hono<AppContext>();
 
 const DEFAULT_INFERENCE_IMAGE = "ghcr.io/bc-dunia/qwen3-tts-inference:03e6b487166a708cdf81a0c9af09e81d212ad5a3";
-const DEFAULT_PREVIEW_TEXT_KO = "안녕하세요. 현재 체크포인트의 실제 음성 품질과 화자 유사도를 확인하는 검증 샘플입니다.";
+const DEFAULT_PREVIEW_TEXT = "Hello. This is a verification sample for checking current checkpoint voice quality and speaker similarity.";
 
 const LANGUAGE_ALIASES: Record<string, string> = {
   auto: "auto",
@@ -287,7 +287,7 @@ app.post("/dataset/retranscribe", async (c) => {
       const transcription = await transcribeAudioWithReviewAsr({
         env: c.env,
         audioBase64: arrayBufferToBase64(await obj.arrayBuffer()),
-        languageHint: body.language_code ?? "ko",
+        languageHint: body.language_code ?? "auto",
       });
 
       return {
@@ -301,7 +301,7 @@ app.post("/dataset/retranscribe", async (c) => {
   );
 
   return c.json({
-    language_code: body.language_code ?? "ko",
+    language_code: body.language_code ?? "auto",
     results,
   });
 });
@@ -449,7 +449,7 @@ app.post("/runpod/checkpoint-preview", async (c) => {
 
   const { referenceAudioKey, referenceText } = await loadQualityReviewReference(c, voice);
   const inputPayload = {
-    text: body.text?.trim() || DEFAULT_PREVIEW_TEXT_KO,
+    text: body.text?.trim() || DEFAULT_PREVIEW_TEXT,
     voice_id: voiceId,
     speaker_name: voice.speaker_name,
     model_id: body.model_id?.trim() || voice.model_id || "qwen3-tts-1.7b",
