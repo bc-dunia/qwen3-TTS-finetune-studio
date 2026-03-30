@@ -1033,6 +1033,64 @@ def ui_make_new_run_name() -> str:
     return default_run_name()
 
 
+def _resolve_preflight_report_path(preflight_report_path: Any | None) -> str:
+    if not preflight_report_path:
+        return ""
+    if isinstance(preflight_report_path, str):
+        return preflight_report_path
+    if isinstance(preflight_report_path, dict) and "name" in preflight_report_path:
+        return str(preflight_report_path["name"])
+    return str(getattr(preflight_report_path, "name", "") or "")
+
+
+def _validate_attn_implementation_choice(attn_implementation: str) -> tuple[str, str | None]:
+    final_attn = (attn_implementation or "").strip()
+    if (
+        final_attn.lower() == "flash_attention_2"
+        and importlib.util.find_spec("flash_attn") is None
+    ):
+        return (
+            final_attn,
+            "flash_attn is not installed. Choose `attn_implementation=auto/sdpa/eager` or install flash-attn.",
+        )
+    return final_attn, None
+
+
+def _refresh_training_updates() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    run_update = _refresh_run_updates()
+    checkpoint_update = _refresh_checkpoint_updates()
+    return run_update, run_update, checkpoint_update, checkpoint_update, checkpoint_update
+
+
+def _refresh_pipeline_updates() -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+]:
+    coded_update = _refresh_coded_updates()
+    run_update = _refresh_run_updates()
+    checkpoint_update = _refresh_checkpoint_updates()
+    return (
+        coded_update,
+        coded_update,
+        run_update,
+        run_update,
+        checkpoint_update,
+        checkpoint_update,
+        checkpoint_update,
+    )
+
+
+def _quick_run_status_text(status: str) -> str:
+    if status.startswith("Pipeline "):
+        return f"Quick Run {status[len('Pipeline '):]}"
+    return status
+
+
 def ui_run_training(
     init_model_path: str,
     train_jsonl_path: str,
@@ -1061,11 +1119,7 @@ def ui_run_training(
             "Prepared JSONL path is required.",
             "",
             "",
-            _refresh_run_updates(),
-            _refresh_run_updates(),
-            _refresh_checkpoint_updates(),
-            _refresh_checkpoint_updates(),
-            _refresh_checkpoint_updates(),
+            *_refresh_training_updates(),
         )
         return
 
@@ -1074,11 +1128,7 @@ def ui_run_training(
             "Training is already running. Use `Stop Training` before starting a new run.",
             "",
             "",
-            _refresh_run_updates(),
-            _refresh_run_updates(),
-            _refresh_checkpoint_updates(),
-            _refresh_checkpoint_updates(),
-            _refresh_checkpoint_updates(),
+            *_refresh_training_updates(),
         )
         return
 
@@ -1088,11 +1138,7 @@ def ui_run_training(
             "Speaker Name is required.",
             "",
             "",
-            _refresh_run_updates(),
-            _refresh_run_updates(),
-            _refresh_checkpoint_updates(),
-            _refresh_checkpoint_updates(),
-            _refresh_checkpoint_updates(),
+            *_refresh_training_updates(),
         )
         return
 
@@ -1101,16 +1147,7 @@ def ui_run_training(
 
     # Preflight gate (optional but recommended)
     expected_raw = expected_raw_jsonl_for_train_jsonl(train_jsonl_path)
-    preflight_path = ""
-    if preflight_report_path:
-        if isinstance(preflight_report_path, str):
-            preflight_path = preflight_report_path
-        elif (
-            isinstance(preflight_report_path, dict) and "name" in preflight_report_path
-        ):
-            preflight_path = str(preflight_report_path["name"])
-        else:
-            preflight_path = str(getattr(preflight_report_path, "name", "") or "")
+    preflight_path = _resolve_preflight_report_path(preflight_report_path)
 
     ok, reason = validate_preflight_gate(
         preflight_report_path=preflight_path or None,
@@ -1122,28 +1159,17 @@ def ui_run_training(
             reason,
             "",
             "",
-            _refresh_run_updates(),
-            _refresh_run_updates(),
-            _refresh_checkpoint_updates(),
-            _refresh_checkpoint_updates(),
-            _refresh_checkpoint_updates(),
+            *_refresh_training_updates(),
         )
         return
 
-    final_attn = (attn_implementation or "").strip()
-    if (
-        final_attn.lower() == "flash_attention_2"
-        and importlib.util.find_spec("flash_attn") is None
-    ):
+    final_attn, attn_error = _validate_attn_implementation_choice(attn_implementation)
+    if attn_error:
         yield (
-            "flash_attn is not installed. Choose `attn_implementation=auto/sdpa/eager` or install flash-attn.",
+            attn_error,
             "",
             "",
-            _refresh_run_updates(),
-            _refresh_run_updates(),
-            _refresh_checkpoint_updates(),
-            _refresh_checkpoint_updates(),
-            _refresh_checkpoint_updates(),
+            *_refresh_training_updates(),
         )
         return
 
@@ -1196,22 +1222,14 @@ def ui_run_training(
             str(e),
             "",
             "",
-            _refresh_run_updates(),
-            _refresh_run_updates(),
-            _refresh_checkpoint_updates(),
-            _refresh_checkpoint_updates(),
-            _refresh_checkpoint_updates(),
+            *_refresh_training_updates(),
         )
     except Exception as e:
         yield (
             f"Training failed: `{e}`",
             "",
             traceback.format_exc(),
-            _refresh_run_updates(),
-            _refresh_run_updates(),
-            _refresh_checkpoint_updates(),
-            _refresh_checkpoint_updates(),
-            _refresh_checkpoint_updates(),
+            *_refresh_training_updates(),
         )
 
 
@@ -1268,7 +1286,7 @@ def ui_run_pipeline(
         if is_training_running():
             running.append("training")
         yield (
-            f"Pipeline cannot start because these stages are already running: {', '.join(running)}. Stop them first.",
+            f"Quick Run cannot start because these stages are already running: {', '.join(running)}. Stop them first.",
             "",
             "",
             _refresh_coded_updates(),
@@ -1300,16 +1318,7 @@ def ui_run_pipeline(
     # Persist commonly reused fields across tabs (matches qwen3-tts-studio auto-save UX).
     save_ui_settings({"speaker_name": final_speaker})
 
-    preflight_path = ""
-    if preflight_report_path:
-        if isinstance(preflight_report_path, str):
-            preflight_path = preflight_report_path
-        elif (
-            isinstance(preflight_report_path, dict) and "name" in preflight_report_path
-        ):
-            preflight_path = str(preflight_report_path["name"])
-        else:
-            preflight_path = str(getattr(preflight_report_path, "name", "") or "")
+    preflight_path = _resolve_preflight_report_path(preflight_report_path)
 
     ok, reason = validate_preflight_gate(
         preflight_report_path=preflight_path or None,
@@ -1321,32 +1330,17 @@ def ui_run_pipeline(
             reason,
             "",
             "",
-            _refresh_coded_updates(),
-            _refresh_coded_updates(),
-            _refresh_run_updates(),
-            _refresh_run_updates(),
-            _refresh_checkpoint_updates(),
-            _refresh_checkpoint_updates(),
-            _refresh_checkpoint_updates(),
+            *_refresh_pipeline_updates(),
         )
         return
 
-    final_attn = (attn_implementation or "").strip()
-    if (
-        final_attn.lower() == "flash_attention_2"
-        and importlib.util.find_spec("flash_attn") is None
-    ):
+    final_attn, attn_error = _validate_attn_implementation_choice(attn_implementation)
+    if attn_error:
         yield (
-            "flash_attn is not installed. Choose `attn_implementation=auto/sdpa/eager` or install flash-attn.",
+            attn_error,
             "",
             "",
-            _refresh_coded_updates(),
-            _refresh_coded_updates(),
-            _refresh_run_updates(),
-            _refresh_run_updates(),
-            _refresh_checkpoint_updates(),
-            _refresh_checkpoint_updates(),
-            _refresh_checkpoint_updates(),
+            *_refresh_pipeline_updates(),
         )
         return
 
@@ -1377,9 +1371,10 @@ def ui_run_pipeline(
             random_seed=int(seed),
         ):
             stage = event.get("stage", "")
-            status = event.get("status", "")
+            status = _quick_run_status_text(str(event.get("status", "")))
             if stage:
-                status = f"[{stage}] {status}"
+                stage_label = "quick-run" if stage == "pipeline" else str(stage)
+                status = f"[{stage_label}] {status}"
 
             coded_choices = event.get("coded_jsonl_choices", list_coded_jsonl_paths())
             run_choices = event.get("run_choices", list_run_paths())
@@ -1416,26 +1411,14 @@ def ui_run_pipeline(
             str(e),
             "",
             "",
-            _refresh_coded_updates(),
-            _refresh_coded_updates(),
-            _refresh_run_updates(),
-            _refresh_run_updates(),
-            _refresh_checkpoint_updates(),
-            _refresh_checkpoint_updates(),
-            _refresh_checkpoint_updates(),
+            *_refresh_pipeline_updates(),
         )
     except Exception as e:
         yield (
-            f"Pipeline failed: `{e}`",
+            f"Quick Run failed: `{e}`",
             "",
             traceback.format_exc(),
-            _refresh_coded_updates(),
-            _refresh_coded_updates(),
-            _refresh_run_updates(),
-            _refresh_run_updates(),
-            _refresh_checkpoint_updates(),
-            _refresh_checkpoint_updates(),
-            _refresh_checkpoint_updates(),
+            *_refresh_pipeline_updates(),
         )
 
 
@@ -1445,7 +1428,7 @@ def ui_stop_pipeline() -> str:
     prepare_status = stop_prepare()
     train_status = stop_training()
     return (
-        "Pipeline stop request:\n"
+        "Quick Run stop request:\n"
         f"- prepare: running={prepare_was_running} -> {prepare_status}\n"
         f"- training: running={training_was_running} -> {train_status}"
     )
@@ -1845,9 +1828,7 @@ def ui_environment_check() -> str:
     return "\n".join(summary_lines)
 
 
-def build_app() -> gr.Blocks:
-    ui_settings = load_ui_settings()
-    default_speaker_name = str(ui_settings.get("speaker_name", "") or "").strip()
+def _resolve_inference_defaults(ui_settings: dict[str, Any]) -> dict[str, Any]:
     infer_cfg = (
         ui_settings.get("inference", {})
         if isinstance(ui_settings.get("inference", {}), dict)
@@ -1858,10 +1839,6 @@ def build_app() -> gr.Blocks:
         if isinstance(infer_cfg.get("params", {}), dict)
         else {}
     )
-    infer_device_default = str(infer_cfg.get("device", "auto") or "auto")
-    infer_language_default = str(infer_cfg.get("language", "auto") or "auto")
-    infer_instruct_default = str(infer_cfg.get("instruct", "") or "")
-    infer_ckpt_default = str(infer_cfg.get("checkpoint_path", "") or "")
     infer_mode_default = str(
         infer_cfg.get("generation_mode", INFER_MODE_CHECKPOINT) or INFER_MODE_CHECKPOINT
     )
@@ -1871,43 +1848,81 @@ def build_app() -> gr.Blocks:
         infer_seed_default = int(infer_cfg.get("seed", 42) or 42)
     except Exception:
         infer_seed_default = 42
-    infer_review_after_default = bool(infer_cfg.get("review_after_generation", True))
-    infer_review_reference_default = str(
-        infer_cfg.get("review_reference_audio", "") or ""
-    )
-    infer_review_profile_default = str(
-        infer_cfg.get("review_profile_raw_jsonl", "") or ""
-    )
-    infer_review_base_model_default = str(
-        infer_cfg.get("review_base_speaker_model", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
-        or "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
-    )
-    infer_review_whisper_default = str(
-        infer_cfg.get("review_whisper_model", "base") or "base"
-    )
-    _icl_ref_audio_raw = str(infer_cfg.get("icl_ref_audio", "") or "")
-    _icl_ref_text_raw = str(infer_cfg.get("icl_ref_text", "") or "")
-    # Auto-discover best ref audio if not previously configured
-    if not _icl_ref_audio_raw:
-        _best_ref_v2 = (
-            WORKSPACE_ROOT / "imports" / "quality_test_quick"
-            / "ref_bank" / "best_ref_v2_seg_0026.wav"
+
+    icl_ref_audio_raw = str(infer_cfg.get("icl_ref_audio", "") or "")
+    icl_ref_text_raw = str(infer_cfg.get("icl_ref_text", "") or "")
+    if not icl_ref_audio_raw:
+        best_ref_v2 = (
+            WORKSPACE_ROOT
+            / "imports"
+            / "quality_test_quick"
+            / "ref_bank"
+            / "best_ref_v2_seg_0026.wav"
         )
-        if _best_ref_v2.exists():
-            _icl_ref_audio_raw = str(_best_ref_v2)
-            _icl_ref_text_raw = _icl_ref_text_raw or (
+        if best_ref_v2.exists():
+            icl_ref_audio_raw = str(best_ref_v2)
+            icl_ref_text_raw = icl_ref_text_raw or (
                 "It feels like we are at the entrance to a turning point in history."
             )
-    infer_icl_ref_audio_default = _icl_ref_audio_raw
-    infer_icl_ref_text_default = _icl_ref_text_raw
-    infer_icl_use_icl_default = bool(infer_cfg.get("icl_use_icl", True))
+
+    return {
+        "infer_cfg": infer_cfg,
+        "infer_params": infer_params,
+        "infer_device_default": str(infer_cfg.get("device", "auto") or "auto"),
+        "infer_language_default": str(infer_cfg.get("language", "auto") or "auto"),
+        "infer_instruct_default": str(infer_cfg.get("instruct", "") or ""),
+        "infer_ckpt_default": str(infer_cfg.get("checkpoint_path", "") or ""),
+        "infer_mode_default": infer_mode_default,
+        "infer_seed_default": infer_seed_default,
+        "infer_review_after_default": bool(
+            infer_cfg.get("review_after_generation", True)
+        ),
+        "infer_review_reference_default": str(
+            infer_cfg.get("review_reference_audio", "") or ""
+        ),
+        "infer_review_profile_default": str(
+            infer_cfg.get("review_profile_raw_jsonl", "") or ""
+        ),
+        "infer_review_base_model_default": str(
+            infer_cfg.get("review_base_speaker_model", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
+            or "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+        ),
+        "infer_review_whisper_default": str(
+            infer_cfg.get("review_whisper_model", "base") or "base"
+        ),
+        "infer_icl_ref_audio_default": icl_ref_audio_raw,
+        "infer_icl_ref_text_default": icl_ref_text_raw,
+        "infer_icl_use_icl_default": bool(infer_cfg.get("icl_use_icl", True)),
+    }
+
+
+def build_app() -> gr.Blocks:
+    ui_settings = load_ui_settings()
+    default_speaker_name = str(ui_settings.get("speaker_name", "") or "").strip()
+    infer_defaults = _resolve_inference_defaults(ui_settings)
+    infer_cfg = infer_defaults["infer_cfg"]
+    infer_params = infer_defaults["infer_params"]
+    infer_device_default = infer_defaults["infer_device_default"]
+    infer_language_default = infer_defaults["infer_language_default"]
+    infer_instruct_default = infer_defaults["infer_instruct_default"]
+    infer_ckpt_default = infer_defaults["infer_ckpt_default"]
+    infer_mode_default = infer_defaults["infer_mode_default"]
+    infer_seed_default = infer_defaults["infer_seed_default"]
+    infer_review_after_default = infer_defaults["infer_review_after_default"]
+    infer_review_reference_default = infer_defaults["infer_review_reference_default"]
+    infer_review_profile_default = infer_defaults["infer_review_profile_default"]
+    infer_review_base_model_default = infer_defaults["infer_review_base_model_default"]
+    infer_review_whisper_default = infer_defaults["infer_review_whisper_default"]
+    infer_icl_ref_audio_default = infer_defaults["infer_icl_ref_audio_default"]
+    infer_icl_ref_text_default = infer_defaults["infer_icl_ref_text_default"]
+    infer_icl_use_icl_default = infer_defaults["infer_icl_use_icl_default"]
 
     with gr.Blocks(title=APP_TITLE, css=CUSTOM_CSS) as demo:
         gr.HTML(
             """
             <div class="main-header">
               <h1 class="main-title">Qwen3-TTS Finetune Studio</h1>
-              <p class="sub-title">Dataset → Quality/Preflight → Prepare → Train → Inference</p>
+              <p class="sub-title">Step-by-step: Dataset → Quality/Preflight → Prepare → Train → Inference | Shortcut: Quick Run (Prepare + Train)</p>
             </div>
             """
         )
@@ -2241,10 +2256,15 @@ def build_app() -> gr.Blocks:
                             value=_first_or_none(list_checkpoint_paths()),
                         )
 
-            with gr.Tab("5) Full Pipeline"):
+            with gr.Tab("5) Quick Run (Prepare + Train)"):
                 with gr.Row():
                     with gr.Column(scale=1, elem_classes=["params-panel"]):
-                        gr.HTML('<div class="section-header">Pipeline Config</div>')
+                        gr.HTML('<div class="section-header">Quick Run Config</div>')
+                        gr.Markdown(
+                            "### Notes\n"
+                            "- Use this tab to run **Prepare + Train** in one go after preflight passes.\n"
+                            "- Use `3) Prepare Codes` + `4) Train` if you want to inspect the prepared JSONL before training."
+                        )
                         pipeline_raw_jsonl = gr.Dropdown(
                             label="Raw JSONL",
                             choices=list_raw_jsonl_paths(),
@@ -2305,7 +2325,7 @@ def build_app() -> gr.Blocks:
                         )
                         with gr.Accordion("Safety Gate (Recommended)", open=True):
                             require_preflight_pipeline = gr.Checkbox(
-                                label="Require preflight gate (NO-GO/BLOCKED prevents pipeline)",
+                                label="Require preflight gate (NO-GO/BLOCKED prevents quick run)",
                                 value=True,
                             )
                             pipeline_preflight_report_file = gr.File(
@@ -2374,11 +2394,11 @@ def build_app() -> gr.Blocks:
                             )
                         with gr.Row():
                             run_pipeline_button = gr.Button(
-                                "Run Full Pipeline",
+                                "Run Prepare + Train",
                                 variant="primary",
                             )
                             stop_pipeline_button = gr.Button(
-                                "Stop Pipeline",
+                                "Stop Quick Run",
                                 variant="stop",
                             )
                     with gr.Column(scale=1, elem_classes=["params-panel"]):
@@ -2386,7 +2406,7 @@ def build_app() -> gr.Blocks:
                         pipeline_status = gr.Markdown()
                         pipeline_progress = gr.Markdown()
                         pipeline_logs = gr.Textbox(
-                            label="Pipeline Logs",
+                            label="Quick Run Logs",
                             lines=20,
                             max_lines=30,
                             autoscroll=True,
