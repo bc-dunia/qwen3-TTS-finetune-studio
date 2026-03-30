@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo } from 'react'
 import { Link } from 'react-router'
-import { fetchVoices, fetchAllTrainingJobs, type Voice, type TrainingJob, formatDate, formatTime } from '../lib/api'
+import { fetchVoices, fetchAllTrainingJobs, type Voice, type TrainingJob, formatTime } from '../lib/api'
 import { shouldWatchTrainingJob } from '../lib/trainingCheckout'
 import { formatScore, scoreColor } from '../lib/voiceScoreUi'
 
@@ -164,8 +164,8 @@ export function Dashboard() {
         <div className="bg-raised border border-edge rounded-xl p-5">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-heading font-semibold text-sm">Recent Generations</h2>
-            <Link to="/playground" className="text-accent text-xs hover:text-accent-light">
-              View all →
+            <Link to={hasVoices ? '/playground' : '/voices'} className="text-accent text-xs hover:text-accent-light">
+              {hasVoices ? 'View all →' : 'Create voice →'}
             </Link>
           </div>
 
@@ -173,10 +173,10 @@ export function Dashboard() {
             <div className="text-center py-8">
               <div className="text-muted text-sm">No generations yet</div>
               <Link
-                to="/playground"
+                to={hasVoices ? '/playground' : '/voices'}
                 className="text-accent text-xs mt-2 inline-block hover:text-accent-light"
               >
-                Go to Playground →
+                {hasVoices ? 'Go to Playground →' : 'Create first voice →'}
               </Link>
             </div>
           ) : (
@@ -269,7 +269,7 @@ export function Dashboard() {
       {/* Quick Links */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
         <QuickLink to="/voices" label="Manage Voices" icon="mic" />
-        <QuickLink to="/playground" label="TTS Playground" icon="play" />
+        <QuickLink to={hasVoices ? '/playground' : '/voices'} label={hasVoices ? 'TTS Playground' : 'Create Voice'} icon={hasVoices ? 'play' : 'mic'} />
         <QuickLink to="/queue" label="Training Queue" icon="training" />
         <QuickLink to="/statistics" label="Statistics" icon="chart" />
       </div>

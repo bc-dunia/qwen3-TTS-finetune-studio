@@ -131,19 +131,24 @@ export function VoiceDataset() {
   const partialUploadWarning = searchParams.get('uploadWarning') === '1'
   const useRawTrainingPipeline = shouldUseRawTrainingPipeline(rows)
   const hasDatasetName = datasetName.trim().length > 0
+  const hasRawUploads = rows.length > 0
   const hasSelectedRows = selectedRows.length > 0
+  const hasUsableSelectedTranscript = selectedRows.some((row) => row.text.trim().length > 0)
   const hasFinalizedDatasetForTraining = Boolean(currentDatasetName) || datasets.length > 0
   const preferredTrainingDatasetName = currentDatasetName ?? datasets[0]?.name ?? null
 
   const canTranscribeSelected = !useRawTrainingPipeline && busyAction === '' && hasSelectedRows
   const canReviewSelected = !useRawTrainingPipeline && busyAction === '' && hasSelectedRows
-  const canAutoPrepareSelected = busyAction === '' && hasSelectedRows && (useRawTrainingPipeline || hasDatasetName)
-  const canCreateFinalizedDataset = !useRawTrainingPipeline && busyAction === '' && hasSelectedRows && Boolean(referenceAudioKey) && hasDatasetName
+  const canAutoPrepareSelected = useRawTrainingPipeline
+    ? busyAction === '' && hasRawUploads
+    : busyAction === '' && hasSelectedRows && hasDatasetName
+  const canCreateFinalizedDataset = !useRawTrainingPipeline && busyAction === '' && hasSelectedRows && hasUsableSelectedTranscript && Boolean(referenceAudioKey) && hasDatasetName
   const canOpenTrainingRecommended = hasFinalizedDatasetForTraining
 
   const datasetActionHints = [
     busyAction !== '' ? 'Wait for the current dataset action to finish.' : '',
-    !hasSelectedRows ? 'Select at least one raw clip.' : '',
+    !useRawTrainingPipeline && !hasSelectedRows ? 'Select at least one raw clip.' : '',
+    !useRawTrainingPipeline && hasSelectedRows && !hasUsableSelectedTranscript ? 'Add or auto-generate transcript text for at least one selected clip.' : '',
     !useRawTrainingPipeline && !hasDatasetName ? 'Enter a dataset name.' : '',
     !useRawTrainingPipeline && !referenceAudioKey ? 'Choose a reference clip.' : '',
     useRawTrainingPipeline ? 'Raw pipeline mode: clip-by-clip transcript actions and manual dataset creation are skipped.' : '',
@@ -578,7 +583,7 @@ export function VoiceDataset() {
         <ol className="mt-2 space-y-1 text-xs text-subtle">
           {useRawTrainingPipeline ? (
             <>
-              <li><span className="font-semibold text-primary">1.</span> Keep your raw uploads selected.</li>
+              <li><span className="font-semibold text-primary">1.</span> Review uploaded source files.</li>
               <li><span className="font-semibold text-primary">2.</span> Start training from raw uploads.</li>
               <li><span className="font-semibold text-primary">3.</span> Open Training to monitor progress.</li>
             </>

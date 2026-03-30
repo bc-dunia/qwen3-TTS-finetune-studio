@@ -17,6 +17,11 @@ function getStatusClass(status: Voice['status']) {
   return 'bg-raised text-muted'
 }
 
+function hasFinalizedDataset(voice: Voice | null): boolean {
+  const refAudioKey = voice?.ref_audio_r2_key
+  return Boolean(refAudioKey && /\/ref_audio\.[^/]+$/i.test(refAudioKey))
+}
+
 export function VoiceWorkspace() {
   const { voiceId = '' } = useParams()
   const [voice, setVoice] = useState<Voice | null>(null)
@@ -52,6 +57,7 @@ export function VoiceWorkspace() {
 
   const statusText = voice?.status ?? 'unknown'
   const hasCheckpoint = Boolean(voice?.run_name) || Boolean(voice?.checkpoint_r2_prefix)
+  const datasetReady = hasFinalizedDataset(voice)
 
   return (
     <div className="space-y-5">
@@ -110,10 +116,19 @@ export function VoiceWorkspace() {
 
         {!loading && !hasCheckpoint && (
           <div className="mt-3 rounded-lg border border-accent/20 bg-accent-dim px-3 py-2 text-xs text-subtle">
-            <span className="font-semibold text-primary">Next step:</span> finalize your dataset, then start training.
-            <Link to="dataset" className="ml-1 text-accent font-semibold hover:text-accent-light">Dataset</Link>
-            <span className="mx-1">→</span>
-            <Link to="training" className="text-accent font-semibold hover:text-accent-light">Training</Link>
+            {datasetReady ? (
+              <>
+                <span className="font-semibold text-primary">Next step:</span> start training with your finalized dataset.
+                <Link to="training" className="ml-1 text-accent font-semibold hover:text-accent-light">Training</Link>
+              </>
+            ) : (
+              <>
+                <span className="font-semibold text-primary">Next step:</span> finalize your dataset, then start training.
+                <Link to="dataset" className="ml-1 text-accent font-semibold hover:text-accent-light">Dataset</Link>
+                <span className="mx-1">→</span>
+                <Link to="training" className="text-accent font-semibold hover:text-accent-light">Training</Link>
+              </>
+            )}
           </div>
         )}
       </div>

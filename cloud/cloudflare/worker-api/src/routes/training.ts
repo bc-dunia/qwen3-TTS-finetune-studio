@@ -1144,6 +1144,10 @@ type HoldoutComparisonResult = {
   evaluated_at: number;
 };
 
+const isBlockingHoldoutComparisonStatus = (
+  status: HoldoutComparisonResult['status'],
+): boolean => status === 'failed' || status === 'error' || status === 'skipped_manifest_error';
+
 const pickHoldoutEntries = (
   entries: HoldoutManifestEntry[],
   maxSamples: number,
@@ -1692,7 +1696,7 @@ const applyValidatedCheckpointOutcome = async ({
     voice.status === 'ready' &&
     currentPrefix.length > 0 &&
     currentPrefix !== candidatePrefix;
-  const shouldForceKeepCurrent = hasReadyBaseline && holdoutComparison.status === 'failed';
+  const shouldForceKeepCurrent = hasReadyBaseline && isBlockingHoldoutComparisonStatus(holdoutComparison.status);
   if (shouldForceKeepCurrent) {
     decision = {
       mode: 'keep_current',
@@ -5311,7 +5315,7 @@ const advanceAsyncCheckpointValidation = async (
     const holdoutRejected =
       adoption.mode === 'keep_current' &&
       adoption.holdoutComparison !== null &&
-      adoption.holdoutComparison.status === 'failed';
+      isBlockingHoldoutComparisonStatus(adoption.holdoutComparison.status);
     const validationMessage =
       adoption.mode === 'keep_current'
         ? holdoutRejected
