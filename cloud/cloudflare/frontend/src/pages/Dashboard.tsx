@@ -76,6 +76,9 @@ export function Dashboard() {
   const readyCount = voices.filter((v) => v.status === 'ready').length
   const trainingCount = voices.filter((v) => v.status === 'training').length
   const voiceNames = useMemo(() => new Map(voices.map((v) => [v.voice_id, v.name])), [voices])
+  const hasVoices = voices.length > 0
+  const primaryDashboardHref = hasVoices ? '/playground' : '/voices'
+  const primaryDashboardLabel = hasVoices ? 'Generate Speech' : 'Create First Voice'
 
   return (
     <div className="space-y-8">
@@ -83,17 +86,27 @@ export function Dashboard() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-heading text-2xl font-bold">Dashboard</h1>
-          <p className="text-subtle text-sm mt-1">Voice cloning overview</p>
+          <p className="text-subtle text-sm mt-1">
+            {hasVoices ? 'Voice cloning overview' : 'Create your first voice to start training'}
+          </p>
         </div>
         <Link
-          to="/playground"
+          to={primaryDashboardHref}
           className="inline-flex items-center gap-2 bg-accent hover:bg-accent-light text-void font-semibold text-sm px-5 py-2.5 rounded-lg transition-colors"
         >
-          <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
-            <title>Generate speech</title>
-            <path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l11.24-7.36a1 1 0 0 0 0-1.72L9.5 4.28A1 1 0 0 0 8 5.14z" />
-          </svg>
-          Generate Speech
+          {hasVoices ? (
+            <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+              <title>Generate speech</title>
+              <path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l11.24-7.36a1 1 0 0 0 0-1.72L9.5 4.28A1 1 0 0 0 8 5.14z" />
+            </svg>
+          ) : (
+            <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
+              <title>Create voice</title>
+              <line x1="12" y1="5" x2="12" y2="19" />
+              <line x1="5" y1="12" x2="19" y2="12" />
+            </svg>
+          )}
+          {primaryDashboardLabel}
         </Link>
       </div>
 

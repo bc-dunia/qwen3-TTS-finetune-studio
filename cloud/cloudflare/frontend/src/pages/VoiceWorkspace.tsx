@@ -51,6 +51,7 @@ export function VoiceWorkspace() {
   }, [voiceId])
 
   const statusText = voice?.status ?? 'unknown'
+  const hasCheckpoint = Boolean(voice?.run_name) || Boolean(voice?.checkpoint_r2_prefix)
 
   return (
     <div className="space-y-5">
@@ -106,6 +107,15 @@ export function VoiceWorkspace() {
             </NavLink>
           ))}
         </div>
+
+        {!loading && !hasCheckpoint && (
+          <div className="mt-3 rounded-lg border border-accent/20 bg-accent-dim px-3 py-2 text-xs text-subtle">
+            <span className="font-semibold text-primary">Next step:</span> finalize your dataset, then start training.
+            <Link to="dataset" className="ml-1 text-accent font-semibold hover:text-accent-light">Dataset</Link>
+            <span className="mx-1">→</span>
+            <Link to="training" className="text-accent font-semibold hover:text-accent-light">Training</Link>
+          </div>
+        )}
       </div>
 
       <Outlet context={{ voice, loading }} />
