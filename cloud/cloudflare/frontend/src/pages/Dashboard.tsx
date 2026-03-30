@@ -34,12 +34,13 @@ export function Dashboard() {
 
   useEffect(() => {
     let cancelled = false
+    let pollingInFlight = false
 
     async function load() {
       try {
         const [voicesData, jobsData] = await Promise.all([
           fetchVoices(),
-          fetchAllTrainingJobs(200),
+          fetchAllTrainingJobs(2000),
         ])
         if (!cancelled) {
           setVoices(voicesData.voices)
@@ -54,8 +55,18 @@ export function Dashboard() {
       }
     }
 
-    load()
-    const interval = setInterval(() => { void load() }, 10_000)
+    async function loadWithGuard() {
+      if (pollingInFlight) return
+      pollingInFlight = true
+      await load().finally(() => {
+        pollingInFlight = false
+      })
+    }
+
+    void loadWithGuard()
+    const interval = setInterval(() => {
+      void loadWithGuard()
+    }, 10_000)
     return () => { cancelled = true; clearInterval(interval) }
   }, [])
 

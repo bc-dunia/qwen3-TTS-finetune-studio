@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router'
 import {
   fetchTrainingCheckoutLedger,
@@ -381,19 +381,34 @@ function JobLogsModal({ job, onClose }: { job: TrainingJob; onClose: () => void 
     }
   }, [job.job_id])
 
-  useEffect(() => {
-    void Promise.all([loadLogs(), loadPreprocess(), loadCheckoutLedger()])
+  const runPollingRefresh = useCallback(async (options?: { keepSelection?: boolean }) => {
+    await Promise.allSettled([
+      loadLogs(options),
+      loadPreprocess(options),
+      loadCheckoutLedger(),
+    ])
   }, [loadCheckoutLedger, loadLogs, loadPreprocess])
+
+  const refreshInFlightRef = useRef(false)
+  const runPollingRefreshWithGuard = useCallback(async (options?: { keepSelection?: boolean }) => {
+    if (refreshInFlightRef.current) return
+    refreshInFlightRef.current = true
+    await runPollingRefresh(options).finally(() => {
+      refreshInFlightRef.current = false
+    })
+  }, [runPollingRefresh])
+
+  useEffect(() => {
+    void runPollingRefreshWithGuard()
+  }, [runPollingRefreshWithGuard])
 
   useEffect(() => {
     if (!shouldWatchTrainingJob(job)) return
     const interval = setInterval(() => {
-      void loadLogs({ keepSelection: true })
-      void loadPreprocess({ keepSelection: true })
-      void loadCheckoutLedger()
+      void runPollingRefreshWithGuard({ keepSelection: true })
     }, 10000)
     return () => clearInterval(interval)
-  }, [job, loadCheckoutLedger, loadLogs, loadPreprocess])
+  }, [job, runPollingRefreshWithGuard])
 
   async function handleSelectSeq(seq: number) {
     setSelectedSeq(seq)

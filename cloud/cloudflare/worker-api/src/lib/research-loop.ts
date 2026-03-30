@@ -23,6 +23,10 @@ const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 const DEFAULT_ADVISOR_MODEL = "gpt-5.4";
 const PASSING_SCORE_THRESHOLD = 0.8;
 const RESEARCH_COOLDOWN_MS = 5 * 60 * 1000;
+const RESEARCH_MAX_AUTO_CYCLES = 12;
+const RESEARCH_STAGNATION_WINDOW = 4;
+const RESEARCH_MIN_SCORE_GAIN = 0.008;
+const RESEARCH_MAX_CHAMPION_REGRESSION = 0.02;
 const SCORING_CHANGE_MAX_SHIFT = 0.10;
 const ALLOWED_SCORING_METRICS = new Set(["asr", "speaker", "style", "tone", "speed", "overall", "duration"]);
 
@@ -628,6 +632,64 @@ const buildDefaultState = (voiceId: string, createdAt: number): VoiceResearchSta
   updated_at: createdAt,
 });
 
+const evaluateResearchLoopGuardrails = (
+  snapshot: ResearchSnapshot,
+  state: VoiceResearchState,
+): { blocked: boolean; reason: string; details: Record<string, unknown> } => {
+  if (state.cycle_count >= RESEARCH_MAX_AUTO_CYCLES) {
+    return {
+      blocked: true,
+      reason: "max_cycle_budget_reached",
+      details: {
+        cycle_count: state.cycle_count,
+        max_cycles: RESEARCH_MAX_AUTO_CYCLES,
+      },
+    };
+  }
+
+  const scored = snapshot.recentJobs
+    .map((job) => (typeof job.score === "number" ? job.score : null))
+    .filter((score): score is number => score !== null)
+    .slice(0, RESEARCH_STAGNATION_WINDOW + 1);
+
+  if (scored.length >= RESEARCH_STAGNATION_WINDOW + 1) {
+    const baseline = scored[scored.length - 1];
+    const peak = scored.reduce((best, score) => Math.max(best, score), baseline);
+    const gain = peak - baseline;
+    if (gain < RESEARCH_MIN_SCORE_GAIN) {
+      return {
+        blocked: true,
+        reason: "no_improvement_patience_exhausted",
+        details: {
+          window: RESEARCH_STAGNATION_WINDOW,
+          observed_gain: Number(gain.toFixed(6)),
+          min_required_gain: RESEARCH_MIN_SCORE_GAIN,
+        },
+      };
+    }
+  }
+
+  const latestScore = scored[0] ?? null;
+  const championScore = typeof snapshot.championScore === "number" ? snapshot.championScore : null;
+  if (
+    latestScore !== null &&
+    championScore !== null &&
+    latestScore < championScore - RESEARCH_MAX_CHAMPION_REGRESSION
+  ) {
+    return {
+      blocked: true,
+      reason: "champion_regression_guard",
+      details: {
+        latest_score: Number(latestScore.toFixed(6)),
+        champion_score: Number(championScore.toFixed(6)),
+        max_regression: RESEARCH_MAX_CHAMPION_REGRESSION,
+      },
+    };
+  }
+
+  return { blocked: false, reason: "", details: {} };
+};
+
 const nextHypothesis = (
   current: string | null,
   retrospective: Retrospective,
@@ -789,18 +851,95 @@ export async function maybeAdvanceResearchLoop(
   }
 
   const snapshot = await buildResearchSnapshot(db, voiceId);
+  const stateBase = snapshot.state ?? buildDefaultState(voiceId, now);
+  const expectedUpdatedAt = snapshot.state?.updated_at ?? null;
+  const autonomyMode = stateBase.autonomy_mode;
+
+  if (autonomyMode === "semi_auto" || autonomyMode === "auto") {
+    const guardrail = evaluateResearchLoopGuardrails(snapshot, stateBase);
+    if (guardrail.blocked) {
+      const cycleId = stateBase.cycle_count + 1;
+      const guardState: VoiceResearchState = {
+        ...stateBase,
+        cycle_count: cycleId,
+        pending_action: null,
+        pending_action_params: {
+          reason: guardrail.reason,
+          ...guardrail.details,
+        },
+        updated_at: now,
+      };
+      const guardClaimed = await casUpsertVoiceResearchState(db, guardState, expectedUpdatedAt);
+
+      if (!guardClaimed) {
+        const conflictEntry: VoiceResearchJournal = {
+          entry_id: crypto.randomUUID(),
+          voice_id: voiceId,
+          cycle_id: cycleId,
+          trigger,
+          linked_ids: asRecord(context?.linked_ids) as VoiceResearchJournal["linked_ids"] | null,
+          observations: `Loop guardrail blocked autonomous action: ${guardrail.reason}`,
+          hypothesis: stateBase.active_hypothesis,
+          decision: "hold",
+          decision_params: { reason: guardrail.reason, ...guardrail.details },
+          expected_signal: "Guardrail requires manual review before next autonomous action.",
+          outcome: "cas_conflict_aborted",
+          confidence: "medium",
+          created_at: now,
+        };
+        await appendVoiceResearchJournal(db, conflictEntry);
+        return {
+          entry: conflictEntry,
+          action: {
+            type: "hold",
+            params: { reason: guardrail.reason, ...guardrail.details },
+            reasoning: "Autonomous loop paused by guardrail.",
+          },
+          executed: false,
+          arena_session_id: null,
+          campaign_id: null,
+          state: (await getVoiceResearchState(db, voiceId)) ?? guardState,
+        };
+      }
+
+      const guardEntry: VoiceResearchJournal = {
+        entry_id: crypto.randomUUID(),
+        voice_id: voiceId,
+        cycle_id: cycleId,
+        trigger,
+        linked_ids: asRecord(context?.linked_ids) as VoiceResearchJournal["linked_ids"] | null,
+        observations: `Loop guardrail blocked autonomous action: ${guardrail.reason}`,
+        hypothesis: stateBase.active_hypothesis,
+        decision: "hold",
+        decision_params: { reason: guardrail.reason, ...guardrail.details },
+        expected_signal: "Guardrail requires manual review before next autonomous action.",
+        outcome: `guardrail_blocked:${guardrail.reason}`,
+        confidence: "medium",
+        created_at: now,
+      };
+      await appendVoiceResearchJournal(db, guardEntry);
+      return {
+        entry: guardEntry,
+        action: {
+          type: "hold",
+          params: { reason: guardrail.reason, ...guardrail.details },
+          reasoning: "Autonomous loop paused by guardrail.",
+        },
+        executed: false,
+        arena_session_id: null,
+        campaign_id: null,
+        state: (await getVoiceResearchState(db, voiceId)) ?? guardState,
+      };
+    }
+  }
+
   const retrospective = await writeRetrospective(env, snapshot, trigger, context);
   const rawAction = await decideNextAction(env, snapshot, retrospective, trigger, context);
 
   const action: ResearchAction = rawAction.type === "propose_scoring_change"
     ? { ...rawAction, params: sanitizeScoringChangeParams(rawAction.params) }
     : rawAction;
-
-  const stateBase = snapshot.state ?? buildDefaultState(voiceId, now);
-  const expectedUpdatedAt = snapshot.state?.updated_at ?? null;
   const cycleId = stateBase.cycle_count + 1;
-
-  const autonomyMode = stateBase.autonomy_mode;
   let pendingAction: VoiceResearchState["pending_action"] = action.type;
   let pendingParams: VoiceResearchState["pending_action_params"] = action.params;
 

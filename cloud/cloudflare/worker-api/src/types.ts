@@ -21,7 +21,7 @@ export interface Env {
   OPENAI_TRANSCRIBE_MODEL?: string;
   OPENAI_REVIEW_MODEL?: string;
   OPENAI_ADVISOR_MODEL?: string;
-  WORKER_PUBLIC_URL?: string;
+  WORKER_PUBLIC_URL: string;
   TRAINING_MAX_ACTIVE_JOBS_PER_VOICE?: string;
 }
 

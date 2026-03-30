@@ -13,7 +13,6 @@ import threading
 import tempfile
 import time
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 from typing import Any
 import numpy as np
@@ -870,16 +869,21 @@ def _download_checkpoint(
         raise FileNotFoundError(
             f"Unknown voice_id/checkpoint: {voice_id}/{run_name}/checkpoint-epoch-{epoch}"
         )
-    pool = ThreadPoolExecutor(max_workers=1)
-    fut = pool.submit(storage.download_checkpoint, voice_id, run_name, epoch, dst)
+    deadline = time.monotonic() + float(R2_TIMEOUT_SEC)
     try:
-        fut.result(timeout=R2_TIMEOUT_SEC)
+        try:
+            storage.download_checkpoint(
+                voice_id,
+                run_name,
+                epoch,
+                dst,
+                deadline_monotonic=deadline,
+            )
+        except TypeError:
+            storage.download_checkpoint(voice_id, run_name, epoch, dst)
     except TimeoutError as exc:
-        fut.cancel()
-        pool.shutdown(wait=False, cancel_futures=True)
+        shutil.rmtree(dst, ignore_errors=True)
         raise TimeoutError(f"R2 download timed out after {R2_TIMEOUT_SEC}s") from exc
-    finally:
-        pool.shutdown(wait=False)
     _log(
         f"checkpoint_download_ms={int((time.time() - start) * 1000)} files={len(objs)}"
     )
@@ -897,24 +901,24 @@ def _download_full_checkpoint(storage: Any, r2_prefix: str, local_dir: Path) -> 
 
     local_dir.mkdir(parents=True, exist_ok=True)
 
-    def _download_all() -> None:
+    deadline = time.monotonic() + float(R2_TIMEOUT_SEC)
+    try:
         for obj in objs:
             key = obj["key"]
             relative = key[len(prefix) :]
             if not relative:
                 continue
-            storage.download_file(key, local_dir / relative)
-
-    pool = ThreadPoolExecutor(max_workers=1)
-    fut = pool.submit(_download_all)
-    try:
-        fut.result(timeout=R2_TIMEOUT_SEC)
+            try:
+                storage.download_file(
+                    key,
+                    local_dir / relative,
+                    deadline_monotonic=deadline,
+                )
+            except TypeError:
+                storage.download_file(key, local_dir / relative)
     except TimeoutError as exc:
-        fut.cancel()
-        pool.shutdown(wait=False, cancel_futures=True)
+        shutil.rmtree(local_dir, ignore_errors=True)
         raise TimeoutError(f"R2 download timed out after {R2_TIMEOUT_SEC}s") from exc
-    finally:
-        pool.shutdown(wait=False)
 
     _log(
         f"full_checkpoint_download_ms={int((time.time() - start) * 1000)} files={len(objs)}"

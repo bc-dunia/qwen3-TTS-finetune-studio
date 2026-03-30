@@ -232,7 +232,10 @@ export function VoiceArena() {
 
   function startPolling(sessionId: string) {
     stopPolling()
+    let pollInFlight = false
     pollRef.current = setInterval(async () => {
+      if (pollInFlight) return
+      pollInFlight = true
       try {
         const updated = await getArenaSession(sessionId)
         setSession(updated)
@@ -250,6 +253,8 @@ export function VoiceArena() {
         }
       } catch {
         // transient error, keep polling
+      } finally {
+        pollInFlight = false
       }
     }, 3000)
   }

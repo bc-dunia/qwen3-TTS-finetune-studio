@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router'
 import { TrainingAdviceCard } from '../components/TrainingAdviceCard'
 import { DecisionHeader } from '../components/compare/DecisionHeader'
@@ -439,6 +439,7 @@ export function VoiceCompare() {
   const [refreshing, setRefreshing] = useState(false)
   const [applyingCandidateId, setApplyingCandidateId] = useState('')
   const [serverTrainingAdvice, setServerTrainingAdvice] = useState<TrainingAdvice | null>(null)
+  const loadInFlightRef = useRef(false)
 
   const requestedJobId = searchParams.get('job') ?? ''
   const trainingResetAt = getTrainingResetAt(voice)
@@ -471,8 +472,10 @@ export function VoiceCompare() {
   const localTrainingAdvice = buildTrainingAdvice(voice, cycleJobs)
   const trainingAdvice = serverTrainingAdvice ?? localTrainingAdvice
 
-  async function loadData(options?: { silent?: boolean }) {
+  const loadData = useCallback(async (options?: { silent?: boolean }) => {
     if (!voiceId) return
+    if (loadInFlightRef.current) return
+    loadInFlightRef.current = true
     const silent = options?.silent === true
     if (silent) {
       setRefreshing(true)
@@ -494,22 +497,28 @@ export function VoiceCompare() {
     } finally {
       setLoading(false)
       setRefreshing(false)
+      loadInFlightRef.current = false
     }
-  }
-
-  useEffect(() => {
-    void loadData()
   }, [voiceId])
 
   useEffect(() => {
+    void loadData()
+  }, [loadData])
+
+  useEffect(() => {
     if (!voiceId || !hasWatchableJobs) return
+    let pollInFlight = false
 
     const interval = setInterval(() => {
-      void loadData({ silent: true })
+      if (pollInFlight) return
+      pollInFlight = true
+      void loadData({ silent: true }).finally(() => {
+        pollInFlight = false
+      })
     }, 8000)
 
     return () => clearInterval(interval)
-  }, [voiceId, hasWatchableJobs])
+  }, [voiceId, hasWatchableJobs, loadData])
 
   useEffect(() => {
     if (!voice) {

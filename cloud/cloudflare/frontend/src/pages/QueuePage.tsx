@@ -23,17 +23,24 @@ export function QueuePage() {
   const [voices, setVoices] = useState<Voice[]>([])
   const [stats, setStats] = useState<QueueStats | null>(null)
   const [loading, setLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
 
   useEffect(() => {
     let cancelled = false
+    let pollingInFlight = false
 
-    async function load() {
-      setLoading(true)
+    async function load(options?: { background?: boolean }) {
+      const isBackground = options?.background === true
+      if (isBackground) {
+        setRefreshing(true)
+      } else {
+        setLoading(true)
+      }
       setError('')
       try {
         const [jobsResponse, voicesResponse] = await Promise.all([
-          fetchAllTrainingJobs(200),
+          fetchAllTrainingJobs(2000),
           fetchVoices(),
         ])
         if (cancelled) return
@@ -60,13 +67,22 @@ export function QueuePage() {
       } finally {
         if (!cancelled) {
           setLoading(false)
+          setRefreshing(false)
         }
       }
     }
 
-    void load()
+    async function loadWithGuard(options?: { background?: boolean }) {
+      if (pollingInFlight) return
+      pollingInFlight = true
+      await load(options).finally(() => {
+        pollingInFlight = false
+      })
+    }
+
+    void loadWithGuard()
     const interval = setInterval(() => {
-      void load()
+      void loadWithGuard({ background: true })
     }, 5000)
 
     return () => {
@@ -94,6 +110,7 @@ export function QueuePage() {
         <div>
           <h1 className="text-heading text-2xl font-bold">Queue Monitor</h1>
           <p className="text-subtle text-sm mt-1">Global training throughput across all voices.</p>
+          {refreshing && <p className="text-muted text-xs mt-2">Refreshing…</p>}
         </div>
         {stats && (
           <div className="flex flex-wrap items-center gap-2">
@@ -118,7 +135,7 @@ export function QueuePage() {
 
       <section className="rounded-xl border border-edge bg-raised p-4">
         <h2 className="text-heading text-sm font-semibold">Active Training Jobs ({activeJobs.length})</h2>
-        {loading ? (
+        {loading && jobs.length === 0 ? (
           <p className="mt-4 text-sm text-muted">Loading queue...</p>
         ) : activeJobs.length === 0 ? (
           <p className="mt-4 rounded-lg border border-dashed border-edge bg-surface px-3 py-6 text-center text-sm text-subtle">

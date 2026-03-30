@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router'
 import {
   ApiError,
@@ -121,6 +121,8 @@ export function VoiceDataset() {
   const [message, setMessage] = useState('')
   const [autoProgress, setAutoProgress] = useState<AutoPrepareProgress | null>(null)
   const autoStartedRef = useRef(false)
+  const runAutoPrepareRef = useRef<(options?: { navigateToTraining?: boolean }) => Promise<void>>(async () => {})
+  const runRawTrainingAutoStartRef = useRef<(options?: { navigateToTraining?: boolean }) => Promise<void>>(async () => {})
 
   const selectedRows = rows.filter((row) => row.selected)
   const currentDatasetName = inferCurrentDatasetName(voice)
@@ -128,8 +130,26 @@ export function VoiceDataset() {
   const openTrainingWhenReady = searchParams.get('openTraining') === '1'
   const partialUploadWarning = searchParams.get('uploadWarning') === '1'
   const useRawTrainingPipeline = shouldUseRawTrainingPipeline(rows)
+  const hasDatasetName = datasetName.trim().length > 0
+  const hasSelectedRows = selectedRows.length > 0
+  const hasFinalizedDatasetForTraining = Boolean(currentDatasetName) || datasets.length > 0
+  const preferredTrainingDatasetName = currentDatasetName ?? datasets[0]?.name ?? null
 
-  async function loadData() {
+  const canTranscribeSelected = !useRawTrainingPipeline && busyAction === '' && hasSelectedRows
+  const canReviewSelected = !useRawTrainingPipeline && busyAction === '' && hasSelectedRows
+  const canAutoPrepareSelected = busyAction === '' && hasSelectedRows && (useRawTrainingPipeline || hasDatasetName)
+  const canCreateFinalizedDataset = !useRawTrainingPipeline && busyAction === '' && hasSelectedRows && Boolean(referenceAudioKey) && hasDatasetName
+  const canOpenTrainingRecommended = hasFinalizedDatasetForTraining
+
+  const datasetActionHints = [
+    busyAction !== '' ? 'Wait for the current dataset action to finish.' : '',
+    !hasSelectedRows ? 'Select at least one raw clip.' : '',
+    !useRawTrainingPipeline && !hasDatasetName ? 'Enter a dataset name.' : '',
+    !useRawTrainingPipeline && !referenceAudioKey ? 'Choose a reference clip.' : '',
+    useRawTrainingPipeline ? 'Raw pipeline mode: clip-by-clip transcript actions and manual dataset creation are skipped.' : '',
+  ].filter(Boolean)
+
+  const loadData = useCallback(async () => {
     if (!voiceId) return
     setLoading(true)
     setError('')
@@ -157,11 +177,11 @@ export function VoiceDataset() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [voiceId])
 
   useEffect(() => {
-    loadData()
-  }, [voiceId])
+    void loadData()
+  }, [loadData])
 
   useEffect(() => {
     if (!partialUploadWarning) return
@@ -496,16 +516,19 @@ export function VoiceDataset() {
     }
   }
 
+  runAutoPrepareRef.current = runAutoPrepare
+  runRawTrainingAutoStartRef.current = runRawTrainingAutoStart
+
   useEffect(() => {
     if (loading || rows.length === 0 || !autoPrepareRequested || autoStartedRef.current) {
       return
     }
     autoStartedRef.current = true
     if (useRawTrainingPipeline) {
-      void runRawTrainingAutoStart({ navigateToTraining: openTrainingWhenReady })
+      void runRawTrainingAutoStartRef.current({ navigateToTraining: openTrainingWhenReady })
       return
     }
-    void runAutoPrepare({ navigateToTraining: openTrainingWhenReady })
+    void runAutoPrepareRef.current({ navigateToTraining: openTrainingWhenReady })
   }, [loading, rows.length, autoPrepareRequested, openTrainingWhenReady, useRawTrainingPipeline])
 
   if (loading) {
@@ -550,20 +573,39 @@ export function VoiceDataset() {
         Review raw uploads, clean transcripts, choose a reference clip, and create the finalized dataset used for training.
       </p>
 
+      <section className="rounded-xl border border-accent/20 bg-accent-dim px-4 py-3">
+        <h2 className="text-[11px] font-semibold uppercase tracking-wider text-accent">Dataset quick flow</h2>
+        <ol className="mt-2 space-y-1 text-xs text-subtle">
+          {useRawTrainingPipeline ? (
+            <>
+              <li><span className="font-semibold text-primary">1.</span> Keep your raw uploads selected.</li>
+              <li><span className="font-semibold text-primary">2.</span> Start training from raw uploads.</li>
+              <li><span className="font-semibold text-primary">3.</span> Open Training to monitor progress.</li>
+            </>
+          ) : (
+            <>
+              <li><span className="font-semibold text-primary">1.</span> Select clips and clean transcripts.</li>
+              <li><span className="font-semibold text-primary">2.</span> Create and activate a finalized dataset.</li>
+              <li><span className="font-semibold text-primary">3.</span> Open Training with recommended defaults.</li>
+            </>
+          )}
+        </ol>
+      </section>
+
       {error && (
-        <div className="rounded-lg border border-error/20 bg-error-dim px-4 py-3 text-error text-sm">
+        <div role="alert" className="rounded-lg border border-error/20 bg-error-dim px-4 py-3 text-error text-sm">
           {error}
         </div>
       )}
 
       {message && (
-        <div className="rounded-lg border border-accent/20 bg-accent-dim px-4 py-3 text-accent text-sm">
+        <div role="status" aria-live="polite" className="rounded-lg border border-accent/20 bg-accent-dim px-4 py-3 text-accent text-sm">
           {message}
         </div>
       )}
 
       {autoProgress && (
-        <div className="rounded-lg border border-accent/20 bg-surface px-4 py-3">
+        <div role="status" aria-live="polite" className="rounded-lg border border-accent/20 bg-surface px-4 py-3">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <div className="text-primary text-sm font-semibold">Auto Prepare Progress</div>
@@ -644,8 +686,9 @@ export function VoiceDataset() {
             </div>
 
             <div>
-              <label className="text-subtle text-xs font-medium mb-1.5 block">Dataset Name</label>
+              <label htmlFor="dataset-name" className="text-subtle text-xs font-medium mb-1.5 block">Dataset Name</label>
               <input
+                id="dataset-name"
                 value={datasetName}
                 onChange={(e) => setDatasetName(e.target.value)}
                 className="w-full bg-surface border border-edge rounded-lg px-3 py-2 text-sm text-primary font-mono focus:border-accent transition-colors"
@@ -653,8 +696,9 @@ export function VoiceDataset() {
             </div>
 
             <div>
-              <label className="text-subtle text-xs font-medium mb-1.5 block">Language</label>
+              <label htmlFor="dataset-language" className="text-subtle text-xs font-medium mb-1.5 block">Language</label>
               <select
+                id="dataset-language"
                 value={languageCode}
                 onChange={(e) => setLanguageCode(e.target.value)}
                 className="w-full bg-surface border border-edge rounded-lg px-3 py-2 text-sm text-primary focus:border-accent transition-colors"
@@ -667,8 +711,9 @@ export function VoiceDataset() {
             </div>
 
             <div>
-              <label className="text-subtle text-xs font-medium mb-1.5 block">Reference Text</label>
+              <label htmlFor="dataset-reference-text" className="text-subtle text-xs font-medium mb-1.5 block">Reference Text</label>
               <textarea
+                id="dataset-reference-text"
                 value={referenceText}
                 onChange={(e) => setReferenceText(e.target.value)}
                 rows={3}
@@ -680,7 +725,8 @@ export function VoiceDataset() {
             <div className="flex flex-wrap gap-2">
               <button
                 onClick={handleRetranscribeSelected}
-                disabled={useRawTrainingPipeline || busyAction !== '' || selectedRows.length === 0}
+                disabled={!canTranscribeSelected}
+                aria-describedby={!canTranscribeSelected ? 'dataset-action-hints' : undefined}
                 className="inline-flex items-center rounded-lg border border-edge px-3 py-2 text-[11px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent disabled:opacity-50"
                 type="button"
               >
@@ -688,7 +734,8 @@ export function VoiceDataset() {
               </button>
               <button
                 onClick={handleReviewSelected}
-                disabled={useRawTrainingPipeline || busyAction !== '' || selectedRows.length === 0}
+                disabled={!canReviewSelected}
+                aria-describedby={!canReviewSelected ? 'dataset-action-hints' : undefined}
                 className="inline-flex items-center rounded-lg border border-edge px-3 py-2 text-[11px] font-semibold text-primary transition-colors hover:border-accent hover:text-accent disabled:opacity-50"
                 type="button"
               >
@@ -702,7 +749,8 @@ export function VoiceDataset() {
                   }
                   void runAutoPrepare()
                 }}
-                disabled={busyAction !== '' || selectedRows.length === 0 || (!useRawTrainingPipeline && !datasetName.trim())}
+                disabled={!canAutoPrepareSelected}
+                aria-describedby={!canAutoPrepareSelected ? 'dataset-action-hints' : undefined}
                 className="inline-flex items-center rounded-lg border border-accent/40 bg-accent-dim px-3 py-2 text-[11px] font-semibold text-accent transition-colors hover:border-accent hover:text-accent-light disabled:opacity-50"
                 type="button"
               >
@@ -726,29 +774,47 @@ export function VoiceDataset() {
               </button>
             </div>
 
-            <button
-              onClick={handleCreateDataset}
-              disabled={useRawTrainingPipeline || busyAction !== '' || selectedRows.length === 0 || !referenceAudioKey || !datasetName.trim()}
-              className="w-full bg-accent hover:bg-accent-light text-void font-semibold text-sm py-2.5 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-              type="button"
-            >
-              {busyAction === 'create' ? 'Creating Dataset…' : 'Create Finalized Dataset'}
-            </button>
+              <button
+                onClick={handleCreateDataset}
+                disabled={!canCreateFinalizedDataset}
+                aria-describedby={!canCreateFinalizedDataset ? 'dataset-action-hints' : undefined}
+                className="w-full bg-accent hover:bg-accent-light text-void font-semibold text-sm py-2.5 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                type="button"
+              >
+                {busyAction === 'create' ? 'Creating Dataset…' : 'Create Finalized Dataset'}
+              </button>
 
-            <button
-              onClick={() => {
-                const targetDataset = currentDatasetName ?? datasetName.trim()
-                if (!targetDataset) return
-                navigate(encodeTrainingQuery(voice.voice_id, targetDataset))
-              }}
-              disabled={!currentDatasetName && !datasetName.trim()}
-              className="w-full rounded-lg border border-edge px-3 py-2 text-sm font-semibold text-primary transition-colors hover:border-accent hover:text-accent disabled:opacity-40"
-              type="button"
-            >
-              Open Training With Recommended Setup
-            </button>
+              {datasetActionHints.length > 0 && (
+                <div id="dataset-action-hints" role="status" aria-live="polite" className="rounded-lg border border-warning/20 bg-warning-dim px-3 py-2 text-[11px] text-warning">
+                  <div className="font-semibold">Before continuing:</div>
+                  <ul className="mt-1 space-y-0.5">
+                    {datasetActionHints.map((hint) => (
+                      <li key={hint}>• {hint}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              <button
+                onClick={() => {
+                  const targetDataset = preferredTrainingDatasetName
+                  if (!targetDataset) return
+                  navigate(encodeTrainingQuery(voice.voice_id, targetDataset))
+                }}
+                disabled={!canOpenTrainingRecommended}
+                aria-describedby={!canOpenTrainingRecommended ? 'dataset-open-training-hint' : undefined}
+                className="w-full rounded-lg border border-edge px-3 py-2 text-sm font-semibold text-primary transition-colors hover:border-accent hover:text-accent disabled:opacity-40"
+                type="button"
+              >
+                Open Training With Recommended Setup
+              </button>
+              {!canOpenTrainingRecommended && (
+                <p id="dataset-open-training-hint" role="status" aria-live="polite" className="text-[11px] text-warning">
+                  Create or activate at least one finalized dataset first.
+                </p>
+              )}
+            </div>
           </div>
-        </div>
 
         <div className="bg-raised border border-edge rounded-xl p-5">
           <div className="flex items-center justify-between gap-4 mb-4">
@@ -780,7 +846,7 @@ export function VoiceDataset() {
                     type="button"
                   >
                     Go to Training
-                    <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor"><path d="M12 4l-1.41 1.41L16.17 11H4v2h12.17l-5.58 5.59L12 20l8-8-8-8z" /></svg>
+                    <svg aria-hidden="true" className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor"><path d="M12 4l-1.41 1.41L16.17 11H4v2h12.17l-5.58 5.59L12 20l8-8-8-8z" /></svg>
                   </button>
                 </>
               ) : (

@@ -6,6 +6,7 @@ import math
 import re
 import shutil
 import statistics
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,10 @@ class DatasetIssue:
     row_index: int | None = None
 
 SAMPLE_RATE_HZ = 24000
+
+_REVIEW_MODEL_LOCK = threading.Lock()
+_WHISPER_MODEL_CACHE: dict[str, Any] = {}
+_SPEAKER_MODEL_CACHE: dict[str, Any] = {}
 
 def _safe_audio_info(path: Path) -> tuple[int | None, float]:
     try:
@@ -290,6 +295,134 @@ def _estimate_runtime_range_hours(total_steps: int, selected_device: str) -> tup
     return min_hours, max_hours
 
 
+def _build_preflight_requirements(
+    *,
+    summary: dict[str, Any],
+    issue_codes: set[str],
+    model_check: dict[str, Any],
+    hf_model_check: dict[str, Any],
+    device_check: dict[str, Any],
+    disk_check: dict[str, Any],
+    required_disk_gb: float,
+    total_audio_min: float,
+    unique_ref_count: int,
+    unique_text_ratio: float,
+    analyzed: int,
+    clip_ratio: float,
+    low_snr_ratio: float,
+) -> list[dict[str, str]]:
+    return [
+        _requirement_check(
+            code="REQ_SCHEMA",
+            level="required",
+            requirement="No blocking dataset errors (missing files/empty text/ref 24k).",
+            passed=int(summary.get("errors", 0)) == 0,
+            current=f"errors={summary.get('errors', 0)}",
+            target="errors=0",
+            impact="Training can fail immediately or produce unusable checkpoints.",
+            action="Run Quality Validation and fix all ERROR items first.",
+        ),
+        _requirement_check(
+            code="REQ_MODEL_PATH",
+            level="required",
+            requirement="Init model path must be valid (local path or HuggingFace model id).",
+            passed=bool(model_check.get("ok", False)),
+            current=str(model_check.get("path", "unknown")),
+            target="resolvable model path",
+            impact="Model load failure at training start.",
+            action="Fix `init_model_path` before prepare/train.",
+        ),
+        _requirement_check(
+            code="REQ_MODEL_ACCESS",
+            level="required",
+            requirement="Init model must be accessible (local exists or hub reachable/cached).",
+            passed=bool(model_check.get("ok", False)) and bool(hf_model_check.get("ok", True)),
+            current=(
+                str(model_check.get("path", "unknown"))
+                if str(model_check.get("mode", "")) == "local"
+                else f"hub:{model_check.get('path', '')} cached={hf_model_check.get('cached', False)}"
+            ),
+            target="accessible model source",
+            impact="Training will fail after spending time on setup if the model cannot be downloaded.",
+            action="Ensure network access to HuggingFace, login with a token for private/gated repos, or use a local model path.",
+        ),
+        _requirement_check(
+            code="REQ_DEVICE",
+            level="required",
+            requirement="Requested prepare device must be available.",
+            passed=bool(device_check.get("ok", False)),
+            current=str(device_check.get("selected", "unknown")),
+            target="available cuda/mps/cpu device",
+            impact="Prepare stage fails before audio code extraction.",
+            action="Set device to `auto` or an actually available device.",
+        ),
+        _requirement_check(
+            code="REQ_DISK",
+            level="required",
+            requirement="Free disk must cover estimated checkpoint/output footprint.",
+            passed=float(disk_check.get("free_gb", 0.0)) >= float(required_disk_gb),
+            current=f"free={disk_check.get('free_gb', 0.0)}GB",
+            target=f">={required_disk_gb}GB",
+            impact="Training can stop mid-run due to disk exhaustion.",
+            action="Free disk or lower epochs/model size before training.",
+        ),
+        _requirement_check(
+            code="REC_DURATION",
+            level="recommended",
+            requirement="Prefer at least 10 minutes of clean target speech.",
+            passed=total_audio_min >= 10.0,
+            current=f"{total_audio_min:.2f} min",
+            target=">= 10.00 min",
+            impact="Too little data increases overfitting and unstable speaker identity.",
+            action="Add more clean speech data or reduce learning rate/epochs.",
+        ),
+        _requirement_check(
+            code="REC_SINGLE_REF",
+            level="recommended",
+            requirement="Use one consistent reference audio across samples.",
+            passed=unique_ref_count <= 1,
+            current=f"unique_ref_audio={unique_ref_count}",
+            target="1",
+            impact="Multiple refs often reduce timbre consistency.",
+            action="Unify `ref_audio` to a single clean reference clip.",
+        ),
+        _requirement_check(
+            code="REC_AUDIO_24K",
+            level="recommended",
+            requirement="All train audio should be 24kHz mono.",
+            passed="NON_24K_SAMPLE_RATE" not in issue_codes,
+            current=f"sample_rates={summary.get('sample_rates', {})}",
+            target=f"{{{SAMPLE_RATE_HZ}: N}}",
+            impact="Resampling at runtime may lower consistency and quality.",
+            action="Run Normalize step before prepare/train.",
+        ),
+        _requirement_check(
+            code="REC_TEXT_DIVERSITY",
+            level="recommended",
+            requirement="Transcript diversity should be high.",
+            passed=unique_text_ratio >= 0.9,
+            current=f"unique_text_ratio={unique_text_ratio}",
+            target=">= 0.9",
+            impact="Low diversity hurts generalization to unseen sentences.",
+            action="Remove duplicate text and expand script variety.",
+        ),
+        _requirement_check(
+            code="REC_SIGNAL",
+            level="recommended",
+            requirement="Signal quality should avoid heavy clipping/noise.",
+            passed=(analyzed == 0) or (clip_ratio < 0.1 and low_snr_ratio < 0.15),
+            current=(
+                f"clip_ratio={clip_ratio:.3f}, low_snr_ratio={low_snr_ratio:.3f}"
+                if analyzed > 0
+                else "not analyzed"
+            ),
+            target="clip_ratio<0.1 and low_snr_ratio<0.15",
+            impact="Noisy/clipped data degrades naturalness and intelligibility.",
+            action="Denoise/re-record bad clips and rerun validation.",
+        ),
+    ]
+
+
 def run_preflight_review(
     raw_jsonl_path: str | Path,
     *,
@@ -452,116 +585,21 @@ def run_preflight_review(
     clip_ratio = (clip_count / analyzed) if analyzed > 0 else 0.0
     low_snr_ratio = (low_snr_count / analyzed) if analyzed > 0 else 0.0
 
-    requirements = [
-        _requirement_check(
-            code="REQ_SCHEMA",
-            level="required",
-            requirement="No blocking dataset errors (missing files/empty text/ref 24k).",
-            passed=int(summary.get("errors", 0)) == 0,
-            current=f"errors={summary.get('errors', 0)}",
-            target="errors=0",
-            impact="Training can fail immediately or produce unusable checkpoints.",
-            action="Run Quality Validation and fix all ERROR items first.",
-        ),
-        _requirement_check(
-            code="REQ_MODEL_PATH",
-            level="required",
-            requirement="Init model path must be valid (local path or HuggingFace model id).",
-            passed=bool(model_check.get("ok", False)),
-            current=str(model_check.get("path", "unknown")),
-            target="resolvable model path",
-            impact="Model load failure at training start.",
-            action="Fix `init_model_path` before prepare/train.",
-        ),
-        _requirement_check(
-            code="REQ_MODEL_ACCESS",
-            level="required",
-            requirement="Init model must be accessible (local exists or hub reachable/cached).",
-            passed=bool(model_check.get("ok", False)) and bool(hf_model_check.get("ok", True)),
-            current=(
-                str(model_check.get("path", "unknown"))
-                if str(model_check.get("mode", "")) == "local"
-                else f"hub:{init_model_path} cached={hf_model_check.get('cached', False)}"
-            ),
-            target="accessible model source",
-            impact="Training will fail after spending time on setup if the model cannot be downloaded.",
-            action="Ensure network access to HuggingFace, login with a token for private/gated repos, or use a local model path.",
-        ),
-        _requirement_check(
-            code="REQ_DEVICE",
-            level="required",
-            requirement="Requested prepare device must be available.",
-            passed=bool(device_check.get("ok", False)),
-            current=str(device_check.get("selected", "unknown")),
-            target="available cuda/mps/cpu device",
-            impact="Prepare stage fails before audio code extraction.",
-            action="Set device to `auto` or an actually available device.",
-        ),
-        _requirement_check(
-            code="REQ_DISK",
-            level="required",
-            requirement="Free disk must cover estimated checkpoint/output footprint.",
-            passed=float(disk_check.get("free_gb", 0.0)) >= float(required_disk_gb),
-            current=f"free={disk_check.get('free_gb', 0.0)}GB",
-            target=f">={required_disk_gb}GB",
-            impact="Training can stop mid-run due to disk exhaustion.",
-            action="Free disk or lower epochs/model size before training.",
-        ),
-        _requirement_check(
-            code="REC_DURATION",
-            level="recommended",
-            requirement="Prefer at least 10 minutes of clean target speech.",
-            passed=total_audio_min >= 10.0,
-            current=f"{total_audio_min:.2f} min",
-            target=">= 10.00 min",
-            impact="Too little data increases overfitting and unstable speaker identity.",
-            action="Add more clean speech data or reduce learning rate/epochs.",
-        ),
-        _requirement_check(
-            code="REC_SINGLE_REF",
-            level="recommended",
-            requirement="Use one consistent reference audio across samples.",
-            passed=unique_ref_count <= 1,
-            current=f"unique_ref_audio={unique_ref_count}",
-            target="1",
-            impact="Multiple refs often reduce timbre consistency.",
-            action="Unify `ref_audio` to a single clean reference clip.",
-        ),
-        _requirement_check(
-            code="REC_AUDIO_24K",
-            level="recommended",
-            requirement="All train audio should be 24kHz mono.",
-            passed="NON_24K_SAMPLE_RATE" not in issue_codes,
-            current=f"sample_rates={summary.get('sample_rates', {})}",
-            target=f"{{{SAMPLE_RATE_HZ}: N}}",
-            impact="Resampling at runtime may lower consistency and quality.",
-            action="Run Normalize step before prepare/train.",
-        ),
-        _requirement_check(
-            code="REC_TEXT_DIVERSITY",
-            level="recommended",
-            requirement="Transcript diversity should be high.",
-            passed=unique_text_ratio >= 0.9,
-            current=f"unique_text_ratio={unique_text_ratio}",
-            target=">= 0.9",
-            impact="Low diversity hurts generalization to unseen sentences.",
-            action="Remove duplicate text and expand script variety.",
-        ),
-        _requirement_check(
-            code="REC_SIGNAL",
-            level="recommended",
-            requirement="Signal quality should avoid heavy clipping/noise.",
-            passed=(analyzed == 0) or (clip_ratio < 0.1 and low_snr_ratio < 0.15),
-            current=(
-                f"clip_ratio={clip_ratio:.3f}, low_snr_ratio={low_snr_ratio:.3f}"
-                if analyzed > 0
-                else "not analyzed"
-            ),
-            target="clip_ratio<0.1 and low_snr_ratio<0.15",
-            impact="Noisy/clipped data degrades naturalness and intelligibility.",
-            action="Denoise/re-record bad clips and rerun validation.",
-        ),
-    ]
+    requirements = _build_preflight_requirements(
+        summary=summary,
+        issue_codes=issue_codes,
+        model_check=model_check,
+        hf_model_check=hf_model_check,
+        device_check=device_check,
+        disk_check=disk_check,
+        required_disk_gb=required_disk_gb,
+        total_audio_min=total_audio_min,
+        unique_ref_count=unique_ref_count,
+        unique_text_ratio=unique_text_ratio,
+        analyzed=analyzed,
+        clip_ratio=clip_ratio,
+        low_snr_ratio=low_snr_ratio,
+    )
 
     hard_failures = [item for item in requirements if item.get("status") == "fail"]
     soft_warnings = [item for item in requirements if item.get("status") == "warn"]
@@ -1161,10 +1199,14 @@ def _safe_transcribe_whisper(audio_path: Path, model_name: str = "base") -> tupl
         return None, f"faster-whisper unavailable: {e}"
 
     try:
-        model = WhisperModel(model_name, device="cpu", compute_type="int8")
+        cache_key = (model_name or "base").strip() or "base"
+        with _REVIEW_MODEL_LOCK:
+            model = _WHISPER_MODEL_CACHE.get(cache_key)
+            if model is None:
+                model = WhisperModel(cache_key, device="cpu", compute_type="int8")
+                _WHISPER_MODEL_CACHE[cache_key] = model
         segments, _ = model.transcribe(
             str(audio_path),
-            language="ko",
             beam_size=3,
             vad_filter=True,
             condition_on_previous_text=False,
@@ -1249,7 +1291,32 @@ def _safe_speaker_cosine(
 
     try:
         resolved_model = _resolve_local_base_model_path(base_speaker_model)
-        model = Qwen3TTSModel.from_pretrained(resolved_model, device_map="cpu", dtype=torch.float32)
+        with _REVIEW_MODEL_LOCK:
+            model = _SPEAKER_MODEL_CACHE.get(resolved_model)
+            if model is None:
+                candidates = [
+                    {"device_map": "cpu", "dtype": torch.float32},
+                    {"device_map": "cpu", "torch_dtype": torch.float32},
+                    {"device_map": "cpu"},
+                ]
+                last_error: Exception | None = None
+                loaded = None
+                for kwargs in candidates:
+                    try:
+                        loaded = Qwen3TTSModel.from_pretrained(resolved_model, **kwargs)
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                if loaded is None:
+                    if last_error is not None:
+                        raise RuntimeError(f"speaker cosine model load failed: {last_error}") from last_error
+                    raise RuntimeError("speaker cosine model load failed")
+                try:
+                    loaded.model.eval()
+                except Exception:
+                    pass
+                _SPEAKER_MODEL_CACHE[resolved_model] = loaded
+                model = loaded
         gen_wav, _ = librosa.load(str(generated_audio_path), sr=SAMPLE_RATE_HZ, mono=True)
         ref_wav, _ = librosa.load(str(reference_audio_path), sr=SAMPLE_RATE_HZ, mono=True)
         gen_emb = model.model.extract_speaker_embedding(gen_wav.astype(np.float32), SAMPLE_RATE_HZ).float().cpu().numpy()

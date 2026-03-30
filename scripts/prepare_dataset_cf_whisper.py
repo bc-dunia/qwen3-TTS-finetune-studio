@@ -37,9 +37,16 @@ SILENCE_THRESH_DB = -35
 MIN_SILENCE_DUR = 0.4
 MAX_SEGMENTS = 400
 
-CF_ACCOUNT_ID = "3672c083409da5ca133c50e0d06fd0e0"
 CF_WHISPER_MODEL = "@cf/openai/whisper-large-v3-turbo"
 R2_BUCKET = "qwen-tts-studio"
+
+
+def resolve_cf_account_id(cli_account_id: str | None) -> str:
+    account_id = (cli_account_id or os.environ.get("CF_ACCOUNT_ID", "")).strip()
+    if account_id:
+        return account_id
+    print("ERROR: Cloudflare account id is required. Set --cf-account-id or CF_ACCOUNT_ID.")
+    sys.exit(1)
 
 
 def get_cf_token() -> str:
@@ -66,11 +73,11 @@ def get_cf_token() -> str:
     sys.exit(1)
 
 
-def get_r2_credentials() -> dict:
+def get_r2_credentials(account_id: str) -> dict:
     """Read R2 credentials from environment or wrangler secrets."""
     endpoint = os.environ.get(
         "R2_ENDPOINT_URL",
-        f"https://{CF_ACCOUNT_ID}.r2.cloudflarestorage.com",
+        f"https://{account_id}.r2.cloudflarestorage.com",
     )
     access_key = os.environ.get("R2_ACCESS_KEY_ID", "")
     secret_key = os.environ.get("R2_SECRET_ACCESS_KEY", "")
@@ -200,12 +207,17 @@ def segment_audio(wav: Path, segments_dir: Path) -> list[tuple[Path, float]]:
 
 
 # ── Step 3: Transcribe via Cloudflare Workers AI ─────────────────────
-def transcribe_segment(seg_path: Path, token: str, retries: int = 3) -> dict | None:
+def transcribe_segment(
+    seg_path: Path,
+    token: str,
+    cf_account_id: str,
+    retries: int = 3,
+) -> dict | None:
     """Transcribe a single audio segment using CF Workers AI Whisper (base64 JSON)."""
     import base64
     import requests
 
-    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_WHISPER_MODEL}"
+    url = f"https://api.cloudflare.com/client/v4/accounts/{cf_account_id}/ai/run/{CF_WHISPER_MODEL}"
     audio_b64 = base64.b64encode(seg_path.read_bytes()).decode("utf-8")
 
     payload = {
@@ -262,6 +274,7 @@ def transcribe_all(
     seg_paths: list[tuple[Path, float]],
     work_dir: Path,
     token: str,
+    cf_account_id: str,
     max_workers: int = 8,
 ) -> list[dict]:
     """Transcribe all segments in parallel with resume support."""
@@ -290,7 +303,7 @@ def transcribe_all(
     completed = len(done_names)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_info = {
-            executor.submit(transcribe_segment, seg_path, token): (seg_path, dur)
+            executor.submit(transcribe_segment, seg_path, token, cf_account_id): (seg_path, dur)
             for seg_path, dur in remaining
         }
         for future in concurrent.futures.as_completed(future_to_info):
@@ -391,6 +404,7 @@ def parse_review_payload(response_text: str, entries: list[dict]) -> list[dict]:
 def review_batch_with_llm(
     entries: list[dict],
     cf_token: str,
+    cf_account_id: str,
     openai_key: str = "",
     retries: int = 2,
 ) -> list[dict]:
@@ -409,7 +423,7 @@ def review_batch_with_llm(
     for attempt in range(retries):
         try:
             cf_resp = requests.post(
-                f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{CF_REVIEW_MODEL}",
+                f"https://api.cloudflare.com/client/v4/accounts/{cf_account_id}/ai/run/{CF_REVIEW_MODEL}",
                 headers={
                     "Authorization": f"Bearer {cf_token}",
                     "Content-Type": "application/json",
@@ -515,6 +529,7 @@ def review_transcriptions(
     transcriptions: list[dict],
     work_dir: Path,
     cf_token: str,
+    cf_account_id: str,
     openai_key: str = "",
     batch_size: int = 10,
 ) -> list[dict]:
@@ -540,7 +555,7 @@ def review_transcriptions(
         end = min(start + batch_size, len(transcriptions))
         batch = transcriptions[start:end]
 
-        reviews = review_batch_with_llm(batch, cf_token, openai_key)
+        reviews = review_batch_with_llm(batch, cf_token, cf_account_id, openai_key)
 
         # Merge reviews with original data
         for i, entry in enumerate(batch):
@@ -675,7 +690,13 @@ def main():
     )
     parser.add_argument("--skip-upload", action="store_true", help="Skip R2 upload")
     parser.add_argument("--skip-review", action="store_true", help="Skip LLM review step")
+    parser.add_argument(
+        "--cf-account-id",
+        default="",
+        help="Cloudflare account id (or set CF_ACCOUNT_ID env)",
+    )
     args = parser.parse_args()
+    cf_account_id = resolve_cf_account_id(args.cf_account_id)
 
     input_path = Path(args.input).expanduser().resolve()
     work_dir = Path(args.work_dir)
@@ -689,6 +710,7 @@ def main():
     print(f"=== Qwen3-TTS Dataset Prep (CF Whisper) ===")
     print(f"  Input: {input_path}")
     print(f"  Speaker: {args.speaker}")
+    print(f"  Cloudflare Account: {cf_account_id}")
     print(f"  Work dir: {work_dir}")
     print()
 
@@ -705,14 +727,21 @@ def main():
     # Step 3: Transcribe
     print("[3/6] Transcribe via Cloudflare Workers AI Whisper")
     token = get_cf_token()
-    transcriptions = transcribe_all(seg_paths, work_dir, token)
+    transcriptions = transcribe_all(seg_paths, work_dir, token, cf_account_id)
     print()
 
     # Step 4: LLM Review
     if not args.skip_review:
         print("[4/6] LLM transcription review (Workers AI first, OpenAI fallback)")
         openai_key = get_openai_key()
-        reviewed = review_transcriptions(transcriptions, work_dir, token, openai_key, batch_size=10)
+        reviewed = review_transcriptions(
+            transcriptions,
+            work_dir,
+            token,
+            cf_account_id,
+            openai_key,
+            batch_size=10,
+        )
         print()
     else:
         print("[4/6] LLM review skipped (--skip-review)")

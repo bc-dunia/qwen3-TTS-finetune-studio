@@ -113,7 +113,10 @@ export function AutopilotPanel({
   const selectedGoal = goalFromDirection(direction)
   const isUsingRecommended = selectedGoal === recommendedGoal
   const [showOverride, setShowOverride] = useState(false)
-  useEffect(() => { setShowOverride(false) }, [voiceId])
+  useEffect(() => {
+    void voiceId
+    setShowOverride(false)
+  }, [voiceId])
   const goalMeta = GOALS.find((g) => g.value === selectedGoal)
 
   const attemptsCreated = Number(campaign?.summary.attempts_created ?? 0)
@@ -274,14 +277,22 @@ export function AutopilotPanel({
             Stop Campaign
           </button>
         ) : (
-          <button
-            type="button"
-            onClick={onStart}
-            disabled={!datasetReady || starting}
-            className="w-full rounded-lg bg-accent px-4 py-3.5 text-sm font-bold text-void disabled:opacity-50 transition-colors hover:bg-accent-light"
-          >
-            {starting ? 'Starting...' : 'Start Autopilot'}
-          </button>
+          <div className="space-y-2">
+            <button
+              type="button"
+              onClick={onStart}
+              disabled={!datasetReady || starting}
+              aria-describedby={!datasetReady ? 'autopilot-disabled-reason' : undefined}
+              className="w-full rounded-lg bg-accent px-4 py-3.5 text-sm font-bold text-void disabled:opacity-50 transition-colors hover:bg-accent-light"
+            >
+              {starting ? 'Starting...' : 'Start Autopilot'}
+            </button>
+            {!datasetReady && (
+              <p id="autopilot-disabled-reason" role="status" aria-live="polite" className="text-[11px] text-warning">
+                Autopilot is disabled until a finalized dataset is available.
+              </p>
+            )}
+          </div>
         )}
 
         {campaign && (

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router'
 import {
   ApiError,
@@ -64,7 +64,7 @@ export function Voices() {
   const [showCreate, setShowCreate] = useState(false)
   const [filter, setFilter] = useState('')
 
-  async function loadVoices() {
+  const loadVoices = useCallback(async () => {
     setLoading(true)
     setError('')
     try {
@@ -75,21 +75,11 @@ export function Voices() {
     } finally {
       setLoading(false)
     }
-  }
-
-  useEffect(() => {
-    loadVoices()
   }, [])
 
   useEffect(() => {
-    const onApiKeyChanged = () => {
-      loadVoices()
-    }
-    window.addEventListener('xi-api-key-changed', onApiKeyChanged)
-    return () => {
-      window.removeEventListener('xi-api-key-changed', onApiKeyChanged)
-    }
-  }, [])
+    void loadVoices()
+  }, [loadVoices])
 
   return (
     <div className="space-y-6">
@@ -107,6 +97,7 @@ export function Voices() {
           type="button"
         >
           <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+            <title>Create voice</title>
             <line x1="12" y1="5" x2="12" y2="19" />
             <line x1="5" y1="12" x2="19" y2="12" />
           </svg>
@@ -124,8 +115,8 @@ export function Voices() {
       {/* Loading */}
       {loading && (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {Array.from({ length: 6 }, (_, i) => (
-            <div key={i} className="bg-raised border border-edge rounded-xl p-5 animate-pulse">
+          {['voice-loading-1', 'voice-loading-2', 'voice-loading-3', 'voice-loading-4', 'voice-loading-5', 'voice-loading-6'].map((loadingKey) => (
+            <div key={loadingKey} className="bg-raised border border-edge rounded-xl p-5 animate-pulse">
               <div className="h-4 bg-elevated rounded w-2/3 mb-3" />
               <div className="h-3 bg-elevated rounded w-full mb-2" />
               <div className="h-3 bg-elevated rounded w-1/2" />
@@ -161,6 +152,7 @@ export function Voices() {
         <div className="text-center py-16">
           <div className="w-16 h-16 mx-auto mb-4 rounded-2xl bg-raised border border-edge flex items-center justify-center">
             <svg className="w-8 h-8 text-muted" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+              <title>Voices empty state</title>
               <rect x="9" y="2" width="6" height="11" rx="3" fill="currentColor" stroke="none" opacity="0.3" />
               <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
               <line x1="12" y1="19" x2="12" y2="22" />
@@ -241,7 +233,7 @@ function CreateVoiceModal({
   function buildDatasetTarget(voiceId: string, partialUpload = false): string {
     const params = new URLSearchParams()
     if (autoPrepare) params.set('autoPrepare', '1')
-    if (openTrainingWhenReady) params.set('openTraining', '1')
+    if (autoPrepare && openTrainingWhenReady) params.set('openTraining', '1')
     if (partialUpload) params.set('uploadWarning', '1')
     const query = params.toString()
     return `/voices/${voiceId}/dataset${query ? `?${query}` : ''}`
@@ -355,6 +347,10 @@ function CreateVoiceModal({
     setAudioFiles((prev) => [...prev, ...files])
   }
 
+  function getAudioFileKey(file: File): string {
+    return `${file.name}-${file.size}-${file.lastModified}`
+  }
+
   const totalUploadedBytes = uploadProgress
     ? Math.min(uploadProgress.totalUploadBytes, uploadProgress.completedBytes + uploadProgress.loadedBytes)
     : 0
@@ -364,6 +360,31 @@ function CreateVoiceModal({
   const currentFilePercent = uploadProgress && uploadProgress.totalBytes > 0
     ? Math.round((uploadProgress.loadedBytes / uploadProgress.totalBytes) * 100)
     : 0
+  const hasVoiceName = name.trim().length > 0
+  const hasAudioFiles = audioFiles.length > 0
+  const isRawPipelineLikely = autoPrepare && shouldAutoStartTrainingFromRawUploads(audioFiles)
+  const canCreateVoice = hasVoiceName && hasAudioFiles && !submitting
+  const createVoiceActionDescription = [
+    !canCreateVoice && !submitting ? 'create-voice-requirements' : '',
+    error ? 'create-voice-error' : '',
+    statusText && !error ? 'create-voice-status' : '',
+  ].filter(Boolean).join(' ') || undefined
+
+  const primaryActionLabel = submitting
+    ? 'Uploading...'
+    : isRawPipelineLikely
+      ? 'Create Voice & Start Raw Pipeline'
+      : openTrainingWhenReady && autoPrepare
+        ? 'Create Voice & Open Training'
+        : autoPrepare
+          ? 'Create Voice & Open Dataset'
+          : 'Create Voice Draft'
+
+  useEffect(() => {
+    if (!autoPrepare) {
+      setOpenTrainingWhenReady(false)
+    }
+  }, [autoPrepare])
 
   return (
     <div className="fixed inset-0 z-50 overflow-y-auto bg-black/60 p-3 sm:p-4">
@@ -383,6 +404,7 @@ function CreateVoiceModal({
               aria-label="Close"
             >
               <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <title>Close dialog</title>
                 <line x1="18" y1="6" x2="6" y2="18" />
                 <line x1="6" y1="6" x2="18" y2="18" />
               </svg>
@@ -394,10 +416,11 @@ function CreateVoiceModal({
             <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5 space-y-4">
               {/* Name */}
               <div>
-                <label className="text-subtle text-xs font-medium mb-1.5 block">
+                <label htmlFor="create-voice-name" className="text-subtle text-xs font-medium mb-1.5 block">
                   Voice Name <span className="text-error">*</span>
                 </label>
                 <input
+                  id="create-voice-name"
                   type="text"
                   value={name}
                   onChange={(e) => setName(e.target.value)}
@@ -409,10 +432,11 @@ function CreateVoiceModal({
 
               {/* Description */}
               <div>
-                <label className="text-subtle text-xs font-medium mb-1.5 block">
+                <label htmlFor="create-voice-description" className="text-subtle text-xs font-medium mb-1.5 block">
                   Description
                 </label>
                 <textarea
+                  id="create-voice-description"
                   value={description}
                   onChange={(e) => setDescription(e.target.value)}
                   placeholder="Describe the voice characteristics..."
@@ -422,10 +446,11 @@ function CreateVoiceModal({
               </div>
 
               <div>
-                <label className="text-subtle text-xs font-medium mb-1.5 block">
+                <label htmlFor="create-voice-model-size" className="text-subtle text-xs font-medium mb-1.5 block">
                   Base Model
                 </label>
                 <select
+                  id="create-voice-model-size"
                   value={modelSize}
                   onChange={(e) => setModelSize(e.target.value as VoiceModelSize)}
                   className="w-full bg-raised border border-edge rounded-lg px-3 py-2 text-sm text-primary focus:border-accent transition-colors"
@@ -437,14 +462,23 @@ function CreateVoiceModal({
 
               {/* Audio Upload */}
               <div>
-                <label className="text-subtle text-xs font-medium mb-1.5 block">
+                <div className="mb-3 rounded-lg border border-accent/20 bg-accent-dim px-3 py-3">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-accent">Quick flow</div>
+                  <ol className="mt-2 space-y-1 text-[11px] text-subtle">
+                    <li><span className="text-primary font-medium">1.</span> Name your voice and upload training audio.</li>
+                    <li><span className="text-primary font-medium">2.</span> We build a dataset from your uploads.</li>
+                    <li><span className="text-primary font-medium">3.</span> Start training from the Training tab with recommended defaults.</li>
+                  </ol>
+                </div>
+                <label htmlFor="create-voice-audio-files" className="text-subtle text-xs font-medium mb-1.5 block">
                   Training Audio Files <span className="text-error">*</span>
                 </label>
                 <div className="mb-2 rounded-lg border border-edge bg-raised px-3 py-2 text-[11px] leading-relaxed text-subtle">
                   Files upload through the API into storage. Short clips continue to Dataset Studio for transcription and cleanup; large MP3, M4A, FLAC, or MP4 source files automatically start the raw-media training pipeline after upload.
                   Best results: 24kHz mono WAV, 3-15s per clip, clean speech only, at least 10 minutes total.
                 </div>
-                <div
+                <label
+                  htmlFor="create-voice-audio-files"
                   className={`
                     border-2 border-dashed rounded-lg p-5 text-center cursor-pointer transition-colors
                     ${dragOver
@@ -454,13 +488,9 @@ function CreateVoiceModal({
                         : 'border-edge hover:border-subtle'
                     }
                   `}
-                  onClick={() => fileInputRef.current?.click()}
                   onDrop={handleDrop}
                   onDragOver={handleDragOver}
                   onDragLeave={() => setDragOver(false)}
-                  onKeyDown={(e) => { if (e.key === 'Enter') fileInputRef.current?.click() }}
-                  role="button"
-                  tabIndex={0}
                 >
                   {audioFiles.length > 0 ? (
                     <div>
@@ -470,15 +500,22 @@ function CreateVoiceModal({
                       <div className="text-muted text-xs mt-1">
                         {(audioFiles.reduce((sum, f) => sum + f.size, 0) / 1024 / 1024).toFixed(1)} MB total
                       </div>
+                      <button
+                        type="button"
+                        onClick={() => fileInputRef.current?.click()}
+                        className="mt-2 text-[11px] font-semibold text-accent hover:text-accent-light"
+                      >
+                        Add more files
+                      </button>
                       <div className="flex flex-wrap gap-1 mt-2 justify-center">
-                        {audioFiles.map((f, i) => (
-                          <span key={i} className="inline-flex items-center gap-1 bg-elevated text-subtle text-xs px-2 py-0.5 rounded-full">
+                        {audioFiles.map((f) => (
+                          <span key={getAudioFileKey(f)} className="inline-flex items-center gap-1 bg-elevated text-subtle text-xs px-2 py-0.5 rounded-full">
                             {f.name.length > 20 ? f.name.slice(0, 17) + '...' : f.name}
                             <button
                               type="button"
                               onClick={(e) => {
                                 e.stopPropagation()
-                                setAudioFiles(prev => prev.filter((_, idx) => idx !== i))
+                                setAudioFiles((prev) => prev.filter((candidate) => candidate !== f))
                               }}
                               className="text-muted hover:text-error ml-0.5"
                               aria-label={"Remove " + f.name}
@@ -492,16 +529,25 @@ function CreateVoiceModal({
                   ) : (
                     <div>
                       <svg className="w-8 h-8 mx-auto text-muted mb-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+                        <title>Upload audio files</title>
                         <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
                         <polyline points="17 8 12 3 7 8" />
                         <line x1="12" y1="3" x2="12" y2="15" />
                       </svg>
                       <div className="text-subtle text-sm">Drop audio files or click to browse</div>
                       <div className="text-muted text-xs mt-1">WAV, MP3, M4A, FLAC, or MP4 audio. Upload the full training set, not just one reference clip.</div>
+                      <button
+                        type="button"
+                        onClick={() => fileInputRef.current?.click()}
+                        className="mt-3 rounded-lg border border-edge bg-surface px-3 py-1.5 text-[11px] font-semibold text-primary hover:border-accent hover:text-accent transition-colors"
+                      >
+                        Browse files
+                      </button>
                     </div>
                   )}
-                </div>
+                </label>
                 <input
+                  id="create-voice-audio-files"
                   ref={fileInputRef}
                   type="file"
                   accept=".wav,.wave,.mp3,.mp4,.m4a,.flac,audio/*,video/mp4"
@@ -534,7 +580,7 @@ function CreateVoiceModal({
                 <label className="flex items-start gap-3 text-sm text-primary">
                   <input
                     type="checkbox"
-                    checked={openTrainingWhenReady}
+                    checked={autoPrepare && openTrainingWhenReady}
                     onChange={(e) => setOpenTrainingWhenReady(e.target.checked)}
                     disabled={!autoPrepare}
                     className="mt-0.5 accent-accent"
@@ -544,6 +590,11 @@ function CreateVoiceModal({
                     <span className="block text-[11px] text-subtle mt-1">
                       Leaves one final check on the Training page before you start the run.
                     </span>
+                    {!autoPrepare && (
+                      <span className="block text-[11px] text-warning mt-1">
+                        Enable auto-prepare first to unlock this option.
+                      </span>
+                    )}
                   </span>
                 </label>
               </div>
@@ -552,19 +603,19 @@ function CreateVoiceModal({
             <div className="shrink-0 border-t border-edge bg-surface/95 px-5 py-4 space-y-3">
               {/* Error */}
               {error && (
-                <div className="bg-error-dim border border-error/20 rounded-lg px-3 py-2 text-error text-xs">
+                <div id="create-voice-error" role="alert" className="bg-error-dim border border-error/20 rounded-lg px-3 py-2 text-error text-xs">
                   {error}
                 </div>
               )}
 
               {statusText && !error && (
-                <div className="bg-accent-dim border border-accent/20 rounded-lg px-3 py-2 text-accent text-xs">
+                <div id="create-voice-status" role="status" aria-live="polite" className="bg-accent-dim border border-accent/20 rounded-lg px-3 py-2 text-accent text-xs">
                   {statusText}
                 </div>
               )}
 
               {uploadProgress && !error && (
-                <div className="rounded-lg border border-accent/20 bg-accent-dim px-3 py-3 text-xs text-primary space-y-2">
+                <div role="status" aria-live="polite" className="rounded-lg border border-accent/20 bg-accent-dim px-3 py-3 text-xs text-primary space-y-2">
                   <div className="flex items-center justify-between gap-3">
                     <div className="min-w-0">
                       <div className="truncate font-medium text-accent">
@@ -609,6 +660,16 @@ function CreateVoiceModal({
               )}
 
               {/* Actions */}
+              {!canCreateVoice && !submitting && (
+                <div id="create-voice-requirements" role="status" aria-live="polite" className="rounded-lg border border-warning/20 bg-warning-dim px-3 py-2 text-[11px] text-warning">
+                  <div className="font-semibold">Before you continue:</div>
+                  <ul className="mt-1 space-y-0.5">
+                    {!hasVoiceName && <li>• Add a voice name.</li>}
+                    {!hasAudioFiles && <li>• Upload at least one training audio file.</li>}
+                  </ul>
+                </div>
+              )}
+
               <div className="flex gap-3">
                 <button
                   type="button"
@@ -619,10 +680,11 @@ function CreateVoiceModal({
                 </button>
                 <button
                   type="submit"
-                  disabled={!name.trim() || audioFiles.length === 0 || submitting}
+                  disabled={!canCreateVoice}
+                  aria-describedby={createVoiceActionDescription}
                   className="flex-1 bg-accent hover:bg-accent-light text-void font-semibold text-sm py-2.5 rounded-lg disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                 >
-                  {submitting ? 'Uploading...' : 'Create Voice'}
+                  {primaryActionLabel}
                 </button>
               </div>
             </div>

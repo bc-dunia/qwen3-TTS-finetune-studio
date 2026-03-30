@@ -717,7 +717,7 @@ export const getTrainingJobByToken = async (
 
 export const listTrainingJobs = async (
   db: D1Database,
-  filters: { voice_id?: string; campaign_id?: string; limit?: number } = {}
+  filters: { voice_id?: string; campaign_id?: string; limit?: number; offset?: number } = {}
 ): Promise<TrainingJob[]> => {
   const conditions: string[] = [];
   const bindings: Array<string | number> = [];
@@ -732,10 +732,12 @@ export const listTrainingJobs = async (
   }
 
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-  const limit = Math.max(1, Math.min(filters.limit ?? 20, 100));
-  const sql = `SELECT * FROM training_jobs ${whereClause} ORDER BY created_at DESC LIMIT ?`;
+  const limit = Math.max(1, Math.min(filters.limit ?? 20, 5000));
+  const offset = Math.max(0, Math.trunc(filters.offset ?? 0));
+  const sql = `SELECT * FROM training_jobs ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`;
 
   bindings.push(limit);
+  bindings.push(offset);
   const result = await db.prepare(sql).bind(...bindings).all<DbTrainingRow>();
   return (result.results ?? []).map(mapTrainingJob);
 };

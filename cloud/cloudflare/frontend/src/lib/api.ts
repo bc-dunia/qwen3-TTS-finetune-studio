@@ -268,6 +268,15 @@ export interface TrainingJob {
   supervisor?: Record<string, unknown>
 }
 
+export interface TrainingJobsResponse {
+  jobs: TrainingJob[]
+  requested_limit?: number
+  applied_limit?: number
+  has_more?: boolean
+  offset?: number
+  next_offset?: number | null
+}
+
 export interface DatasetSnapshot {
   snapshot_id: string
   voice_id: string
@@ -449,16 +458,6 @@ const API_URL = import.meta.env.VITE_API_URL ?? ''
 const MULTIPART_UPLOAD_THRESHOLD_BYTES = 32 * 1024 * 1024
 const DEFAULT_MULTIPART_CHUNK_SIZE_BYTES = 8 * 1024 * 1024
 
-function getApiKey(): string {
-  return (localStorage.getItem('xi-api-key') ?? '').trim()
-}
-
-function authHeaders(): Record<string, string> {
-  const key = getApiKey()
-  if (!key) return {}
-  return { 'xi-api-key': key }
-}
-
 async function request<T>(
   path: string,
   options: RequestInit = {},
@@ -467,7 +466,6 @@ async function request<T>(
   const response = await fetch(url, {
     ...options,
     headers: {
-      ...authHeaders(),
       ...options.headers,
     },
   })
@@ -507,7 +505,6 @@ async function requestText(
   const response = await fetch(url, {
     ...options,
     headers: {
-      ...authHeaders(),
       ...options.headers,
     },
   })
@@ -573,7 +570,6 @@ export async function createVoice(
   const url = `${API_URL}/v1/voices/add`
   const response = await fetch(url, {
     method: 'POST',
-    headers: authHeaders(),
     body: formData,
   })
 
@@ -604,7 +600,6 @@ export async function createVoiceDraft(
   const url = `${API_URL}/v1/voices/add`
   const response = await fetch(url, {
     method: 'POST',
-    headers: authHeaders(),
     body: formData,
   })
 
@@ -642,7 +637,6 @@ export async function generateSpeech(
   const response = await fetch(url, {
     method: 'POST',
     headers: {
-      ...authHeaders(),
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
@@ -784,48 +778,49 @@ export async function fetchTrainingCheckoutLedger(jobId: string): Promise<{ entr
 export async function fetchTrainingJobs(
   voiceId?: string,
   limit = 20,
-): Promise<{ jobs: TrainingJob[] }> {
+  offset = 0,
+): Promise<TrainingJobsResponse> {
   const params = new URLSearchParams()
   params.set('limit', String(limit))
+  params.set('offset', String(Math.max(0, Math.trunc(offset))))
   if (voiceId) params.set('voice_id', voiceId)
   const query = params.toString()
   const path = query ? `/v1/training/jobs?${query}` : '/v1/training/jobs'
-  return request<{ jobs: TrainingJob[] }>(path)
+  return request<TrainingJobsResponse>(path)
 }
 
-export async function fetchAllTrainingJobs(limit = 100): Promise<{ jobs: TrainingJob[] }> {
-  return fetchTrainingJobs(undefined, limit)
-}
+export async function fetchAllTrainingJobs(limit = 1000): Promise<TrainingJobsResponse> {
+  const jobs: TrainingJob[] = []
+  let offset = 0
+  let lastResponse: TrainingJobsResponse | null = null
 
-export async function fetchQueueStats(): Promise<{
-  active_workers: number
-  max_workers: number
-  active_jobs: number
-  queued_jobs: number
-  running_jobs: number
-}> {
-  const jobsResponse = await fetchAllTrainingJobs(200)
-  const activeStatuses = new Set([
-    'pending',
-    'running',
-    'provisioning',
-    'downloading',
-    'preprocessing',
-    'preparing',
-    'training',
-    'uploading',
-  ])
-  const runningJobs = jobsResponse.jobs.filter((job) => activeStatuses.has(job.status)).length
-  const queuedJobs = jobsResponse.jobs.filter((job) => job.status === 'queued').length
-  const activeWorkers = runningJobs
-  const maxWorkers = Math.max(activeWorkers, 3)
+  for (let page = 0; page < 100; page += 1) {
+    const response = await fetchTrainingJobs(undefined, limit, offset)
+    lastResponse = response
+    jobs.push(...response.jobs)
+
+    const hasMore = response.has_more === true
+    if (!hasMore || response.jobs.length === 0) {
+      break
+    }
+
+    const nextOffset =
+      typeof response.next_offset === 'number' && Number.isFinite(response.next_offset)
+        ? Math.max(0, Math.trunc(response.next_offset))
+        : offset + response.jobs.length
+    if (nextOffset <= offset) {
+      break
+    }
+    offset = nextOffset
+  }
 
   return {
-    active_workers: activeWorkers,
-    max_workers: maxWorkers,
-    active_jobs: runningJobs + queuedJobs,
-    queued_jobs: queuedJobs,
-    running_jobs: runningJobs,
+    jobs,
+    requested_limit: lastResponse?.requested_limit,
+    applied_limit: lastResponse?.applied_limit,
+    has_more: lastResponse?.has_more,
+    offset: 0,
+    next_offset: lastResponse?.next_offset,
   }
 }
 
@@ -852,11 +847,25 @@ export async function fetchDatasetSnapshots(
 export async function fetchTrainingAdvice(
   voiceId: string,
   limit = 40,
-): Promise<{ advice: TrainingAdvice | null; voice_id: string; jobs_considered: number }> {
+): Promise<{
+  advice: TrainingAdvice | null
+  voice_id: string
+  jobs_considered: number
+  requested_limit?: number
+  applied_limit?: number
+  has_more?: boolean
+}> {
   const params = new URLSearchParams()
   params.set('voice_id', voiceId)
   params.set('limit', String(limit))
-  return request<{ advice: TrainingAdvice | null; voice_id: string; jobs_considered: number }>(
+  return request<{
+    advice: TrainingAdvice | null
+    voice_id: string
+    jobs_considered: number
+    requested_limit?: number
+    applied_limit?: number
+    has_more?: boolean
+  }>(
     `/v1/training/advice?${params.toString()}`,
   )
 }
@@ -1123,8 +1132,6 @@ async function uploadMultipartPart(
   },
   onProgress?: (progress: UploadProgress) => void,
 ): Promise<MultipartUploadPart> {
-  const apiKey = getApiKey()
-
   return new Promise<MultipartUploadPart>((resolve, reject) => {
     const url = new URL(`${API_URL}/v1/upload/multipart/part`)
     url.searchParams.set('key', input.r2Key)
@@ -1133,9 +1140,6 @@ async function uploadMultipartPart(
 
     const xhr = new XMLHttpRequest()
     xhr.open('POST', url.toString())
-    if (apiKey) {
-      xhr.setRequestHeader('xi-api-key', apiKey)
-    }
 
     xhr.upload.addEventListener('progress', (event) => {
       const totalBytes = input.chunk.size > 0 ? input.chunk.size : 1
@@ -1270,7 +1274,6 @@ async function uploadFileViaWorker(
   }
 
   if (typeof XMLHttpRequest !== 'undefined') {
-    const apiKey = getApiKey()
     await new Promise<void>((resolve, reject) => {
       const url = new URL(`${API_URL}/v1/upload/raw`)
       url.searchParams.set('voice_id', voiceId)
@@ -1279,9 +1282,6 @@ async function uploadFileViaWorker(
 
       const xhr = new XMLHttpRequest()
       xhr.open('POST', url.toString())
-      if (apiKey) {
-        xhr.setRequestHeader('xi-api-key', apiKey)
-      }
       if (file.type) {
         xhr.setRequestHeader('Content-Type', file.type)
       }
@@ -1342,7 +1342,6 @@ async function uploadFileViaWorker(
   const response = await fetch(url.toString(), {
     method: 'POST',
     headers: {
-      ...authHeaders(),
       ...(file.type ? { 'Content-Type': file.type } : {}),
     },
     body: file,

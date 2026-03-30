@@ -19,6 +19,34 @@ const app = new Hono<AppContext>();
 
 type CheckpointRecord = { epoch?: number; r2_prefix?: string };
 
+const resolveCanonicalDatasetRefAudioKey = (
+  datasetPrefixRaw: string,
+  ...candidates: Array<string | null | undefined>
+): string | null => {
+  const datasetPrefix = stripSlashes(datasetPrefixRaw);
+  let hasCandidate = false;
+  for (const candidate of candidates) {
+    const trimmed = typeof candidate === "string" ? candidate.trim() : "";
+    if (!trimmed) {
+      continue;
+    }
+    hasCandidate = true;
+    if (datasetPrefix && trimmed.startsWith(`${datasetPrefix}/`)) {
+      return trimmed;
+    }
+  }
+  if (datasetPrefix && hasCandidate) {
+    return `${datasetPrefix}/ref_audio.wav`;
+  }
+  for (const candidate of candidates) {
+    const trimmed = typeof candidate === "string" ? candidate.trim() : "";
+    if (trimmed) {
+      return trimmed;
+    }
+  }
+  return null;
+};
+
 const parseBearerToken = (authorizationHeader: string | undefined): string | null => {
   if (!authorizationHeader) {
     return null;
@@ -170,9 +198,7 @@ app.post("/:job_id/report", async (c) => {
 
   if (body.status === "completed" || body.status === "failed") {
     const ctx = (c as unknown as { executionCtx?: ExecutionContext }).executionCtx;
-    ctx?.waitUntil(
-      dispatchQueuedJobs(c.env, auth.job.voice_id).catch(() => undefined)
-    );
+    ctx?.waitUntil(dispatchQueuedJobs(c.env, auth.job.voice_id));
   }
 
   return c.json({ status: "ok" });
@@ -222,12 +248,17 @@ app.post("/:job_id/preprocess-cache", async (c) => {
     dataset_signature?: string;
     cache_r2_prefix?: string;
     train_raw_r2_key?: string;
+    train_clipped_r2_key?: string | null;
+    control_holdout_r2_key?: string | null;
     ref_audio_r2_key?: string | null;
     reference_profile_r2_key?: string | null;
     source_file_count?: number;
     segments_created?: number;
     segments_accepted?: number;
     accepted_duration_min?: number;
+    train_segments?: number;
+    holdout_segments?: number;
+    holdout_ratio?: number;
   };
 
   const datasetSignature =
@@ -236,6 +267,10 @@ app.post("/:job_id/preprocess-cache", async (c) => {
     typeof body.cache_r2_prefix === "string" ? body.cache_r2_prefix.trim() : "";
   const trainRawR2Key =
     typeof body.train_raw_r2_key === "string" ? body.train_raw_r2_key.trim() : "";
+  const reportedRefAudioR2Key =
+    typeof body.ref_audio_r2_key === "string" && body.ref_audio_r2_key.trim()
+      ? body.ref_audio_r2_key.trim()
+      : null;
   if (!datasetSignature || !cacheR2Prefix || !trainRawR2Key) {
     return c.json(
       {
@@ -301,6 +336,11 @@ app.post("/:job_id/preprocess-cache", async (c) => {
     auth.job.dataset_r2_prefix,
     datasetSignature
   );
+  const canonicalRefAudioR2Key = resolveCanonicalDatasetRefAudioKey(
+    auth.job.dataset_r2_prefix,
+    existingSnapshot?.ref_audio_r2_key,
+    reportedRefAudioR2Key
+  );
   await upsertDatasetSnapshot(c.env.DB, {
     snapshot_id: auth.job.dataset_snapshot_id ?? existingSnapshot?.snapshot_id ?? crypto.randomUUID(),
     voice_id: auth.job.voice_id,
@@ -311,10 +351,7 @@ app.post("/:job_id/preprocess-cache", async (c) => {
     source_cache_id: persistedCache?.cache_id ?? existingSnapshot?.source_cache_id ?? null,
     cache_r2_prefix: cacheR2Prefix,
     train_raw_r2_key: trainRawR2Key,
-    ref_audio_r2_key:
-      typeof body.ref_audio_r2_key === "string" && body.ref_audio_r2_key.trim()
-        ? body.ref_audio_r2_key.trim()
-        : null,
+    ref_audio_r2_key: canonicalRefAudioR2Key,
     reference_profile_r2_key:
       typeof body.reference_profile_r2_key === "string" && body.reference_profile_r2_key.trim()
         ? body.reference_profile_r2_key.trim()
@@ -341,12 +378,9 @@ app.post("/:job_id/preprocess-cache", async (c) => {
     updated_at: now,
   });
 
-  if (
-    typeof body.ref_audio_r2_key === "string" &&
-    body.ref_audio_r2_key.trim().length > 0
-  ) {
+  if (canonicalRefAudioR2Key) {
     await updateVoice(c.env.DB, auth.job.voice_id, {
-      ref_audio_r2_key: body.ref_audio_r2_key.trim(),
+      ref_audio_r2_key: canonicalRefAudioR2Key,
     });
   }
 
@@ -357,6 +391,14 @@ app.post("/:job_id/preprocess-cache", async (c) => {
       preprocess_cache_dataset_signature: datasetSignature,
       preprocess_cache_r2_prefix: cacheR2Prefix,
       preprocess_cache_train_raw_r2_key: trainRawR2Key,
+      preprocess_cache_train_clipped_r2_key:
+        typeof body.train_clipped_r2_key === "string"
+          ? body.train_clipped_r2_key.trim()
+          : null,
+      preprocess_cache_control_holdout_r2_key:
+        typeof body.control_holdout_r2_key === "string"
+          ? body.control_holdout_r2_key.trim()
+          : null,
       preprocess_cache_ref_audio_r2_key:
         typeof body.ref_audio_r2_key === "string" ? body.ref_audio_r2_key.trim() : null,
       preprocess_cache_reference_profile_r2_key:
@@ -371,6 +413,12 @@ app.post("/:job_id/preprocess-cache", async (c) => {
         typeof body.segments_accepted === "number" ? Math.trunc(body.segments_accepted) : null,
       preprocess_cache_accepted_duration_min:
         typeof body.accepted_duration_min === "number" ? body.accepted_duration_min : null,
+      preprocess_cache_train_segments:
+        typeof body.train_segments === "number" ? Math.trunc(body.train_segments) : null,
+      preprocess_cache_holdout_segments:
+        typeof body.holdout_segments === "number" ? Math.trunc(body.holdout_segments) : null,
+      preprocess_cache_holdout_ratio:
+        typeof body.holdout_ratio === "number" ? body.holdout_ratio : null,
       preprocess_cache_saved_at: now,
     },
     supervisor: {

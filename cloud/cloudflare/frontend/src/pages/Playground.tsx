@@ -58,16 +58,6 @@ export function Playground() {
         if (cancelled) return
         const readyVoices = data.voices.filter((v) => v.status === 'ready')
         setVoices(readyVoices)
-        if (readyVoices.length > 0) {
-          const requestedVoice = requestedVoiceId
-            ? readyVoices.find((voice) => voice.voice_id === requestedVoiceId)
-            : null
-          if (requestedVoice) {
-            setSelectedVoiceId(requestedVoice.voice_id)
-          } else if (!selectedVoiceId || !readyVoices.some((voice) => voice.voice_id === selectedVoiceId)) {
-            setSelectedVoiceId(readyVoices[0].voice_id)
-          }
-        }
       } catch {
         // silently fail — user can still type
       } finally {
@@ -77,7 +67,25 @@ export function Playground() {
 
     load()
     return () => { cancelled = true }
-  }, [requestedVoiceId, selectedVoiceId])
+  }, [])
+
+  useEffect(() => {
+    if (voices.length === 0) return
+
+    const requestedVoice = requestedVoiceId
+      ? voices.find((voice) => voice.voice_id === requestedVoiceId)
+      : null
+    if (requestedVoice) {
+      setSelectedVoiceId(requestedVoice.voice_id)
+      return
+    }
+
+    setSelectedVoiceId((previous) => (
+      previous && voices.some((voice) => voice.voice_id === previous)
+        ? previous
+        : voices[0].voice_id
+    ))
+  }, [requestedVoiceId, voices])
 
   // Save history to localStorage
   const saveHistory = useCallback((entries: HistoryEntry[]) => {

@@ -89,6 +89,39 @@ def _copy_uploaded_files(uploaded_files: list[Any], target_dir: Path) -> dict[st
     return by_name
 
 
+def _copy_media_into_dataset(
+    source_path: Path,
+    target_dir: Path,
+    copied_by_source: dict[Path, Path],
+    fallback_stem: str,
+) -> Path:
+    src = source_path.resolve()
+    try:
+        target_root = target_dir.resolve()
+    except Exception:
+        target_root = target_dir
+
+    if src.parent == target_root or target_root in src.parents:
+        copied_by_source[src] = src
+        return src
+
+    if src in copied_by_source and copied_by_source[src].exists():
+        return copied_by_source[src]
+
+    ext = src.suffix.lower() or ".wav"
+    stem = sanitize_name(src.stem, fallback_stem)
+    dest = target_dir / f"{stem}{ext}"
+    idx = 1
+    while dest.exists():
+        dest = target_dir / f"{stem}_{idx}{ext}"
+        idx += 1
+
+    shutil.copy2(src, dest)
+    resolved = dest.resolve()
+    copied_by_source[src] = resolved
+    return resolved
+
+
 def _audio_duration_seconds(path: Path) -> float:
     try:
         return float(sf.info(str(path)).duration)
@@ -114,6 +147,8 @@ def build_dataset_from_uploads(
 
     uploaded = uploaded_audios or []
     uploaded_audio_by_name = _copy_uploaded_files(uploaded, audio_dir)
+    copied_audio_by_source: dict[Path, Path] = {}
+    copied_ref_by_source: dict[Path, Path] = {}
 
     transcript_path = _to_uploaded_path(transcript_file).resolve()
     shutil.copy2(transcript_path, target_dataset_dir / f"source_transcript{transcript_path.suffix.lower()}")
@@ -124,9 +159,12 @@ def build_dataset_from_uploads(
     global_ref_path: Path | None = None
     if reference_audio_file is not None:
         src_ref = _to_uploaded_path(reference_audio_file).resolve()
-        ext = src_ref.suffix.lower() or ".wav"
-        global_ref_path = ref_dir / f"reference{ext}"
-        shutil.copy2(src_ref, global_ref_path)
+        global_ref_path = _copy_media_into_dataset(
+            source_path=src_ref,
+            target_dir=ref_dir,
+            copied_by_source=copied_ref_by_source,
+            fallback_stem="reference",
+        )
 
     result_rows: list[dict[str, Any]] = []
     for i, row in enumerate(rows):
@@ -140,18 +178,30 @@ def build_dataset_from_uploads(
         if not text:
             raise ValueError(f"Transcript row {i + 1} has empty 'text'.")
 
-        audio_path = _resolve_audio_path(
+        audio_src = _resolve_audio_path(
             str(row.get("audio", "")).strip(),
             transcript_path.parent,
             uploaded_audio_by_name,
         )
+        audio_path = _copy_media_into_dataset(
+            source_path=audio_src,
+            target_dir=audio_dir,
+            copied_by_source=copied_audio_by_source,
+            fallback_stem="audio",
+        )
 
         row_ref_raw = str(row.get("ref_audio", "")).strip()
         if row_ref_raw:
-            ref_audio_path = _resolve_audio_path(
+            ref_src = _resolve_audio_path(
                 row_ref_raw,
                 transcript_path.parent,
                 uploaded_audio_by_name,
+            )
+            ref_audio_path = _copy_media_into_dataset(
+                source_path=ref_src,
+                target_dir=ref_dir,
+                copied_by_source=copied_ref_by_source,
+                fallback_stem="reference",
             )
         elif global_ref_path is not None:
             ref_audio_path = global_ref_path
@@ -236,7 +286,7 @@ def import_existing_raw_jsonl(dataset_name: str, raw_jsonl_file: Any) -> tuple[P
     return target_dataset_dir.resolve(), dest.resolve()
 
 
-def load_raw_jsonl(path: str | Path) -> list[dict[str, Any]]:
+def load_raw_jsonl(path: str | Path, *, strict: bool = True) -> list[dict[str, Any]]:
     p = Path(path).resolve()
     if not p.exists():
         raise FileNotFoundError(f"JSONL not found: {p}")
@@ -247,9 +297,21 @@ def load_raw_jsonl(path: str | Path) -> list[dict[str, Any]]:
             if not line:
                 continue
             try:
-                rows.append(json.loads(line))
+                parsed = json.loads(line)
             except json.JSONDecodeError as exc:
-                logger.warning("Skipping malformed JSONL line %d in %s: %s", line_num, p, exc)
+                msg = f"Malformed JSONL line {line_num} in {p}: {exc}"
+                if strict:
+                    raise ValueError(msg) from exc
+                logger.warning(msg)
+                continue
+
+            if not isinstance(parsed, dict):
+                msg = f"JSONL line {line_num} in {p} must be a JSON object."
+                if strict:
+                    raise ValueError(msg)
+                logger.warning(msg)
+                continue
+            rows.append(parsed)
     return rows
 
 

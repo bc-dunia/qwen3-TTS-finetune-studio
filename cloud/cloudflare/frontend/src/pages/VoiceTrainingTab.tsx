@@ -98,6 +98,7 @@ export function VoiceTrainingTab() {
   }, [directionSetByUser])
 
   useEffect(() => {
+    void voiceId
     setDirectionSetByUser(false)
     directionSetByUserRef.current = false
   }, [voiceId])
@@ -202,6 +203,7 @@ export function VoiceTrainingTab() {
     if (!activeCampaignId) return
     const campaignId = activeCampaignId
     let cancelled = false
+    let pollInFlight = false
 
     async function pollCampaign() {
       try {
@@ -234,9 +236,17 @@ export function VoiceTrainingTab() {
       }
     }
 
-    void pollCampaign()
+    async function pollCampaignWithGuard() {
+      if (pollInFlight) return
+      pollInFlight = true
+      await pollCampaign().finally(() => {
+        pollInFlight = false
+      })
+    }
+
+    void pollCampaignWithGuard()
     const interval = setInterval(() => {
-      void pollCampaign()
+      void pollCampaignWithGuard()
     }, 5000)
 
     return () => {
@@ -247,14 +257,30 @@ export function VoiceTrainingTab() {
 
   useEffect(() => {
     if (activeJobs.length === 0) return
-    const interval = setInterval(async () => {
+    let pollInFlight = false
+    async function pollJobStatuses() {
       const ids = jobsRef.current.filter((job) => shouldWatchTrainingJob(job)).map((job) => job.job_id)
-      if (ids.length === 0) return
+      if (ids.length === 0) {
+        return
+      }
       try {
         const updates = await Promise.all(ids.map((jobId) => fetchTrainingJob(jobId)))
         setJobs((previous) => previous.map((job) => updates.find((candidate) => candidate.job_id === job.job_id) ?? job))
       } catch {
       }
+    }
+
+    async function pollJobStatusesWithGuard() {
+      if (pollInFlight) return
+      pollInFlight = true
+      await pollJobStatuses().finally(() => {
+        pollInFlight = false
+      })
+    }
+
+    void pollJobStatusesWithGuard()
+    const interval = setInterval(() => {
+      void pollJobStatusesWithGuard()
     }, 5000)
 
     return () => clearInterval(interval)
@@ -391,9 +417,48 @@ export function VoiceTrainingTab() {
 
   const hasExistingCheckpoint = Boolean(voice?.run_name) || Boolean(voice?.checkpoint_r2_prefix)
   const datasetReady = datasets.length > 0 || Boolean(linkedDatasetName) || hasExistingCheckpoint
+  const firstRunFlow = !hasExistingCheckpoint
 
   return (
     <div className="space-y-6">
+      <section className="rounded-xl border border-edge bg-raised p-4">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h3 className="text-heading text-sm font-semibold">Training quick flow</h3>
+            <p className="text-subtle text-xs mt-1">
+              {firstRunFlow
+                ? 'Follow this once to reach your first checkpoint quickly.'
+                : 'Use autopilot for your next improvement cycle.'}
+            </p>
+          </div>
+          <span
+            className={`rounded-full px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider ${
+              datasetReady
+                ? 'bg-accent-dim text-accent'
+                : 'bg-warning-dim text-warning'
+            }`}
+          >
+            {datasetReady ? 'dataset ready' : 'dataset required'}
+          </span>
+        </div>
+
+        <ol className="mt-3 space-y-1 text-xs text-subtle">
+          <li><span className="font-semibold text-primary">1.</span> Finalize a clean dataset.</li>
+          <li><span className="font-semibold text-primary">2.</span> Start Autopilot to search for the best checkpoint.</li>
+          <li><span className="font-semibold text-primary">3.</span> Open Compare once attempts finish and promote the winner.</li>
+        </ol>
+
+        {!datasetReady && (
+          <div className="mt-3 rounded-lg border border-warning/20 bg-warning-dim px-3 py-2 text-xs text-warning">
+            Training is blocked until a finalized dataset is available.
+            <Link to={`/voices/${voiceId}/dataset`} className="ml-1 font-semibold underline hover:no-underline">
+              Open Dataset tab
+            </Link>
+            .
+          </div>
+        )}
+      </section>
+
       {error && (
         <div className="rounded-lg border border-error/20 bg-error-dim px-3 py-2 text-sm text-error">
           {error}
@@ -542,11 +607,18 @@ export function VoiceTrainingTab() {
               <button
                 type="submit"
                 disabled={startingManual || !datasetReady}
+                aria-describedby={!datasetReady ? 'manual-training-disabled-reason' : undefined}
                 className="rounded-lg bg-accent px-4 py-2 text-xs font-semibold text-void disabled:opacity-50"
               >
                 {startingManual ? 'Starting...' : 'Start Single Training'}
               </button>
             </div>
+
+            {!datasetReady && (
+              <p id="manual-training-disabled-reason" role="status" aria-live="polite" className="text-[11px] text-warning">
+                Select or create a finalized dataset before starting a manual run.
+              </p>
+            )}
           </form>
         )}
       </section>

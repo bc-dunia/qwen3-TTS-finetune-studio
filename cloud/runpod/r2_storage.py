@@ -16,6 +16,7 @@ import json
 import logging
 import mimetypes
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -119,11 +120,34 @@ class R2Storage:
         )
         return r2_key
 
-    def download_file(self, r2_key: str, local_path: str | Path) -> Path:
+    def download_file(
+        self,
+        r2_key: str,
+        local_path: str | Path,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> Path:
         """Download an R2 object to a local file. Returns the local path."""
         local_path = Path(local_path)
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        self.client.download_file(self.bucket, r2_key, str(local_path))
+
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            raise TimeoutError(f"R2 download timed out before starting: {r2_key}")
+
+        class _DeadlineCallback:
+            def __init__(self, deadline: float | None) -> None:
+                self.deadline = deadline
+
+            def __call__(self, _bytes_transferred: int) -> None:
+                if self.deadline is not None and time.monotonic() >= self.deadline:
+                    raise TimeoutError(f"R2 download timed out while streaming: {r2_key}")
+
+        self.client.download_file(
+            self.bucket,
+            r2_key,
+            str(local_path),
+            Callback=_DeadlineCallback(deadline_monotonic),
+        )
         logger.info("Downloaded r2://%s/%s -> %s", self.bucket, r2_key, local_path)
         return local_path
 
@@ -287,6 +311,8 @@ class R2Storage:
         run_name: str,
         epoch: int,
         local_dir: str | Path,
+        *,
+        deadline_monotonic: float | None = None,
     ) -> Path:
         """Download a checkpoint from R2 to a local directory."""
         prefix = f"{PREFIX_CHECKPOINTS}/{voice_id}/{run_name}/checkpoint-epoch-{epoch}/"
@@ -296,7 +322,11 @@ class R2Storage:
         objects = self.list_prefix(prefix)
         for obj in objects:
             relative = obj["key"][len(prefix) :]
-            self.download_file(obj["key"], local_dir / relative)
+            self.download_file(
+                obj["key"],
+                local_dir / relative,
+                deadline_monotonic=deadline_monotonic,
+            )
 
         logger.info(
             "Downloaded checkpoint (%d files) -> %s",
@@ -363,6 +393,8 @@ class R2Storage:
         voice_id: str,
         dataset_name: str,
         local_dir: str | Path,
+        *,
+        deadline_monotonic: float | None = None,
     ) -> Path:
         """Download a dataset from R2 to a local directory."""
         prefix = f"{PREFIX_DATASETS}/{voice_id}/{dataset_name}/" if dataset_name else f"{PREFIX_DATASETS}/{voice_id}/"
@@ -372,12 +404,22 @@ class R2Storage:
         objects = self.list_prefix(prefix)
         for obj in objects:
             relative = obj["key"][len(prefix) :]
-            self.download_file(obj["key"], local_dir / relative)
+            self.download_file(
+                obj["key"],
+                local_dir / relative,
+                deadline_monotonic=deadline_monotonic,
+            )
 
         logger.info("Downloaded dataset (%d files) -> %s", len(objects), local_dir)
         return local_dir
 
-    def download_prefix(self, prefix: str, local_dir: str | Path) -> Path:
+    def download_prefix(
+        self,
+        prefix: str,
+        local_dir: str | Path,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> Path:
         """Download every object under a prefix into a local directory."""
         normalized_prefix = prefix.rstrip("/") + "/"
         local_dir = Path(local_dir)
@@ -388,7 +430,11 @@ class R2Storage:
             relative = obj["key"][len(normalized_prefix) :]
             if not relative:
                 continue
-            self.download_file(obj["key"], local_dir / relative)
+            self.download_file(
+                obj["key"],
+                local_dir / relative,
+                deadline_monotonic=deadline_monotonic,
+            )
 
         logger.info(
             "Downloaded prefix (%d files) r2://%s/%s -> %s",

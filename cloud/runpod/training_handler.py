@@ -3,6 +3,7 @@ from __future__ import annotations
 # pyright: reportMissingImports=false
 import json
 import importlib
+import hashlib
 import logging
 import math
 import os
@@ -19,12 +20,12 @@ from typing import Any, Callable
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .r2_storage import R2Storage
+    from .r2_storage import PREFIX_PREPROCESS_CACHE, R2Storage
 else:
     try:
-        from .r2_storage import R2Storage
+        from .r2_storage import PREFIX_PREPROCESS_CACHE, R2Storage
     except ImportError:
-        from r2_storage import R2Storage
+        from r2_storage import PREFIX_PREPROCESS_CACHE, R2Storage
 
 LOGGER = logging.getLogger("training_handler")
 PREPARE_PROGRESS_RE = re.compile(
@@ -62,6 +63,12 @@ MAX_DUPLICATES_PER_TEXT = 2
 # validation and manual compare instead of only the latest few epochs.
 MAX_UPLOADED_CHECKPOINTS = 10
 HEARTBEAT_INTERVAL_SEC = 30.0
+DEFAULT_HOLDOUT_RATIO = 0.15
+MIN_HOLDOUT_RATIO = 0.10
+MAX_HOLDOUT_RATIO = 0.20
+MIN_HOLDOUT_SEGMENTS = 3
+MIN_TRAIN_SEGMENTS_AFTER_SPLIT = 12
+MIN_TRAIN_AUDIO_MIN_AFTER_SPLIT = 3.0
 
 
 @dataclass
@@ -91,6 +98,8 @@ class JobConfig:
     whisper_language: str | None = None  # None = auto-detect; e.g. "ko", "en", "zh", "ja"
     dataset_signature: str | None = None
     preprocess_cache_r2_prefix: str | None = None
+    holdout_ratio: float = DEFAULT_HOLDOUT_RATIO
+    split_seed: int | None = None
 
 
 class UnrecoverableError(Exception):
@@ -192,23 +201,33 @@ class WorkerReporter:
         dataset_signature: str,
         cache_r2_prefix: str,
         train_raw_r2_key: str,
+        train_clipped_r2_key: str | None,
+        control_holdout_r2_key: str | None,
         ref_audio_r2_key: str | None,
         reference_profile_r2_key: str | None,
         source_file_count: int | None,
         segments_created: int | None,
         segments_accepted: int | None,
         accepted_duration_min: float | None,
+        train_segments: int | None,
+        holdout_segments: int | None,
+        holdout_ratio: float | None,
     ) -> None:
         payload: dict[str, Any] = {
             "dataset_signature": dataset_signature,
             "cache_r2_prefix": cache_r2_prefix,
             "train_raw_r2_key": train_raw_r2_key,
+            "train_clipped_r2_key": train_clipped_r2_key,
+            "control_holdout_r2_key": control_holdout_r2_key,
             "ref_audio_r2_key": ref_audio_r2_key,
             "reference_profile_r2_key": reference_profile_r2_key,
             "source_file_count": source_file_count,
             "segments_created": segments_created,
             "segments_accepted": segments_accepted,
             "accepted_duration_min": accepted_duration_min,
+            "train_segments": train_segments,
+            "holdout_segments": holdout_segments,
+            "holdout_ratio": holdout_ratio,
         }
         self._post(f"/v1/internal/training/{self.job_id}/preprocess-cache", payload)
 
@@ -329,6 +348,47 @@ def resolve_finetune_dir() -> Path:
     )
 
 
+def _normalize_holdout_ratio(value: Any) -> float:
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_HOLDOUT_RATIO
+    if not math.isfinite(ratio):
+        return DEFAULT_HOLDOUT_RATIO
+    return max(MIN_HOLDOUT_RATIO, min(MAX_HOLDOUT_RATIO, ratio))
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _report_int(report: dict[str, Any] | None, key: str) -> int | None:
+    if not report:
+        return None
+    value = report.get(key)
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return int(value)
+    return None
+
+
+def _report_float(report: dict[str, Any] | None, key: str) -> float | None:
+    if not report:
+        return None
+    value = report.get(key)
+    if isinstance(value, bool):
+        return float(int(value))
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+    return None
+
+
 def parse_job_config(raw: dict[str, Any]) -> JobConfig:
     required = [
         "voice_id",
@@ -371,6 +431,8 @@ def parse_job_config(raw: dict[str, Any]) -> JobConfig:
         preprocess_cache_r2_prefix=(
             str(raw.get("preprocess_cache_r2_prefix", "")).strip() or None
         ),
+        holdout_ratio=_normalize_holdout_ratio(raw.get("holdout_ratio", DEFAULT_HOLDOUT_RATIO)),
+        split_seed=_optional_int(raw.get("split_seed")),
     )
     # Normalize whisper_language: "auto" or empty → None (auto-detect)
     if cfg.whisper_language and cfg.whisper_language.lower() == "auto":
@@ -779,6 +841,102 @@ def _normalize_text(text: str) -> str:
     return NORMALIZED_TEXT_RE.sub("", (text or "").strip().lower())
 
 
+def _stable_hash_fraction(seed: int, key: str) -> float:
+    digest = hashlib.sha256(f"{seed}:{key}".encode("utf-8")).digest()
+    value = int.from_bytes(digest[:8], "big", signed=False)
+    return value / float((1 << 64) - 1)
+
+
+def _split_train_vs_holdout(
+    rows: list[dict[str, Any]],
+    *,
+    holdout_ratio: float,
+    split_seed: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not rows:
+        return [], []
+
+    normalized_ratio = _normalize_holdout_ratio(holdout_ratio)
+    total = len(rows)
+    max_holdout_allowed = max(1, total - MIN_TRAIN_SEGMENTS_AFTER_SPLIT)
+    target_holdout = int(round(total * normalized_ratio))
+    target_holdout = max(MIN_HOLDOUT_SEGMENTS, target_holdout)
+    target_holdout = min(target_holdout, max_holdout_allowed)
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        source_key = str(row.get("_source_audio", "unknown"))
+        norm_text = str(row.get("_norm_text", ""))
+        group_key = f"{source_key}|{norm_text[:80]}"
+        grouped.setdefault(group_key, []).append(row)
+
+    group_order: list[tuple[float, str, int]] = []
+    for key, bucket in grouped.items():
+        score = _stable_hash_fraction(split_seed, key)
+        group_order.append((score, key, len(bucket)))
+    group_order.sort(key=lambda item: (item[0], item[1]))
+
+    holdout_keys: set[str] = set()
+    holdout_count = 0
+    for _, key, count in group_order:
+        if holdout_count >= target_holdout:
+            break
+        if holdout_count + count > max_holdout_allowed and holdout_count > 0:
+            continue
+        holdout_keys.add(key)
+        holdout_count += count
+
+    train_rows: list[dict[str, Any]] = []
+    holdout_rows: list[dict[str, Any]] = []
+    for row in rows:
+        source_key = str(row.get("_source_audio", "unknown"))
+        norm_text = str(row.get("_norm_text", ""))
+        group_key = f"{source_key}|{norm_text[:80]}"
+        if group_key in holdout_keys:
+            holdout_rows.append(row)
+        else:
+            train_rows.append(row)
+
+    if len(holdout_rows) < MIN_HOLDOUT_SEGMENTS:
+        needed = min(
+            MIN_HOLDOUT_SEGMENTS - len(holdout_rows),
+            max(0, len(train_rows) - MIN_TRAIN_SEGMENTS_AFTER_SPLIT),
+        )
+        if needed > 0:
+            train_rows.sort(
+                key=lambda row: (
+                    _stable_hash_fraction(
+                        split_seed,
+                        f"{row.get('_source_audio', 'unknown')}|{row.get('_norm_text', '')[:80]}",
+                    ),
+                    str(row.get("audio", "")),
+                )
+            )
+            holdout_rows.extend(train_rows[:needed])
+            train_rows = train_rows[needed:]
+
+    if len(train_rows) < MIN_TRAIN_SEGMENTS_AFTER_SPLIT:
+        deficit = MIN_TRAIN_SEGMENTS_AFTER_SPLIT - len(train_rows)
+        if deficit > 0 and holdout_rows:
+            holdout_rows.sort(
+                key=lambda row: (
+                    _stable_hash_fraction(
+                        split_seed,
+                        f"{row.get('_source_audio', 'unknown')}|{row.get('_norm_text', '')[:80]}",
+                    ),
+                    str(row.get("audio", "")),
+                ),
+                reverse=True,
+            )
+            move_back = holdout_rows[:deficit]
+            train_rows.extend(move_back)
+            holdout_rows = holdout_rows[deficit:]
+
+    train_rows.sort(key=lambda row: str(row.get("audio", "")))
+    holdout_rows.sort(key=lambda row: str(row.get("audio", "")))
+    return train_rows, holdout_rows
+
+
 def _compute_signal_metrics(audio_path: Path) -> dict[str, float]:
     import numpy as np
     import soundfile as sf
@@ -813,6 +971,8 @@ def _compute_signal_metrics(audio_path: Path) -> dict[str, float]:
 def preprocess_raw_audio(
     dataset_dir: Path, output_jsonl: Path, status: StatusWriter,
     whisper_language: str | None = None,
+    holdout_ratio: float = DEFAULT_HOLDOUT_RATIO,
+    split_seed: int | None = None,
 ) -> dict[str, Any]:
     import torch
 
@@ -890,6 +1050,7 @@ def preprocess_raw_audio(
     segments_dir.mkdir(parents=True, exist_ok=True)
 
     all_segments: list[Path] = []
+    segment_meta: dict[str, dict[str, Any]] = {}
     seg_index = 1
     status.write(
         {
@@ -937,6 +1098,11 @@ def preprocess_raw_audio(
                 ),
             )
             all_segments.append(out_path)
+            segment_meta[str(out_path)] = {
+                "source_audio": wav_path.name,
+                "source_start_sec": float(start_sec),
+                "source_duration_sec": float(dur_sec),
+            }
 
         status.write(
             {
@@ -1058,6 +1224,15 @@ def preprocess_raw_audio(
                 "_metrics": metrics,
                 "_norm_text": _normalize_text(text),
                 "_ref_score": ref_score,
+                "_source_audio": str(
+                    segment_meta.get(str(seg_path), {}).get("source_audio", "unknown")
+                ),
+                "_source_start_sec": float(
+                    segment_meta.get(str(seg_path), {}).get("source_start_sec", 0.0)
+                ),
+                "_source_duration_sec": float(
+                    segment_meta.get(str(seg_path), {}).get("source_duration_sec", duration)
+                ),
             }
         )
 
@@ -1107,16 +1282,56 @@ def preprocess_raw_audio(
             "Upload more clean speech from the same speaker before training."
         )
 
-    if ref_candidates:
-        ref_candidates.sort(key=lambda item: item[0], reverse=True)
-        ref_audio_source = ref_candidates[0][1]
+    split_seed_value = split_seed if split_seed is not None else 0
+    train_rows, holdout_rows = _split_train_vs_holdout(
+        accepted_rows,
+        holdout_ratio=holdout_ratio,
+        split_seed=split_seed_value,
+    )
+
+    train_duration_min = (
+        sum(float(row.get("_duration", 0.0)) for row in train_rows) / 60.0
+        if train_rows
+        else 0.0
+    )
+    holdout_duration_min = (
+        sum(float(row.get("_duration", 0.0)) for row in holdout_rows) / 60.0
+        if holdout_rows
+        else 0.0
+    )
+
+    if (
+        len(train_rows) < MIN_TRAIN_SEGMENTS_AFTER_SPLIT
+        or train_duration_min < MIN_TRAIN_AUDIO_MIN_AFTER_SPLIT
+    ):
+        raise RuntimeError(
+            "Split quality gate failed after preprocessing: "
+            f"train_segments={len(train_rows)} (required >= {MIN_TRAIN_SEGMENTS_AFTER_SPLIT}), "
+            f"train_minutes={train_duration_min:.2f} (required >= {MIN_TRAIN_AUDIO_MIN_AFTER_SPLIT:.2f})."
+        )
+
+    train_ref_candidates = [
+        (float(row.get("_ref_score", 0.0)), Path(str(row.get("audio", ""))))
+        for row in train_rows
+        if IDEAL_REF_MIN_SEC <= float(row.get("_duration", 0.0)) <= IDEAL_REF_MAX_SEC
+    ]
+    if train_ref_candidates:
+        train_ref_candidates.sort(key=lambda item: item[0], reverse=True)
+        ref_audio_source = train_ref_candidates[0][1]
     else:
-        accepted_rows.sort(key=lambda row: row["_confidence"], reverse=True)
-        ref_audio_source = Path(str(accepted_rows[0]["audio"]))
+        train_rows.sort(
+            key=lambda row: (
+                float(row.get("_ref_score", 0.0)),
+                float(row.get("_confidence", 0.0)),
+            ),
+            reverse=True,
+        )
+        ref_audio_source = Path(str(train_rows[0]["audio"]))
+
     reference_text = next(
         (
             str(row.get("text", "")).strip()
-            for row in accepted_rows
+            for row in (train_rows + holdout_rows)
             if str(row.get("audio", "")).strip() == str(ref_audio_source)
         ),
         "",
@@ -1126,25 +1341,72 @@ def preprocess_raw_audio(
     shutil.copyfile(ref_audio_source, ref_audio_path)
     LOGGER.info("Selected reference audio: %s", ref_audio_path)
 
+    train_records = [
+        {
+            "audio": row["audio"],
+            "text": row["text"],
+            "ref_audio": str(ref_audio_path),
+        }
+        for row in train_rows
+    ]
+    train_payload = "\n".join(
+        json.dumps(record, ensure_ascii=False) for record in train_records
+    )
     with output_jsonl.open("w", encoding="utf-8") as f:
-        for row in accepted_rows:
-            f.write(
-                json.dumps(
-                    {
-                        "audio": row["audio"],
-                        "text": row["text"],
-                        "ref_audio": str(ref_audio_path),
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
+        f.write(train_payload + "\n")
+
+    train_clipped_jsonl = dataset_dir / "train_clipped.jsonl"
+    with train_clipped_jsonl.open("w", encoding="utf-8") as f:
+        f.write(train_payload + "\n")
+
+    control_holdout_jsonl = dataset_dir / "control_holdout.jsonl"
+    holdout_records: list[dict[str, Any]] = []
+    for row in holdout_rows:
+        audio_abs = str(row.get("audio", "")).strip()
+        rel_audio = ""
+        if audio_abs:
+            try:
+                rel_audio = str(Path(audio_abs).resolve().relative_to(dataset_dir.resolve()))
+            except Exception:
+                rel_audio = Path(audio_abs).name
+        holdout_records.append(
+            {
+                "audio": audio_abs,
+                "audio_relpath": rel_audio,
+                "text": str(row.get("text", "")).strip(),
+                "ref_audio": str(ref_audio_path),
+                "source_audio": str(row.get("_source_audio", "unknown")),
+                "source_start_sec": float(row.get("_source_start_sec", 0.0)),
+                "source_duration_sec": float(row.get("_source_duration_sec", 0.0)),
+                "duration_sec": float(row.get("_duration", 0.0)),
+                "confidence": float(row.get("_confidence", 0.0)),
+            }
+        )
+    with control_holdout_jsonl.open("w", encoding="utf-8") as f:
+        for record in holdout_records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    holdout_ratio_realized = len(holdout_rows) / max(len(accepted_rows), 1)
 
     dataset_report = {
         "source_audio_files": len(source_audio),
         "segments_created": len(all_segments),
         "segments_accepted": len(accepted_rows),
         "accepted_duration_min": round(total_duration_min, 2),
+        "train_segments": len(train_rows),
+        "train_duration_min": round(train_duration_min, 2),
+        "holdout_segments": len(holdout_rows),
+        "holdout_duration_min": round(holdout_duration_min, 2),
+        "holdout_ratio": round(holdout_ratio_realized, 4),
+        "split_seed": split_seed_value,
+        "split_policy": {
+            "strategy": "deterministic_group_hash",
+            "group_key": "source_audio + normalized_text_prefix",
+            "requested_holdout_ratio": round(_normalize_holdout_ratio(holdout_ratio), 4),
+        },
+        "train_raw_jsonl": str(output_jsonl),
+        "train_clipped_jsonl": str(train_clipped_jsonl),
+        "control_holdout_jsonl": str(control_holdout_jsonl),
         "avg_confidence": round(
             sum(float(row.get("_confidence", 0.0)) for row in accepted_rows)
             / max(len(accepted_rows), 1),
@@ -1166,7 +1428,7 @@ def preprocess_raw_audio(
     LOGGER.info(
         "Generated %s with %d samples (%d raw files -> %d segments)",
         output_jsonl,
-        len(accepted_rows),
+        len(train_rows),
         len(source_audio),
         len(all_segments),
     )
@@ -1180,6 +1442,7 @@ def restore_preprocess_cache(
     cache_prefix: str,
     dataset_dir: Path,
     status: StatusWriter,
+    expected_holdout: bool,
 ) -> bool:
     cache_prefix = cache_prefix.strip().rstrip("/")
     if not cache_prefix:
@@ -1198,7 +1461,37 @@ def restore_preprocess_cache(
         }
     )
     r2.download_prefix(cache_prefix, dataset_dir)
-    restored = (dataset_dir / "train_raw.jsonl").exists()
+    train_raw_jsonl = dataset_dir / "train_raw.jsonl"
+    control_holdout_jsonl = dataset_dir / "control_holdout.jsonl"
+
+    restored = train_raw_jsonl.exists()
+    if restored:
+        try:
+            rewrite_jsonl_paths(train_raw_jsonl, dataset_dir)
+            validate_dataset(train_raw_jsonl)
+            if expected_holdout and not control_holdout_jsonl.exists():
+                raise ValueError("control_holdout.jsonl missing from preprocess cache")
+            if control_holdout_jsonl.exists():
+                rewrite_jsonl_paths(control_holdout_jsonl, dataset_dir)
+                validate_dataset(control_holdout_jsonl)
+        except Exception as exc:
+            LOGGER.warning("Preprocess cache restore validation failed: %s", exc)
+            restored = False
+            for stale in (
+                "train_raw.jsonl",
+                "train_clipped.jsonl",
+                "control_holdout.jsonl",
+                "ref_audio.wav",
+                "reference_profile.json",
+                "preprocess_report.json",
+            ):
+                stale_path = dataset_dir / stale
+                if stale_path.exists():
+                    stale_path.unlink()
+            for stale_dir in ("segments", "converted"):
+                stale_path = dataset_dir / stale_dir
+                if stale_path.exists() and stale_path.is_dir():
+                    shutil.rmtree(stale_path)
     status.write(
         {
             "status": "preprocessing",
@@ -1231,6 +1524,26 @@ def upload_preprocess_cache(
         return None
 
     r2.upload_file(train_raw_jsonl, f"{cache_prefix}/train_raw.jsonl", content_type="application/jsonl")
+    train_clipped_jsonl = dataset_dir / "train_clipped.jsonl"
+    train_clipped_key: str | None = None
+    if train_clipped_jsonl.exists():
+        train_clipped_key = f"{cache_prefix}/train_clipped.jsonl"
+        r2.upload_file(
+            train_clipped_jsonl,
+            train_clipped_key,
+            content_type="application/jsonl",
+        )
+
+    control_holdout_jsonl = dataset_dir / "control_holdout.jsonl"
+    control_holdout_key: str | None = None
+    if control_holdout_jsonl.exists():
+        control_holdout_key = f"{cache_prefix}/control_holdout.jsonl"
+        r2.upload_file(
+            control_holdout_jsonl,
+            control_holdout_key,
+            content_type="application/jsonl",
+        )
+
     ref_audio_path = dataset_dir / "ref_audio.wav"
     ref_audio_key: str | None = None
     if ref_audio_path.exists():
@@ -1263,28 +1576,17 @@ def upload_preprocess_cache(
             dataset_signature=dataset_signature,
             cache_r2_prefix=cache_prefix,
             train_raw_r2_key=f"{cache_prefix}/train_raw.jsonl",
+            train_clipped_r2_key=train_clipped_key,
+            control_holdout_r2_key=control_holdout_key,
             ref_audio_r2_key=ref_audio_key,
             reference_profile_r2_key=reference_profile_key,
-            source_file_count=(
-                int(preprocess_report.get("source_audio_files"))
-                if preprocess_report and preprocess_report.get("source_audio_files") is not None
-                else None
-            ),
-            segments_created=(
-                int(preprocess_report.get("segments_created"))
-                if preprocess_report and preprocess_report.get("segments_created") is not None
-                else None
-            ),
-            segments_accepted=(
-                int(preprocess_report.get("segments_accepted"))
-                if preprocess_report and preprocess_report.get("segments_accepted") is not None
-                else None
-            ),
-            accepted_duration_min=(
-                float(preprocess_report.get("accepted_duration_min"))
-                if preprocess_report and preprocess_report.get("accepted_duration_min") is not None
-                else None
-            ),
+            source_file_count=_report_int(preprocess_report, "source_audio_files"),
+            segments_created=_report_int(preprocess_report, "segments_created"),
+            segments_accepted=_report_int(preprocess_report, "segments_accepted"),
+            accepted_duration_min=_report_float(preprocess_report, "accepted_duration_min"),
+            train_segments=_report_int(preprocess_report, "train_segments"),
+            holdout_segments=_report_int(preprocess_report, "holdout_segments"),
+            holdout_ratio=_report_float(preprocess_report, "holdout_ratio"),
         )
 
     LOGGER.info("Uploaded preprocess cache to %s", cache_prefix)
@@ -1300,14 +1602,6 @@ def persist_preprocessed_dataset_artifacts(
     dataset_prefix = cfg.dataset_r2_prefix.strip().rstrip("/")
     if not dataset_prefix:
         return
-
-    train_raw_jsonl = dataset_dir / "train_raw.jsonl"
-    if train_raw_jsonl.exists():
-        r2.upload_file(
-            train_raw_jsonl,
-            f"{dataset_prefix}/train_raw.jsonl",
-            content_type="application/jsonl",
-        )
 
     ref_audio_path = dataset_dir / "ref_audio.wav"
     ref_audio_key = f"{dataset_prefix}/ref_audio.wav"
@@ -1352,17 +1646,6 @@ def persist_preprocessed_dataset_artifacts(
             f"{dataset_prefix}/preprocess_report.json",
             content_type="application/json",
         )
-
-    segments_dir = dataset_dir / "segments"
-    if segments_dir.exists():
-        for seg_path in segments_dir.rglob("*"):
-            if seg_path.is_file():
-                relative = seg_path.relative_to(dataset_dir)
-                r2.upload_file(
-                    seg_path,
-                    f"{dataset_prefix}/{relative.as_posix()}",
-                    content_type="audio/wav",
-                )
 
 
 def run_prepare(
@@ -1744,6 +2027,8 @@ def main() -> int:
             raise UnrecoverableError(f"Dataset download failed: {exc}") from exc
 
         train_raw_jsonl = DATASET_DIR / "train_raw.jsonl"
+        control_holdout_jsonl = DATASET_DIR / "control_holdout.jsonl"
+        expected_holdout = _normalize_holdout_ratio(cfg.holdout_ratio) > 0
         generated_train_raw = False
         preprocess_report: dict[str, Any] | None = None
         if not train_raw_jsonl.exists():
@@ -1755,6 +2040,7 @@ def main() -> int:
                         cache_prefix=cfg.preprocess_cache_r2_prefix,
                         dataset_dir=DATASET_DIR,
                         status=status,
+                        expected_holdout=expected_holdout,
                     )
                 except Exception as exc:
                     LOGGER.warning("Failed to restore preprocess cache: %s", exc)
@@ -1771,6 +2057,8 @@ def main() -> int:
                         train_raw_jsonl,
                         status,
                         whisper_language=cfg.whisper_language,
+                        holdout_ratio=cfg.holdout_ratio,
+                        split_seed=cfg.split_seed if cfg.split_seed is not None else cfg.seed,
                     )
                 except (FileNotFoundError, RuntimeError) as exc:
                     raise UnrecoverableError(f"Preprocessing failed: {exc}") from exc
@@ -1794,9 +2082,52 @@ def main() -> int:
                 except Exception as exc:
                     LOGGER.warning("Failed to upload preprocess cache: %s", exc)
 
+        if train_raw_jsonl.exists() and expected_holdout and not control_holdout_jsonl.exists():
+            status.write(
+                {
+                    "status": "preprocessing",
+                    "message": "Prepared dataset missing control holdout; rebuilding preprocess artifacts...",
+                }
+            )
+            try:
+                preprocess_report = preprocess_raw_audio(
+                    DATASET_DIR,
+                    train_raw_jsonl,
+                    status,
+                    whisper_language=cfg.whisper_language,
+                    holdout_ratio=cfg.holdout_ratio,
+                    split_seed=cfg.split_seed if cfg.split_seed is not None else cfg.seed,
+                )
+            except (FileNotFoundError, RuntimeError) as exc:
+                raise UnrecoverableError(
+                    "Prepared dataset is missing control_holdout.jsonl and automatic rebuild failed: "
+                    f"{exc}"
+                ) from exc
+            generated_train_raw = True
+            try:
+                persist_preprocessed_dataset_artifacts(
+                    r2=r2,
+                    cfg=cfg,
+                    dataset_dir=DATASET_DIR,
+                )
+            except Exception as exc:
+                LOGGER.warning("Failed to persist preprocess artifacts into dataset prefix: %s", exc)
+            try:
+                upload_preprocess_cache(
+                    r2=r2,
+                    cfg=cfg,
+                    dataset_dir=DATASET_DIR,
+                    preprocess_report=preprocess_report,
+                    reporter=reporter,
+                )
+            except Exception as exc:
+                LOGGER.warning("Failed to upload preprocess cache: %s", exc)
+
         # Rewrite JSONL paths to match downloaded file locations
         if not generated_train_raw:
             rewrite_jsonl_paths(train_raw_jsonl, DATASET_DIR)
+            if control_holdout_jsonl.exists():
+                rewrite_jsonl_paths(control_holdout_jsonl, DATASET_DIR)
 
         # Validate dataset integrity (all files exist, required keys present)
         status.write({"status": "validating", "message": "Validating dataset..."})
@@ -1804,6 +2135,14 @@ def main() -> int:
             validate_dataset(train_raw_jsonl)
         except ValueError as exc:
             raise UnrecoverableError(f"Dataset validation failed: {exc}") from exc
+
+        if control_holdout_jsonl.exists():
+            try:
+                validate_dataset(control_holdout_jsonl)
+            except ValueError as exc:
+                raise UnrecoverableError(
+                    f"Control holdout validation failed: {exc}"
+                ) from exc
 
         # Ensure all audio is 24kHz (resample if needed)
         validate_audio_format(train_raw_jsonl)

@@ -260,6 +260,9 @@ const CAMPAIGN_ACTIVE_STATUSES = new Set<TrainingCampaignStatus>(['planning', 'r
 const DEFAULT_CAMPAIGN_ATTEMPT_COUNT = 3;
 const DEFAULT_CAMPAIGN_PARALLELISM = 1;
 const MAX_CAMPAIGN_ATTEMPTS = 12;
+const DEFAULT_TRAINING_JOBS_QUERY_LIMIT = 20;
+const DEFAULT_TRAINING_ADVICE_QUERY_LIMIT = 40;
+const MAX_TRAINING_JOBS_QUERY_LIMIT = 2000;
 
 type TrainingCampaignRequest = {
   voice_id?: string;
@@ -279,18 +282,22 @@ const ACTIVE_STAGE_STALE_MS: Record<string, number> = {
   uploading: 20 * 60 * 1000,
 };
 const MAX_STALL_RECOVERY_ATTEMPTS = 3;
-const DEFAULT_WORKER_PUBLIC_URL = 'https://qwen-tts-api.brian-367.workers.dev';
 const TRAINING_SWEEP_LIMIT = 100;
 const DEFAULT_MAX_ACTIVE_TRAINING_JOBS_PER_VOICE = 1;
 const DEFAULT_MAX_ACTIVE_TRAINING_JOBS_GLOBAL = 3;
 const DEFAULT_TRAINING_IMAGE_FALLBACKS = [
   'ghcr.io/bc-dunia/qwen3-tts-training@sha256:fd32cc16f8febc7ce23a08eea38b9b62beaa7819139895e241a8bdddb6bf2357',
 ];
+const DEFAULT_HOLDOUT_RATIO = 0.15;
+const MIN_HOLDOUT_RATIO = 0.10;
+const MAX_HOLDOUT_RATIO = 0.20;
 
 const REFERENCE_AUDIO_KEY_RE = /\/ref_audio\.[^/]+$/i;
 const RAW_DATASET_AUDIO_EXTENSIONS = new Set(['.wav', '.mp3', '.mp4', '.m4a', '.flac', '.aac']);
 const GENERATED_DATASET_FILENAMES = new Set([
   'train_raw.jsonl',
+  'train_clipped.jsonl',
+  'control_holdout.jsonl',
   'train_with_codes.jsonl',
   'ref_audio.wav',
   'reference_profile.json',
@@ -401,6 +408,22 @@ const toDatasetRelativePath = (value: string): string => {
     return trimmed.slice(TMP_DATASET_PREFIX.length).replace(/^\/+/, '');
   }
   return trimmed.replace(/^\/+/, '');
+};
+
+const normalizeHoldoutRatio = (value: unknown): number => {
+  const parsed = readNumber(value);
+  if (parsed === null) {
+    return DEFAULT_HOLDOUT_RATIO;
+  }
+  return Math.max(MIN_HOLDOUT_RATIO, Math.min(MAX_HOLDOUT_RATIO, parsed));
+};
+
+const resolveSplitSeed = (value: unknown, fallbackSeed: number): number => {
+  const parsed = readNumber(value);
+  if (parsed === null) {
+    return fallbackSeed;
+  }
+  return Math.trunc(parsed);
 };
 
 const buildPreprocessCacheEntryId = (cacheId: string, seq: number): string =>
@@ -599,6 +622,34 @@ const extractDatasetPrefixFromRefAudioKey = (
   return datasetPrefix;
 };
 
+const resolveCanonicalDatasetRefAudioKey = (
+  datasetPrefixRaw: string,
+  ...candidates: Array<string | null | undefined>
+): string | null => {
+  const datasetPrefix = stripSlashes(datasetPrefixRaw);
+  let hasCandidate = false;
+  for (const candidate of candidates) {
+    const trimmed = typeof candidate === 'string' ? candidate.trim() : '';
+    if (!trimmed) {
+      continue;
+    }
+    hasCandidate = true;
+    if (datasetPrefix && trimmed.startsWith(`${datasetPrefix}/`)) {
+      return trimmed;
+    }
+  }
+  if (datasetPrefix && hasCandidate) {
+    return `${datasetPrefix}/ref_audio.wav`;
+  }
+  for (const candidate of candidates) {
+    const trimmed = typeof candidate === 'string' ? candidate.trim() : '';
+    if (trimmed) {
+      return trimmed;
+    }
+  }
+  return null;
+};
+
 const resolveTrainingDatasetPrefix = (
   voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>,
   datasetName: string | undefined,
@@ -644,7 +695,11 @@ const buildDatasetSnapshot = async ({
   source_cache_id: preprocessCache?.cache_id ?? null,
   cache_r2_prefix: preprocessCache?.cache_r2_prefix ?? null,
   train_raw_r2_key: preprocessCache?.train_raw_r2_key ?? null,
-  ref_audio_r2_key: preprocessCache?.ref_audio_r2_key ?? voice.ref_audio_r2_key ?? null,
+  ref_audio_r2_key: resolveCanonicalDatasetRefAudioKey(
+    datasetPrefix,
+    voice.ref_audio_r2_key,
+    preprocessCache?.ref_audio_r2_key,
+  ),
   reference_profile_r2_key: preprocessCache?.reference_profile_r2_key ?? null,
   reference_text: referenceText,
   source_file_count: preprocessCache?.source_file_count ?? sourceFileCount,
@@ -702,7 +757,11 @@ const ensureDatasetSnapshot = async ({
     source_cache_id: preprocessCache?.cache_id ?? nextSnapshot.source_cache_id,
     cache_r2_prefix: preprocessCache?.cache_r2_prefix ?? nextSnapshot.cache_r2_prefix,
     train_raw_r2_key: preprocessCache?.train_raw_r2_key ?? nextSnapshot.train_raw_r2_key,
-    ref_audio_r2_key: preprocessCache?.ref_audio_r2_key ?? nextSnapshot.ref_audio_r2_key,
+    ref_audio_r2_key: resolveCanonicalDatasetRefAudioKey(
+      datasetPrefix,
+      nextSnapshot.ref_audio_r2_key,
+      preprocessCache?.ref_audio_r2_key,
+    ),
     reference_profile_r2_key:
       preprocessCache?.reference_profile_r2_key ?? nextSnapshot.reference_profile_r2_key,
     reference_text: referenceText ?? nextSnapshot.reference_text,
@@ -1028,6 +1087,546 @@ const resolvePromotionSettings = (
   return preset?.settings ?? voice.settings ?? {};
 };
 
+type HoldoutManifestEntry = {
+  seq: number;
+  text: string;
+  audioR2Key: string;
+};
+
+type HoldoutSampleMetrics = {
+  sampleSeq: number;
+  composite: number | null;
+  overall: number | null;
+  asr: number | null;
+  speaker: number | null;
+  style: number | null;
+  tone: number | null;
+  speed: number | null;
+  health: number | null;
+  duration: number | null;
+  error: string | null;
+};
+
+type HoldoutAggregate = {
+  checkpoint_prefix: string;
+  sample_count: number;
+  successful_samples: number;
+  avg_composite: number | null;
+  avg_overall: number | null;
+  avg_asr: number | null;
+  avg_speaker: number | null;
+  avg_style: number | null;
+  avg_tone: number | null;
+  avg_speed: number | null;
+  avg_health: number | null;
+  avg_duration: number | null;
+};
+
+type HoldoutComparisonResult = {
+  status:
+    | 'passed'
+    | 'failed'
+    | 'skipped_no_baseline'
+    | 'skipped_no_holdout'
+    | 'skipped_manifest_error'
+    | 'error';
+  reason: string;
+  holdout_manifest_key: string | null;
+  selected_samples: number;
+  paired_samples: number;
+  win_rate: number | null;
+  median_delta: number | null;
+  avg_delta: number | null;
+  candidate: HoldoutAggregate | null;
+  baseline: HoldoutAggregate | null;
+  failed_constraints: string[];
+  thresholds: Record<string, number>;
+  evaluated_at: number;
+};
+
+const pickHoldoutEntries = (
+  entries: HoldoutManifestEntry[],
+  maxSamples: number,
+): HoldoutManifestEntry[] => {
+  if (entries.length <= maxSamples) {
+    return entries;
+  }
+  const sorted = [...entries].sort((a, b) => a.seq - b.seq);
+  const picked: HoldoutManifestEntry[] = [];
+  const step = sorted.length / maxSamples;
+  for (let i = 0; i < maxSamples; i += 1) {
+    const index = Math.min(sorted.length - 1, Math.floor(i * step));
+    picked.push(sorted[index]);
+  }
+  const dedup = new Map<number, HoldoutManifestEntry>();
+  for (const item of picked) {
+    dedup.set(item.seq, item);
+  }
+  return [...dedup.values()].sort((a, b) => a.seq - b.seq);
+};
+
+const parseHoldoutManifestEntries = (
+  raw: string,
+  audioPrefix: string,
+): HoldoutManifestEntry[] => {
+  const normalizedPrefix = stripSlashes(audioPrefix);
+  const rows: HoldoutManifestEntry[] = [];
+
+  for (const [index, line] of raw.split(/\r?\n/).entries()) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+      const text = typeof parsed.text === 'string' ? parsed.text.trim() : '';
+      if (!text) {
+        continue;
+      }
+      const relAudio =
+        typeof parsed.audio_relpath === 'string' && parsed.audio_relpath.trim()
+          ? parsed.audio_relpath.trim().replace(/^\/+/, '')
+          : toDatasetRelativePath(String(parsed.audio ?? ''));
+      if (!relAudio) {
+        continue;
+      }
+      const audioR2Key = normalizedPrefix ? `${normalizedPrefix}/${relAudio}` : relAudio;
+      rows.push({
+        seq: index + 1,
+        text,
+        audioR2Key,
+      });
+    } catch {
+      continue;
+    }
+  }
+
+  return rows;
+};
+
+const parseQualityMetric = (
+  quality: Record<string, unknown>,
+  primary: string,
+  fallback?: string,
+): number | null => {
+  const primaryValue = readNumber(quality[primary]);
+  if (primaryValue !== null) {
+    return primaryValue;
+  }
+  if (!fallback) {
+    return null;
+  }
+  return readNumber(quality[fallback]);
+};
+
+const computeHoldoutComposite = (metrics: {
+  overall: number | null;
+  asr: number | null;
+  speaker: number | null;
+  style: number | null;
+  tone: number | null;
+  speed: number | null;
+  health: number | null;
+}): number | null => {
+  const styleValue =
+    metrics.style ??
+    (metrics.tone !== null && metrics.speed !== null
+      ? metrics.tone * 0.6 + metrics.speed * 0.4
+      : null);
+
+  const weighted: Array<{ value: number; weight: number }> = [];
+  if (metrics.speaker !== null) weighted.push({ value: metrics.speaker, weight: 0.35 });
+  if (styleValue !== null) weighted.push({ value: styleValue, weight: 0.25 });
+  if (metrics.asr !== null) weighted.push({ value: metrics.asr, weight: 0.2 });
+  if (metrics.health !== null) weighted.push({ value: metrics.health, weight: 0.1 });
+  if (metrics.overall !== null) weighted.push({ value: metrics.overall, weight: 0.1 });
+  if (weighted.length === 0) {
+    return null;
+  }
+  const totalWeight = weighted.reduce((acc, item) => acc + item.weight, 0) || 1;
+  return weighted.reduce((acc, item) => acc + item.value * item.weight, 0) / totalWeight;
+};
+
+const averageNullable = (values: Array<number | null>): number | null => {
+  const finite = values.filter((value): value is number => value !== null && Number.isFinite(value));
+  if (finite.length === 0) {
+    return null;
+  }
+  return finite.reduce((acc, value) => acc + value, 0) / finite.length;
+};
+
+const median = (values: number[]): number | null => {
+  if (values.length === 0) {
+    return null;
+  }
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) {
+    return sorted[mid];
+  }
+  return (sorted[mid - 1] + sorted[mid]) / 2;
+};
+
+const aggregateHoldoutMetrics = (
+  checkpointPrefix: string,
+  rows: HoldoutSampleMetrics[],
+): HoldoutAggregate => ({
+  checkpoint_prefix: checkpointPrefix,
+  sample_count: rows.length,
+  successful_samples: rows.filter((row) => row.error === null && row.composite !== null).length,
+  avg_composite: averageNullable(rows.map((row) => row.composite)),
+  avg_overall: averageNullable(rows.map((row) => row.overall)),
+  avg_asr: averageNullable(rows.map((row) => row.asr)),
+  avg_speaker: averageNullable(rows.map((row) => row.speaker)),
+  avg_style: averageNullable(rows.map((row) => row.style)),
+  avg_tone: averageNullable(rows.map((row) => row.tone)),
+  avg_speed: averageNullable(rows.map((row) => row.speed)),
+  avg_health: averageNullable(rows.map((row) => row.health)),
+  avg_duration: averageNullable(rows.map((row) => row.duration)),
+});
+
+const evaluateHoldoutSample = async ({
+  c,
+  voice,
+  job,
+  checkpointPrefix,
+  sample,
+  seed,
+  preset,
+}: {
+  c: Context<AppContext>;
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>;
+  job: TrainingJob;
+  checkpointPrefix: string;
+  sample: HoldoutManifestEntry;
+  seed: number;
+  preset: ValidationPreset | null;
+}): Promise<HoldoutSampleMetrics> => {
+  const languageHint = getValidationLanguageHint(voice, job);
+  const normalizedLanguage = normalizeValidationInferenceLanguage(languageHint);
+  const payload: Record<string, unknown> = {
+    text: sample.text,
+    voice_id: voice.voice_id,
+    speaker_name: voice.speaker_name,
+    model_id: voice.model_id ?? 'qwen3-tts-1.7b',
+    ...(normalizedLanguage ? { language: normalizedLanguage } : {}),
+    seed,
+    num_candidates: 1,
+    quality_review: {
+      enable_asr: true,
+      enable_speaker: true,
+      enable_style: true,
+      enable_speed: true,
+      allow_below_threshold: true,
+      reference_audio_key: sample.audioR2Key,
+      reference_text: sample.text,
+    },
+    checkpoint_info: {
+      r2_prefix: checkpointPrefix,
+      type: 'full',
+    },
+    ...(preset?.payload ?? {}),
+  };
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const syncResult = await invokeServerless(c.env, c.env.RUNPOD_ENDPOINT_ID, payload);
+    if (syncResult.autoAsync) {
+      continue;
+    }
+    const output = (syncResult.body.output ?? null) as
+      | { audio?: string; quality?: Record<string, unknown>; error?: unknown }
+      | null;
+    if (!output?.audio || !output.quality) {
+      continue;
+    }
+    const quality = output.quality;
+    const overall = parseQualityMetric(quality, 'overall_score');
+    const asr = parseQualityMetric(quality, 'asr_score', 'asr_similarity');
+    const speaker = parseQualityMetric(quality, 'speaker_score', 'speaker_cosine');
+    const style = parseQualityMetric(quality, 'style_score');
+    const tone = parseQualityMetric(quality, 'tone_score');
+    const speed = parseQualityMetric(quality, 'speed_score');
+    const health = parseQualityMetric(quality, 'health_score');
+    const duration = parseQualityMetric(quality, 'duration_score');
+    const composite = computeHoldoutComposite({
+      overall,
+      asr,
+      speaker,
+      style,
+      tone,
+      speed,
+      health,
+    });
+    return {
+      sampleSeq: sample.seq,
+      composite,
+      overall,
+      asr,
+      speaker,
+      style,
+      tone,
+      speed,
+      health,
+      duration,
+      error: composite === null ? 'missing_quality_metrics' : null,
+    };
+  }
+
+  return {
+    sampleSeq: sample.seq,
+    composite: null,
+    overall: null,
+    asr: null,
+    speaker: null,
+    style: null,
+    tone: null,
+    speed: null,
+    health: null,
+    duration: null,
+    error: 'runpod_quality_eval_failed',
+  };
+};
+
+const runHoldoutComparisonGate = async ({
+  c,
+  voice,
+  job,
+  candidatePrefix,
+  candidatePreset,
+}: {
+  c: Context<AppContext>;
+  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>;
+  job: TrainingJob;
+  candidatePrefix: string;
+  candidatePreset: string | null;
+}): Promise<HoldoutComparisonResult> => {
+  const baselinePrefix =
+    voice.status === 'ready' &&
+    typeof voice.checkpoint_r2_prefix === 'string' &&
+    voice.checkpoint_r2_prefix.trim() &&
+    voice.checkpoint_r2_prefix.trim() !== candidatePrefix
+      ? voice.checkpoint_r2_prefix.trim()
+      : null;
+
+  if (!baselinePrefix) {
+    return {
+      status: 'skipped_no_baseline',
+      reason: 'baseline checkpoint unavailable',
+      holdout_manifest_key: null,
+      selected_samples: 0,
+      paired_samples: 0,
+      win_rate: null,
+      median_delta: null,
+      avg_delta: null,
+      candidate: null,
+      baseline: null,
+      failed_constraints: [],
+      thresholds: {},
+      evaluated_at: Date.now(),
+    };
+  }
+
+  const datasetPrefix = String(job.dataset_r2_prefix ?? '').replace(/\/+$/, '');
+  const summary = (job.summary ?? {}) as Record<string, unknown>;
+  const summaryHoldoutKey =
+    typeof summary.preprocess_cache_control_holdout_r2_key === 'string'
+      ? summary.preprocess_cache_control_holdout_r2_key.trim()
+      : '';
+  const summaryCachePrefix =
+    typeof summary.preprocess_cache_r2_prefix === 'string'
+      ? summary.preprocess_cache_r2_prefix.trim().replace(/\/+$/, '')
+      : '';
+  const candidateKeys = uniqueNonEmpty([
+    summaryHoldoutKey,
+    datasetPrefix ? `${datasetPrefix}/${HOLDOUT_MANIFEST_FILE}` : null,
+    summaryCachePrefix ? `${summaryCachePrefix}/${HOLDOUT_MANIFEST_FILE}` : null,
+  ]);
+
+  let holdoutManifestKey: string | null = null;
+  let holdoutManifestRaw: string | null = null;
+  for (const key of candidateKeys) {
+    const obj = await c.env.R2.get(key);
+    if (!obj) {
+      continue;
+    }
+    holdoutManifestKey = key;
+    holdoutManifestRaw = await obj.text();
+    break;
+  }
+
+  if (!holdoutManifestKey || !holdoutManifestRaw) {
+    return {
+      status: 'skipped_no_holdout',
+      reason: 'control_holdout.jsonl not found',
+      holdout_manifest_key: holdoutManifestKey,
+      selected_samples: 0,
+      paired_samples: 0,
+      win_rate: null,
+      median_delta: null,
+      avg_delta: null,
+      candidate: null,
+      baseline: null,
+      failed_constraints: [],
+      thresholds: {},
+      evaluated_at: Date.now(),
+    };
+  }
+
+  const holdoutAudioPrefix = holdoutManifestKey.includes('/')
+    ? holdoutManifestKey.slice(0, holdoutManifestKey.lastIndexOf('/'))
+    : datasetPrefix;
+  const entries = parseHoldoutManifestEntries(holdoutManifestRaw, holdoutAudioPrefix);
+  if (entries.length === 0) {
+    return {
+      status: 'skipped_manifest_error',
+      reason: 'control_holdout manifest has no valid rows',
+      holdout_manifest_key: holdoutManifestKey,
+      selected_samples: 0,
+      paired_samples: 0,
+      win_rate: null,
+      median_delta: null,
+      avg_delta: null,
+      candidate: null,
+      baseline: null,
+      failed_constraints: [],
+      thresholds: {},
+      evaluated_at: Date.now(),
+    };
+  }
+
+  const pickedEntries = pickHoldoutEntries(entries, HOLDOUT_MAX_SAMPLES);
+  const lang =
+    typeof (job.config as Record<string, unknown>).whisper_language === 'string'
+      ? String((job.config as Record<string, unknown>).whisper_language).toLowerCase()
+      : String(voice.labels?.language ?? '').toLowerCase();
+  const preset =
+    getValidationPresets(voice.model_id ?? 'qwen3-tts-1.7b', lang).find(
+      (value) => value.name === candidatePreset,
+    ) ?? getValidationPresets(voice.model_id ?? 'qwen3-tts-1.7b', lang)[0] ?? null;
+
+  const baselineMetrics: HoldoutSampleMetrics[] = [];
+  const candidateMetrics: HoldoutSampleMetrics[] = [];
+  const deltas: number[] = [];
+  let wins = 0;
+
+  for (let i = 0; i < pickedEntries.length; i += 1) {
+    const sample = pickedEntries[i];
+    const seedBase = 991733 + sample.seq + i * 17;
+    const baseline = await evaluateHoldoutSample({
+      c,
+      voice,
+      job,
+      checkpointPrefix: baselinePrefix,
+      sample,
+      seed: seedBase,
+      preset,
+    });
+    const candidate = await evaluateHoldoutSample({
+      c,
+      voice,
+      job,
+      checkpointPrefix: candidatePrefix,
+      sample,
+      seed: seedBase,
+      preset,
+    });
+    baselineMetrics.push(baseline);
+    candidateMetrics.push(candidate);
+    if (baseline.composite !== null && candidate.composite !== null) {
+      const delta = candidate.composite - baseline.composite;
+      deltas.push(delta);
+      if (delta > 0) {
+        wins += 1;
+      }
+    }
+  }
+
+  const pairedSamples = deltas.length;
+  const candidateAgg = aggregateHoldoutMetrics(candidatePrefix, candidateMetrics);
+  const baselineAgg = aggregateHoldoutMetrics(baselinePrefix, baselineMetrics);
+  const winRate = pairedSamples > 0 ? wins / pairedSamples : null;
+  const medianDelta = median(deltas);
+  const avgDelta = pairedSamples > 0 ? deltas.reduce((acc, value) => acc + value, 0) / pairedSamples : null;
+
+  const failedConstraints: string[] = [];
+  const minPairedByRatio = Math.ceil(pickedEntries.length * HOLDOUT_MIN_PAIRED_RATIO);
+  const minPairedRequired = Math.max(HOLDOUT_MIN_PAIRED_SAMPLES, minPairedByRatio);
+  if (pairedSamples < minPairedRequired) {
+    failedConstraints.push(`paired_samples<${minPairedRequired}`);
+  }
+  if (winRate === null || winRate < HOLDOUT_WIN_RATE_MIN) {
+    failedConstraints.push(`win_rate<${HOLDOUT_WIN_RATE_MIN}`);
+  }
+  if (medianDelta === null || medianDelta < HOLDOUT_MEDIAN_DELTA_MIN) {
+    failedConstraints.push(`median_delta<${HOLDOUT_MEDIAN_DELTA_MIN}`);
+  }
+  if (avgDelta === null || avgDelta < HOLDOUT_AVG_DELTA_MIN) {
+    failedConstraints.push(`avg_delta<${HOLDOUT_AVG_DELTA_MIN}`);
+  }
+  if (
+    candidateAgg.avg_asr !== null &&
+    baselineAgg.avg_asr !== null &&
+    candidateAgg.avg_asr < baselineAgg.avg_asr - HOLDOUT_MAX_ASR_REGRESSION
+  ) {
+    failedConstraints.push(`asr_regression>${HOLDOUT_MAX_ASR_REGRESSION}`);
+  }
+  if (
+    candidateAgg.avg_health !== null &&
+    baselineAgg.avg_health !== null &&
+    candidateAgg.avg_health < baselineAgg.avg_health - HOLDOUT_MAX_HEALTH_REGRESSION
+  ) {
+    failedConstraints.push(`health_regression>${HOLDOUT_MAX_HEALTH_REGRESSION}`);
+  }
+  if (
+    candidateAgg.avg_speaker !== null &&
+    baselineAgg.avg_speaker !== null &&
+    candidateAgg.avg_speaker < baselineAgg.avg_speaker - HOLDOUT_MAX_SPEAKER_REGRESSION
+  ) {
+    failedConstraints.push(`speaker_regression>${HOLDOUT_MAX_SPEAKER_REGRESSION}`);
+  }
+
+  return {
+    status: failedConstraints.length === 0 ? 'passed' : 'failed',
+    reason:
+      failedConstraints.length === 0
+        ? 'candidate passed holdout comparison gate'
+        : `candidate failed holdout gate: ${failedConstraints.join(', ')}`,
+    holdout_manifest_key: holdoutManifestKey,
+    selected_samples: pickedEntries.length,
+    paired_samples: pairedSamples,
+    win_rate: winRate,
+    median_delta: medianDelta,
+    avg_delta: avgDelta,
+    candidate: candidateAgg,
+    baseline: baselineAgg,
+    failed_constraints: failedConstraints,
+    thresholds: {
+      min_paired_samples: HOLDOUT_MIN_PAIRED_SAMPLES,
+      min_paired_ratio: HOLDOUT_MIN_PAIRED_RATIO,
+      win_rate_min: HOLDOUT_WIN_RATE_MIN,
+      median_delta_min: HOLDOUT_MEDIAN_DELTA_MIN,
+      avg_delta_min: HOLDOUT_AVG_DELTA_MIN,
+      max_asr_regression: HOLDOUT_MAX_ASR_REGRESSION,
+      max_health_regression: HOLDOUT_MAX_HEALTH_REGRESSION,
+      max_speaker_regression: HOLDOUT_MAX_SPEAKER_REGRESSION,
+    },
+    evaluated_at: Date.now(),
+  };
+};
+
+const formatHoldoutGateNote = (comparison: HoldoutComparisonResult | null): string => {
+  if (!comparison) {
+    return '';
+  }
+  if (comparison.status === 'passed') {
+    return ` | holdout_gate=passed win_rate=${(comparison.win_rate ?? 0).toFixed(3)} median_delta=${(comparison.median_delta ?? 0).toFixed(3)}`;
+  }
+  if (comparison.status.startsWith('skipped_')) {
+    return ` | holdout_gate=${comparison.status}`;
+  }
+  return ` | holdout_gate=${comparison.status} reason=${comparison.reason}`;
+};
+
 const applyValidatedCheckpointOutcome = async ({
   c,
   voice,
@@ -1051,13 +1650,58 @@ const applyValidatedCheckpointOutcome = async ({
   selectedPreset: string | null;
   selectedScore: number | null;
   preservedScore: number | null;
+  holdoutComparison: HoldoutComparisonResult | null;
 }> => {
-  const decision = await chooseCheckpointAdoption({
+  let holdoutComparison: HoldoutComparisonResult;
+  try {
+    holdoutComparison = await runHoldoutComparisonGate({
+      c,
+      voice,
+      job,
+      candidatePrefix,
+      candidatePreset,
+    });
+  } catch (error) {
+    holdoutComparison = {
+      status: 'error',
+      reason: error instanceof Error ? error.message : 'holdout comparison failed',
+      holdout_manifest_key: null,
+      selected_samples: 0,
+      paired_samples: 0,
+      win_rate: null,
+      median_delta: null,
+      avg_delta: null,
+      candidate: null,
+      baseline: null,
+      failed_constraints: ['holdout_eval_runtime_error'],
+      thresholds: {},
+      evaluated_at: Date.now(),
+    };
+  }
+
+  let decision = await chooseCheckpointAdoption({
     c,
     voice,
     candidatePrefix,
     candidateScore,
   });
+
+  const currentPrefix =
+    typeof voice.checkpoint_r2_prefix === 'string' ? voice.checkpoint_r2_prefix.trim() : '';
+  const hasReadyBaseline =
+    voice.status === 'ready' &&
+    currentPrefix.length > 0 &&
+    currentPrefix !== candidatePrefix;
+  const shouldForceKeepCurrent = hasReadyBaseline && holdoutComparison.status === 'failed';
+  if (shouldForceKeepCurrent) {
+    decision = {
+      mode: 'keep_current',
+      preservedPrefix: currentPrefix,
+      preservedEpoch: voice.epoch,
+      preservedScore: await getCurrentReadyVoiceScore(c, voice),
+    };
+  }
+
   const promotedSettings = resolvePromotionSettings(voice, candidatePreset);
   const candidateRunName = parseRunNameFromCheckpointPrefix(candidatePrefix);
 
@@ -1116,6 +1760,7 @@ const applyValidatedCheckpointOutcome = async ({
       selectedPreset: candidatePreset,
       selectedScore: candidateScore,
       preservedScore: decision.preservedScore,
+      holdoutComparison,
     };
   }
 
@@ -1160,6 +1805,7 @@ const applyValidatedCheckpointOutcome = async ({
       selectedPreset: candidatePreset,
       selectedScore: candidateScore,
       preservedScore: decision.preservedScore,
+      holdoutComparison,
     };
   }
 
@@ -1194,6 +1840,7 @@ const applyValidatedCheckpointOutcome = async ({
     selectedPreset: 'kept_existing_best',
     selectedScore: decision.preservedScore,
     preservedScore: decision.preservedScore,
+    holdoutComparison,
   };
 };
 
@@ -1341,6 +1988,16 @@ const MIN_PASS_RATE_06B = 5 / 6;
 const MIN_PASS_RATE_17B = 5 / 6;
 const PROVISIONING_STALE_MS = 4 * 60 * 1000;
 const VALIDATION_RUN_STALE_MS = 6 * 60 * 1000;
+const HOLDOUT_MANIFEST_FILE = 'control_holdout.jsonl';
+const HOLDOUT_MAX_SAMPLES = 8;
+const HOLDOUT_MIN_PAIRED_SAMPLES = 4;
+const HOLDOUT_MIN_PAIRED_RATIO = 0.75;
+const HOLDOUT_WIN_RATE_MIN = 0.60;
+const HOLDOUT_MEDIAN_DELTA_MIN = 0.01;
+const HOLDOUT_AVG_DELTA_MIN = 0.005;
+const HOLDOUT_MAX_ASR_REGRESSION = 0.01;
+const HOLDOUT_MAX_HEALTH_REGRESSION = 0.01;
+const HOLDOUT_MAX_SPEAKER_REGRESSION = 0.015;
 
 const getRecommendedTrainingDefaults = getTrainingDefaults;
 const MAX_PROVISIONING_RECOVERY_ATTEMPTS = 2;
@@ -1356,7 +2013,10 @@ const resolveWorkerPublicUrl = (
     return new URL(requestUrl).origin;
   }
   const configured = env.WORKER_PUBLIC_URL?.trim();
-  return configured ? configured.replace(/\/+$/, '') : DEFAULT_WORKER_PUBLIC_URL;
+  if (configured) {
+    return configured.replace(/\/+$/, '');
+  }
+  throw new Error('WORKER_PUBLIC_URL is required when request origin is unavailable');
 };
 
 const getWorkerOrigin = (c: Context<AppContext>): string =>
@@ -1373,6 +2033,27 @@ const GHCR_INDEX_ACCEPT =
 
 const readNumber = domainReadNumber;
 const readTimestamp = domainReadTimestamp;
+
+const normalizeTrainingJobsQueryLimit = (
+  limitRaw: string | undefined,
+  fallback: number,
+): { requestedLimit: number; appliedLimit: number } => {
+  const parsedLimit = Number(limitRaw ?? String(fallback));
+  const requestedLimit = Number.isFinite(parsedLimit) ? Math.trunc(parsedLimit) : fallback;
+  const appliedLimit = Math.max(1, Math.min(requestedLimit, MAX_TRAINING_JOBS_QUERY_LIMIT));
+  return {
+    requestedLimit,
+    appliedLimit,
+  };
+};
+
+const normalizeTrainingJobsQueryOffset = (offsetRaw: string | undefined): number => {
+  const parsedOffset = Number(offsetRaw ?? '0');
+  if (!Number.isFinite(parsedOffset)) {
+    return 0;
+  }
+  return Math.max(0, Math.trunc(parsedOffset));
+};
 
 const getValidationRunStartedAt = (
   persistedState: Record<string, unknown> | null,
@@ -2007,6 +2688,8 @@ const getCampaignConfigKey = (config: TrainingConfig): string =>
     whisper_language: config.whisper_language ?? null,
     gpu_type_id: config.gpu_type_id ?? null,
     seed: config.seed ?? null,
+    holdout_ratio: (config as Record<string, unknown>).holdout_ratio ?? DEFAULT_HOLDOUT_RATIO,
+    split_seed: (config as Record<string, unknown>).split_seed ?? null,
   });
 
 const summarizeCampaignFailures = (jobs: TrainingJob[]): { asr: number; infra: number } => {
@@ -2290,6 +2973,11 @@ const enqueueCampaignAttempt = async (
   if (typeof requestedCfg.whisper_language === 'string' && requestedCfg.whisper_language.trim()) {
     effectiveConfig.whisper_language = requestedCfg.whisper_language.trim();
   }
+  effectiveConfig.holdout_ratio = normalizeHoldoutRatio(requestedCfg.holdout_ratio);
+  effectiveConfig.split_seed = resolveSplitSeed(
+    requestedCfg.split_seed,
+    Number(effectiveConfig.seed ?? recommendedDefaults.seed),
+  );
 
   const {
     datasetPrefix,
@@ -2397,6 +3085,12 @@ const enqueueCampaignAttempt = async (
         : 'miss',
     preprocess_cache_dataset_signature: datasetSignature,
     preprocess_cache_source_file_count: datasetSignatureInfo?.sourceCount ?? null,
+    dataset_split_holdout_ratio: Number(
+      (effectiveConfig as Record<string, unknown>).holdout_ratio ?? DEFAULT_HOLDOUT_RATIO,
+    ),
+    dataset_split_seed: Math.trunc(
+      Number((effectiveConfig as Record<string, unknown>).split_seed ?? effectiveConfig.seed ?? 0),
+    ),
     preprocess_cache_r2_prefix:
       datasetSnapshot.cache_r2_prefix ?? preprocessCache?.cache_r2_prefix ?? null,
     preprocess_cache_train_raw_r2_key:
@@ -2469,6 +3163,12 @@ const enqueueCampaignAttempt = async (
       typeof effectiveConfig.whisper_language === 'string'
         ? effectiveConfig.whisper_language
         : undefined,
+    holdout_ratio: Number(
+      (effectiveConfig as Record<string, unknown>).holdout_ratio ?? DEFAULT_HOLDOUT_RATIO,
+    ),
+    split_seed: Math.trunc(
+      Number((effectiveConfig as Record<string, unknown>).split_seed ?? effectiveConfig.seed ?? 0),
+    ),
     dataset_signature: datasetSignature,
     dataset_snapshot_id: datasetSnapshot.snapshot_id,
     preprocess_cache_r2_prefix:
@@ -2512,7 +3212,7 @@ const enqueueCampaignAttemptWithConfig = async (
       last_reasoning: plannerMeta.reasoning,
     },
   };
-  return enqueueCampaignAttempt(c, patchedCampaign, voice, 1, voiceJobs);
+  return enqueueCampaignAttempt(c, patchedCampaign, voice, attemptIndex, voiceJobs);
 };
 
 const fireResearchHookOnCampaignEnd = (
@@ -4608,19 +5308,26 @@ const advanceAsyncCheckpointValidation = async (
       candidateScore: champion.score,
     });
 
+    const holdoutRejected =
+      adoption.mode === 'keep_current' &&
+      adoption.holdoutComparison !== null &&
+      adoption.holdoutComparison.status === 'failed';
     const validationMessage =
       adoption.mode === 'keep_current'
-        ? `${champion.message} | kept current ready checkpoint score=${(adoption.preservedScore ?? 0).toFixed(3)} >= candidate_score=${champion.score.toFixed(3)}`
+        ? holdoutRejected
+          ? `${champion.message} | kept current ready checkpoint due to holdout gate`
+          : `${champion.message} | kept current ready checkpoint score=${(adoption.preservedScore ?? 0).toFixed(3)} >= candidate_score=${champion.score.toFixed(3)}`
         : adoption.mode === 'candidate'
           ? `${champion.message} | stored as candidate; production remains unchanged until promotion`
           : champion.message;
+    const validationMessageWithHoldout = `${validationMessage}${formatHoldoutGateNote(adoption.holdoutComparison)}`;
     const nextSummary = {
       ...currentSummary,
       force_revalidation: false,
       validation_in_progress: false,
       validation_checked: true,
       validation_passed: true,
-      validation_message: validationMessage,
+      validation_message: validationMessageWithHoldout,
       selected_checkpoint_prefix: adoption.selectedPrefix,
       selected_checkpoint_epoch: adoption.selectedEpoch,
       selected_preset: adoption.selectedPreset,
@@ -4630,6 +5337,9 @@ const advanceAsyncCheckpointValidation = async (
       candidate_preset: champion.preset_name,
       candidate_score: champion.score,
       candidate_promotion_mode: adoption.mode,
+      holdout_comparison: adoption.holdoutComparison,
+      holdout_gate_status: adoption.holdoutComparison?.status ?? null,
+      holdout_gate_reason: adoption.holdoutComparison?.reason ?? null,
       evaluated_checkpoints: evaluations,
       async_validation: null,
     };
@@ -5100,764 +5810,6 @@ const advanceAsyncCheckpointValidation = async (
   }
 
   return completeFailedValidation(checkpointEvaluation.message, nextEvaluations);
-};
-
-const advanceAsync06bCheckpointValidation = async (
-  c: Context<AppContext>,
-  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>,
-  job: TrainingJob,
-  progress: TrainingProgress,
-  currentSummary: Record<string, unknown>,
-  candidateCheckpoints: CheckpointCandidate[],
-): Promise<{ status: string; progress: TrainingProgress }> => {
-  const preset = getValidationPresets(
-    voice.model_id ?? 'qwen3-tts-0.6b',
-    typeof (job.config as Record<string, unknown>).whisper_language === 'string'
-      ? String((job.config as Record<string, unknown>).whisper_language).toLowerCase()
-      : String(voice.labels?.language ?? ''),
-  )[0];
-  const validationText = getValidationTexts(
-    typeof (job.config as Record<string, unknown>).whisper_language === 'string'
-      ? String((job.config as Record<string, unknown>).whisper_language).toLowerCase()
-      : '',
-    true,
-  )[0];
-  const seed = FAST_VALIDATION_SEEDS_OFFSET[0];
-
-  if (!preset || !validationText) {
-    return {
-      status: 'completed',
-      progress,
-    };
-  }
-
-  const persistedState =
-    currentSummary.async_validation && typeof currentSummary.async_validation === 'object'
-      ? (currentSummary.async_validation as Record<string, unknown>)
-      : null;
-  const existingEvaluations = Array.isArray(persistedState?.evaluations)
-    ? persistedState.evaluations
-        .map(normalizeCheckpointEvaluation)
-        .filter((value): value is CheckpointEvaluation => value !== null)
-    : [];
-
-  const referenceAudioKey =
-    typeof persistedState?.reference_audio_key === 'string' ||
-    persistedState?.reference_audio_key === null
-      ? (persistedState.reference_audio_key as string | null)
-      : null;
-  const referenceText =
-    typeof persistedState?.reference_text === 'string' ? persistedState.reference_text : '';
-
-  const startCheckpointValidation = async (
-    checkpointIndex: number,
-    evaluations: CheckpointEvaluation[],
-  ): Promise<{ status: string; progress: TrainingProgress }> => {
-    const checkpoint = candidateCheckpoints[checkpointIndex];
-    if (!checkpoint) {
-      await updateTrainingJob(c.env.DB, job.job_id, {
-        status: 'completed',
-        error_message: null,
-        completed_at: job.completed_at ?? Date.now(),
-        progress,
-        summary: {
-          ...currentSummary,
-          validation_in_progress: false,
-          validation_checked: true,
-          validation_passed: false,
-          validation_failed: true,
-          validation_rejected: true,
-          validation_message: 'No remaining checkpoints to validate',
-          selected_checkpoint_prefix: null,
-          selected_checkpoint_epoch: null,
-          selected_preset: null,
-          selected_score: null,
-          evaluated_checkpoints: evaluations,
-          async_validation: null,
-        },
-      });
-      return { status: 'completed', progress };
-    }
-    const reference =
-      referenceAudioKey !== null || referenceText
-        ? { referenceAudioKey, referenceText }
-        : await loadValidationReference(c, voice, job);
-    const payload = buildValidationPayload({
-      voice,
-      checkpointPrefix: checkpoint.r2_prefix,
-      preset,
-      validationText,
-      seed,
-      referenceAudioKey: reference.referenceAudioKey,
-      referenceText: reference.referenceText,
-      languageHint: getValidationLanguageHint(voice, job),
-    });
-    const runpodResponse = await invokeServerlessAsync(c.env, c.env.RUNPOD_ENDPOINT_ID, payload);
-    const nextState: Async06bValidationState = {
-      mode: 'fast_06b_async',
-      run_id: String(runpodResponse.id ?? ''),
-      run_started_at: Date.now(),
-      checkpoint_index: checkpointIndex,
-      checkpoint_epoch: checkpoint.epoch,
-      checkpoint_prefix: checkpoint.r2_prefix,
-      preset_name: preset.name,
-      validation_text: validationText,
-      seed,
-      reference_audio_key: reference.referenceAudioKey,
-      reference_text: reference.referenceText,
-      evaluations,
-    };
-    await updateTrainingJob(c.env.DB, job.job_id, {
-      status: 'completed',
-      completed_at: job.completed_at ?? Date.now(),
-      progress,
-      summary: {
-        ...currentSummary,
-        validation_in_progress: true,
-        validation_message: `Validating checkpoint epoch ${checkpoint.epoch} for 0.6B`,
-        async_validation: nextState,
-      },
-    });
-    return { status: 'completed', progress };
-  };
-
-  if (
-    !persistedState ||
-    String(persistedState.mode ?? '') !== 'fast_06b_async' ||
-    typeof persistedState.run_id !== 'string'
-  ) {
-    return startCheckpointValidation(existingEvaluations.length, existingEvaluations);
-  }
-
-  const currentIndex =
-    typeof persistedState.checkpoint_index === 'number' ? persistedState.checkpoint_index : 0;
-  const currentEpoch =
-    typeof persistedState.checkpoint_epoch === 'number'
-      ? persistedState.checkpoint_epoch
-      : candidateCheckpoints[currentIndex]?.epoch;
-  const currentPrefix =
-    typeof persistedState.checkpoint_prefix === 'string'
-      ? persistedState.checkpoint_prefix
-      : candidateCheckpoints[currentIndex]?.r2_prefix;
-
-  const runpodResponse = await getServerlessStatusOrSyntheticFailure(
-    c.env,
-    c.env.RUNPOD_ENDPOINT_ID,
-    persistedState.run_id,
-  );
-  const runStartedAt = getValidationRunStartedAt(persistedState, job);
-  const runAgeMs = Math.max(0, Date.now() - runStartedAt);
-  const rawRunStatus = String(runpodResponse.status ?? 'UNKNOWN');
-  const runTimedOut =
-    rawRunStatus !== 'COMPLETED' && rawRunStatus !== 'FAILED' && runAgeMs > VALIDATION_RUN_STALE_MS;
-  const runStatus = runTimedOut ? 'FAILED' : rawRunStatus;
-  if (runStatus !== 'COMPLETED' && runStatus !== 'FAILED') {
-    await updateTrainingJob(c.env.DB, job.job_id, {
-      status: 'completed',
-      completed_at: job.completed_at ?? Date.now(),
-      progress,
-      summary: {
-        ...currentSummary,
-        validation_in_progress: true,
-        validation_message: `Validation still running for checkpoint epoch ${currentEpoch} (${runStatus.toLowerCase()})`,
-        async_validation: {
-          ...persistedState,
-          run_started_at: runStartedAt,
-          evaluations: existingEvaluations,
-        },
-      },
-    });
-    return { status: 'completed', progress };
-  }
-
-  const output = (runpodResponse.output ?? null) as {
-    quality?: Record<string, unknown>;
-    audio?: string;
-    error?: unknown;
-  } | null;
-  let enrichedOutput = runStatus === 'COMPLETED' ? output : null;
-  if (enrichedOutput?.audio) {
-    try {
-      enrichedOutput = await enrichOutputWithReviewAsr({
-        env: c.env,
-        output: enrichedOutput,
-        expectedText: validationText,
-        languageHint: getValidationLanguageHint(voice, job),
-      });
-    } catch (error) {
-      enrichedOutput = annotateAsrFailure(enrichedOutput, error);
-    }
-  }
-  const asyncFailureDetail = runTimedOut
-    ? `validation request timed out after ${Math.round(runAgeMs / 1000)}s`
-    : typeof enrichedOutput?.error === 'string'
-      ? enrichedOutput.error
-      : typeof runpodResponse.error === 'string'
-        ? runpodResponse.error
-        : `runpod_status=${runStatus.toLowerCase()}`;
-  const result =
-    runStatus === 'COMPLETED'
-      ? scoreSingleValidationOutput({
-          preset,
-          seed,
-          output: enrichedOutput,
-          fallbackError: typeof runpodResponse.error === 'string' ? runpodResponse.error : null,
-          referenceAudioKey: referenceAudioKey,
-          referenceText,
-          is06b: true,
-          minToneScore: 0.45,
-        })
-      : {
-          ok: false,
-          message: `All presets failed: preset=${preset.name} ${asyncFailureDetail}`,
-          aggregateScore: 0,
-          presetName: preset.name,
-          passedSamples: 0,
-          totalSamples: 1,
-        };
-
-  const nextEvaluations: CheckpointEvaluation[] = [
-    ...existingEvaluations,
-    {
-      epoch:
-        typeof currentEpoch === 'number' ? currentEpoch : candidateCheckpoints[currentIndex].epoch,
-      prefix:
-        typeof currentPrefix === 'string'
-          ? currentPrefix
-          : candidateCheckpoints[currentIndex].r2_prefix,
-      ok: result.ok,
-      score: result.aggregateScore,
-      message: result.message,
-      preset: result.presetName,
-      passed_samples: result.passedSamples,
-      total_samples: result.totalSamples,
-    },
-  ];
-
-  if (result.ok) {
-    const promotedPrefix =
-      typeof currentPrefix === 'string'
-        ? currentPrefix
-        : candidateCheckpoints[currentIndex].r2_prefix;
-    const promotedEpoch =
-      typeof currentEpoch === 'number' ? currentEpoch : candidateCheckpoints[currentIndex].epoch;
-    const adoption = await applyValidatedCheckpointOutcome({
-      c,
-      voice,
-      job,
-      candidatePrefix: promotedPrefix,
-      candidateEpoch: promotedEpoch,
-      candidatePreset: result.presetName,
-      candidateScore: result.aggregateScore,
-    });
-
-    const validationMessage =
-      adoption.mode === 'keep_current'
-        ? `${result.message} | kept current ready checkpoint score=${(adoption.preservedScore ?? 0).toFixed(3)} >= candidate_score=${result.aggregateScore.toFixed(3)}`
-        : adoption.mode === 'candidate'
-          ? `${result.message} | stored as candidate; production remains unchanged until promotion`
-          : result.message;
-    const nextSummary = {
-      ...currentSummary,
-      force_revalidation: false,
-      validation_in_progress: false,
-      validation_checked: true,
-      validation_passed: true,
-      validation_message: validationMessage,
-      selected_checkpoint_prefix: adoption.selectedPrefix,
-      selected_checkpoint_epoch: adoption.selectedEpoch,
-      selected_preset: adoption.selectedPreset,
-      selected_score: adoption.selectedScore,
-      candidate_checkpoint_prefix: promotedPrefix,
-      candidate_checkpoint_epoch: promotedEpoch,
-      candidate_preset: result.presetName,
-      candidate_score: result.aggregateScore,
-      candidate_promotion_mode: adoption.mode,
-      evaluated_checkpoints: nextEvaluations,
-      async_validation: null,
-    };
-    await updateTrainingJob(c.env.DB, job.job_id, {
-      status: 'completed',
-      completed_at: job.completed_at ?? Date.now(),
-      progress,
-      summary: nextSummary,
-      supervisor: {
-        ...(job.supervisor ?? {}),
-        phase: 'validation_completed',
-        outcome: adoption.mode,
-        last_validation_checkpoint_epoch: promotedEpoch,
-      },
-    });
-    await syncTrainingCheckoutLedgerForJob(c, job, nextSummary, job.completed_at ?? Date.now());
-    return { status: 'completed', progress };
-  }
-
-  const nextIndex = currentIndex + 1;
-  if (nextIndex < candidateCheckpoints.length) {
-    await updateTrainingJob(c.env.DB, job.job_id, {
-      status: 'completed',
-      completed_at: job.completed_at ?? Date.now(),
-      progress,
-      summary: {
-        ...currentSummary,
-        evaluated_checkpoints: nextEvaluations,
-      },
-    });
-    return startCheckpointValidation(nextIndex, nextEvaluations);
-  }
-
-  const keepReadyVoice = shouldKeepReadyVoiceOnValidationFailure(voice, currentSummary, {
-    evaluatedCheckpoints: nextEvaluations,
-    validationRunName: parseRunNameFromCheckpointPrefix(candidateCheckpoints[0]?.r2_prefix ?? ''),
-    forceRevalidation: currentSummary.force_revalidation === true,
-  });
-  if (!keepReadyVoice) {
-    await updateVoice(c.env.DB, job.voice_id, {
-      status: 'created',
-      checkpoint_r2_prefix: null,
-      run_name: null,
-      epoch: null,
-      checkpoint_preset: null,
-      checkpoint_score: null,
-      checkpoint_job_id: null,
-      candidate_checkpoint_r2_prefix: null,
-      candidate_run_name: null,
-      candidate_epoch: null,
-      candidate_preset: null,
-      candidate_score: null,
-      candidate_job_id: null,
-    });
-  }
-
-  if (job.round_id) {
-    await updateTrainingRound(c.env.DB, job.round_id, {
-      status: 'failed',
-      production_checkpoint_r2_prefix: keepReadyVoice ? voice.checkpoint_r2_prefix : null,
-      production_run_name: keepReadyVoice ? voice.run_name : null,
-      production_epoch: keepReadyVoice ? voice.epoch : null,
-      production_preset: keepReadyVoice ? voice.checkpoint_preset : null,
-      production_score: keepReadyVoice ? voice.checkpoint_score : null,
-      production_job_id: keepReadyVoice ? voice.checkpoint_job_id : null,
-      champion_checkpoint_r2_prefix: null,
-      champion_run_name: null,
-      champion_epoch: null,
-      champion_preset: null,
-      champion_score: null,
-      champion_job_id: null,
-      selected_checkpoint_r2_prefix: null,
-      selected_run_name: null,
-      selected_epoch: null,
-      selected_preset: null,
-      selected_score: null,
-      selected_job_id: null,
-      adoption_mode: null,
-      candidate_checkpoint_r2_prefix: null,
-      candidate_run_name: null,
-      candidate_epoch: null,
-      candidate_score: null,
-      candidate_job_id: null,
-      completed_at: Date.now(),
-      summary: {
-        ...(await getTrainingRound(c.env.DB, job.round_id))?.summary,
-        validation_message: result.message,
-        evaluated_checkpoints: nextEvaluations,
-      },
-    });
-  }
-
-  const nextSummary = {
-    ...currentSummary,
-    force_revalidation: false,
-    validation_in_progress: false,
-    validation_checked: true,
-    validation_passed: false,
-    validation_failed: true,
-    validation_rejected: true,
-    validation_message: result.message,
-    selected_checkpoint_prefix: null,
-    selected_checkpoint_epoch: null,
-    selected_preset: null,
-    selected_score: null,
-    evaluated_checkpoints: nextEvaluations,
-    async_validation: null,
-  };
-  await updateTrainingJob(c.env.DB, job.job_id, {
-    status: 'completed',
-    error_message: null,
-    completed_at: job.completed_at ?? Date.now(),
-    progress,
-    summary: nextSummary,
-    supervisor: {
-      ...(job.supervisor ?? {}),
-      phase: 'validation_failed',
-    },
-  });
-  await syncTrainingCheckoutLedgerForJob(c, job, nextSummary, job.completed_at ?? Date.now());
-  return { status: 'completed', progress };
-};
-
-const validateTrainedCheckpoint = async (
-  c: Context<AppContext>,
-  voice: NonNullable<Awaited<ReturnType<typeof getVoice>>>,
-  job: TrainingJob,
-  checkpointPrefix: string,
-): Promise<CheckpointValidationResult> => {
-  const jobConfig = job.config as Record<string, unknown>;
-  const lang =
-    typeof jobConfig.whisper_language === 'string' ? jobConfig.whisper_language.toLowerCase() : '';
-  const datasetPrefix = String(job.dataset_r2_prefix ?? '').replace(/\/+$/, '');
-  const presets = getValidationPresets(voice.model_id ?? 'qwen3-tts-1.7b', lang);
-  const is06b = String(voice.model_id ?? '')
-    .toLowerCase()
-    .includes('0.6b');
-  const validationTexts = getValidationTexts(lang, is06b);
-  const validationSeedOffsets = is06b ? FAST_VALIDATION_SEEDS_OFFSET : FULL_VALIDATION_SEEDS_OFFSET;
-  const totalSamples = validationTexts.length * validationSeedOffsets.length;
-  const minOverall = is06b ? 0.82 : 0.85;
-  const minPassRate = is06b ? MIN_PASS_RATE_06B : MIN_PASS_RATE_17B;
-  const minAsrScore = 0.8;
-  let referenceAudioKey =
-    voice.ref_audio_r2_key ?? (datasetPrefix ? `${datasetPrefix}/ref_audio.wav` : null);
-  let referenceText = '';
-
-  if (datasetPrefix) {
-    try {
-      const profileObj = await c.env.R2.get(`${datasetPrefix}/reference_profile.json`);
-      if (profileObj) {
-        const profile = (await profileObj.json()) as Record<string, unknown>;
-        if (typeof profile.reference_audio_key === 'string' && profile.reference_audio_key.trim()) {
-          referenceAudioKey = profile.reference_audio_key.trim();
-        }
-        if (typeof profile.reference_text === 'string') {
-          referenceText = profile.reference_text.trim();
-        }
-      }
-    } catch {
-      // Best-effort only. Validation can still proceed with ASR-only scoring.
-    }
-  }
-
-  let bestPassing: {
-    score: number;
-    message: string;
-    preset: ValidationPreset;
-  } | null = null;
-  let bestFailure: { passed: number; message: string; presetName: string } | null = null;
-
-  try {
-    for (const preset of presets) {
-      let passed = 0;
-      let noAudio = 0;
-      let infraIssues = 0;
-      let sumOverall = 0;
-      let sumDuration = 0;
-      let sumHealth = 0;
-      let sumAsr = 0;
-      let sumSpeaker = 0;
-      let sumTone = 0;
-      let sumSpeed = 0;
-      let sumStyle = 0;
-      let speakerSamples = 0;
-      let toneSamples = 0;
-      let speedSamples = 0;
-      let styleSamples = 0;
-      let firstFailureMessage: string | null = null;
-
-      for (let i = 0; i < validationTexts.length; i += 1) {
-        for (const seedOffset of validationSeedOffsets) {
-          const seed = seedOffset + i;
-          const languageHint = getValidationLanguageHint(voice, job);
-          const normalizedLanguage = normalizeValidationInferenceLanguage(languageHint);
-          const payload: Record<string, unknown> = {
-            text: validationTexts[i],
-            voice_id: voice.voice_id,
-            speaker_name: voice.speaker_name,
-            model_id: voice.model_id ?? 'qwen3-tts-1.7b',
-            ...(normalizedLanguage ? { language: normalizedLanguage } : {}),
-            seed,
-            quality_review: {
-              enable_asr: false,
-              enable_speaker: Boolean(referenceAudioKey),
-              enable_style: Boolean(referenceAudioKey),
-              enable_speed: Boolean(referenceAudioKey && referenceText),
-              allow_below_threshold: true,
-              reference_audio_key: referenceAudioKey,
-              reference_text: referenceText,
-            },
-            checkpoint_info: {
-              r2_prefix: checkpointPrefix,
-              type: 'full',
-            },
-            ...preset.payload,
-          };
-
-          let response: Record<string, unknown> | null = null;
-          let output: {
-            quality?: Record<string, unknown>;
-            audio?: string;
-            error?: unknown;
-          } | null = null;
-          let lastErrorDetail = 'unknown';
-
-          for (let attempt = 1; attempt <= VALIDATION_RETRY_ATTEMPTS; attempt += 1) {
-            const syncResult = await invokeServerless(c.env, c.env.RUNPOD_ENDPOINT_ID, payload);
-            if (syncResult.autoAsync) {
-              lastErrorDetail = 'validation exceeded sync timeout';
-              continue;
-            }
-            response = syncResult.body;
-            output = (response.output ?? {}) as {
-              quality?: Record<string, unknown>;
-              audio?: string;
-              error?: unknown;
-            };
-
-            if (output.audio) {
-              break;
-            }
-
-            const statusText = String(response.status ?? 'unknown');
-            const outputError =
-              typeof output.error === 'string'
-                ? output.error
-                : typeof response.error === 'string'
-                  ? String(response.error)
-                  : null;
-            lastErrorDetail = outputError ?? `status=${statusText} no-audio`;
-          }
-
-          if (!output?.audio) {
-            noAudio += 1;
-            const parsedOverall = parseOverallFromError(lastErrorDetail);
-            const msg =
-              parsedOverall !== null
-                ? `sample ${i + 1} seed ${seed} no audio overall_score=${parsedOverall.toFixed(3)}`
-                : `sample ${i + 1} seed ${seed} no audio (${lastErrorDetail})`;
-            if (!firstFailureMessage) {
-              firstFailureMessage = msg;
-            }
-            continue;
-          }
-
-          try {
-            output =
-              (await enrichOutputWithReviewAsr({
-                env: c.env,
-                output,
-                expectedText: validationTexts[i],
-                languageHint: getValidationLanguageHint(voice, job),
-              })) ?? output;
-          } catch (error) {
-            output = annotateAsrFailure(output, error);
-          }
-
-          const quality = output?.quality ?? {};
-          const overall = Number(quality.overall_score ?? NaN);
-          const duration = Number(quality.duration_score ?? NaN);
-          const health = Number(quality.health_score ?? NaN);
-          const asr = Number(quality.asr_score ?? quality.asr_similarity ?? NaN);
-          const speaker = Number(quality.speaker_score ?? NaN);
-          const tone = Number(quality.tone_score ?? NaN);
-          const speed = Number(quality.speed_score ?? NaN);
-          const style = Number(quality.style_score ?? NaN);
-
-          if (!Number.isFinite(overall) || !Number.isFinite(duration) || !Number.isFinite(health)) {
-            infraIssues += 1;
-            if (!firstFailureMessage) {
-              firstFailureMessage = `sample ${i + 1} seed ${seed} invalid quality metrics`;
-            }
-            continue;
-          }
-          if (!Number.isFinite(asr)) {
-            infraIssues += 1;
-            if (!firstFailureMessage) {
-              firstFailureMessage = getMissingAsrMessage(quality, i + 1, seed);
-            }
-            continue;
-          }
-          if (overall < minOverall) {
-            if (!firstFailureMessage) {
-              firstFailureMessage = `sample ${i + 1} seed ${seed} overall_score=${overall.toFixed(3)}`;
-            }
-            continue;
-          }
-          if (duration < 0.3) {
-            if (!firstFailureMessage) {
-              firstFailureMessage = `sample ${i + 1} seed ${seed} duration_score=${duration.toFixed(3)}`;
-            }
-            continue;
-          }
-          if (health < 0.72) {
-            if (!firstFailureMessage) {
-              firstFailureMessage = `sample ${i + 1} seed ${seed} health_score=${health.toFixed(3)}`;
-            }
-            continue;
-          }
-          if (Number.isFinite(asr) && asr < minAsrScore) {
-            if (!firstFailureMessage) {
-              firstFailureMessage = `sample ${i + 1} seed ${seed} asr_score=${asr.toFixed(3)}`;
-            }
-            continue;
-          }
-          if (
-            referenceAudioKey &&
-            Number.isFinite(speaker) &&
-            speaker < VALIDATION_GATE_THRESHOLDS.speaker_min
-          ) {
-            if (!firstFailureMessage) {
-              firstFailureMessage = `sample ${i + 1} seed ${seed} speaker_score=${speaker.toFixed(3)}`;
-            }
-            continue;
-          }
-          if (
-            referenceAudioKey &&
-            Number.isFinite(style) &&
-            style < (is06b ? 0.4 : VALIDATION_GATE_THRESHOLDS.style_min)
-          ) {
-            if (!firstFailureMessage) {
-              firstFailureMessage = `sample ${i + 1} seed ${seed} style_score=${style.toFixed(3)}`;
-            }
-            continue;
-          }
-          if (
-            referenceAudioKey &&
-            Number.isFinite(tone) &&
-            tone < (is06b ? 0.4 : VALIDATION_GATE_THRESHOLDS.tone_min)
-          ) {
-            if (!firstFailureMessage) {
-              firstFailureMessage = `sample ${i + 1} seed ${seed} tone_score=${tone.toFixed(3)}`;
-            }
-            continue;
-          }
-          if (
-            referenceAudioKey &&
-            referenceText &&
-            Number.isFinite(speed) &&
-            speed < VALIDATION_GATE_THRESHOLDS.speed_min
-          ) {
-            if (!firstFailureMessage) {
-              firstFailureMessage = `sample ${i + 1} seed ${seed} speed_score=${speed.toFixed(3)}`;
-            }
-            continue;
-          }
-
-          passed += 1;
-          sumOverall += overall;
-          sumDuration += duration;
-          sumHealth += health;
-          if (Number.isFinite(asr)) {
-            sumAsr += asr;
-          }
-          if (Number.isFinite(speaker)) {
-            sumSpeaker += speaker;
-            speakerSamples += 1;
-          }
-          if (Number.isFinite(tone)) {
-            sumTone += tone;
-            toneSamples += 1;
-          }
-          if (Number.isFinite(speed)) {
-            sumSpeed += speed;
-            speedSamples += 1;
-          }
-          if (Number.isFinite(style)) {
-            sumStyle += style;
-            styleSamples += 1;
-          }
-        }
-      }
-
-      const passRate = totalSamples > 0 ? passed / totalSamples : 0;
-      if (passed > 0 && passRate >= minPassRate && infraIssues === 0) {
-        const n = Math.max(1, passed);
-        const meanOverall = sumOverall / n;
-        const meanDuration = sumDuration / n;
-        const meanHealth = sumHealth / n;
-        const meanAsr = sumAsr / n;
-        const meanSpeaker = speakerSamples > 0 ? sumSpeaker / speakerSamples : NaN;
-        const meanTone = toneSamples > 0 ? sumTone / toneSamples : NaN;
-        const meanSpeed = speedSamples > 0 ? sumSpeed / speedSamples : NaN;
-        const meanStyle = styleSamples > 0 ? sumStyle / styleSamples : NaN;
-        const scoreParts = buildValidationScoreParts({
-          is06b: true,
-          overall: meanOverall,
-          asr: meanAsr,
-          health: meanHealth,
-          duration: meanDuration,
-          passRate,
-          speaker: meanSpeaker,
-          tone: meanTone,
-          speed: meanSpeed,
-          style: meanStyle,
-        });
-        const totalWeight = scoreParts.reduce((acc, part) => acc + part.weight, 0) || 1;
-        const score =
-          scoreParts.reduce((acc, part) => acc + part.value * part.weight, 0) / totalWeight;
-        const similaritySegments: string[] = [];
-        if (Number.isFinite(meanSpeaker)) {
-          similaritySegments.push(`speaker=${meanSpeaker.toFixed(3)}`);
-        }
-        if (Number.isFinite(meanStyle)) {
-          similaritySegments.push(`style=${meanStyle.toFixed(3)}`);
-        } else if (Number.isFinite(meanTone)) {
-          similaritySegments.push(`tone=${meanTone.toFixed(3)}`);
-        }
-        const similarityNote =
-          similaritySegments.length > 0 ? `${similaritySegments.join(' ')} ` : '';
-        const speedNote = Number.isFinite(meanSpeed) ? `speed=${meanSpeed.toFixed(3)} ` : '';
-        const message =
-          `preset=${preset.name} ` +
-          `score=${score.toFixed(3)} overall=${meanOverall.toFixed(3)} ` +
-          `asr=${meanAsr.toFixed(3)} ` +
-          similarityNote +
-          speedNote +
-          `health=${meanHealth.toFixed(3)} duration=${meanDuration.toFixed(3)} ` +
-          `samples=${passed}/${totalSamples} no_audio=${noAudio}`;
-        if (!bestPassing || score > bestPassing.score) {
-          bestPassing = { score, message, preset };
-        }
-      } else if (!bestFailure || passed > bestFailure.passed) {
-        const failureSummary =
-          firstFailureMessage ??
-          `samples=${passed}/${totalSamples} pass_rate=${passRate.toFixed(3)} no_audio=${noAudio} infra=${infraIssues}`;
-        bestFailure = {
-          passed,
-          message: `preset=${preset.name} ${failureSummary}`,
-          presetName: preset.name,
-        };
-      }
-    }
-
-    if (bestPassing) {
-      return {
-        ok: true,
-        message: bestPassing.message,
-        aggregateScore: bestPassing.score,
-        presetName: bestPassing.preset.name,
-        presetSettings: bestPassing.preset.settings,
-        passedSamples: totalSamples,
-        totalSamples,
-      };
-    }
-
-    return {
-      ok: false,
-      message: `All presets failed: ${bestFailure?.message ?? 'unknown'}`,
-      aggregateScore: 0,
-      presetName: bestFailure?.presetName ?? 'default',
-      passedSamples: bestFailure?.passed ?? 0,
-      totalSamples,
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      message: `Validation invocation failed: ${error instanceof Error ? error.message : 'unknown'}`,
-      aggregateScore: 0,
-      presetName: 'default',
-      passedSamples: 0,
-      totalSamples,
-    };
-  }
 };
 
 const reconcileJobStatus = async (
@@ -6357,6 +6309,11 @@ app.post('/campaigns', async (c) => {
   if (typeof baseCfg.whisper_language === 'string' && baseCfg.whisper_language.trim()) {
     normalizedBaseConfig.whisper_language = baseCfg.whisper_language.trim();
   }
+  normalizedBaseConfig.holdout_ratio = normalizeHoldoutRatio(baseCfg.holdout_ratio);
+  normalizedBaseConfig.split_seed = resolveSplitSeed(
+    baseCfg.split_seed,
+    Number(normalizedBaseConfig.seed ?? baseDefaults.seed),
+  );
 
   const baseNumEpochs = Number(normalizedBaseConfig.num_epochs ?? baseDefaults.num_epochs);
   const baseBatchSize = Number(normalizedBaseConfig.batch_size ?? baseDefaults.batch_size);
@@ -6553,6 +6510,11 @@ app.post('/start', async (c) => {
   if (typeof cfg.whisper_language === 'string' && cfg.whisper_language.trim()) {
     effectiveConfig.whisper_language = cfg.whisper_language.trim();
   }
+  effectiveConfig.holdout_ratio = normalizeHoldoutRatio(cfg.holdout_ratio);
+  effectiveConfig.split_seed = resolveSplitSeed(
+    cfg.split_seed,
+    Number(effectiveConfig.seed ?? recommendedDefaults.seed),
+  );
 
   const numEpochs = Number(effectiveConfig.num_epochs ?? recommendedDefaults.num_epochs);
   const batchSize = Number(effectiveConfig.batch_size ?? recommendedDefaults.batch_size);
@@ -6618,6 +6580,12 @@ app.post('/start', async (c) => {
         : 'miss',
     preprocess_cache_dataset_signature: datasetSignature,
     preprocess_cache_source_file_count: datasetSignatureInfo?.sourceCount ?? null,
+    dataset_split_holdout_ratio: Number(
+      (effectiveConfig as Record<string, unknown>).holdout_ratio ?? DEFAULT_HOLDOUT_RATIO,
+    ),
+    dataset_split_seed: Math.trunc(
+      Number((effectiveConfig as Record<string, unknown>).split_seed ?? effectiveConfig.seed ?? 0),
+    ),
     preprocess_cache_r2_prefix: preprocessCache?.cache_r2_prefix ?? null,
     preprocess_cache_train_raw_r2_key:
       preprocessCache?.train_raw_r2_key ?? (datasetHasPreparedTrainRaw ? datasetTrainRawKey : null),
@@ -6695,6 +6663,12 @@ app.post('/start', async (c) => {
       typeof effectiveConfig.whisper_language === 'string'
         ? effectiveConfig.whisper_language
         : undefined,
+    holdout_ratio: Number(
+      (effectiveConfig as Record<string, unknown>).holdout_ratio ?? DEFAULT_HOLDOUT_RATIO,
+    ),
+    split_seed: Math.trunc(
+      Number((effectiveConfig as Record<string, unknown>).split_seed ?? effectiveConfig.seed ?? 0),
+    ),
     dataset_signature: datasetSignature,
     dataset_snapshot_id: datasetSnapshot.snapshot_id,
     training_round_id: round.round_id,
@@ -6731,35 +6705,28 @@ app.post('/start', async (c) => {
 
 app.get('/jobs', async (c) => {
   const voiceId = c.req.query('voice_id')?.trim();
-  const limitRaw = c.req.query('limit');
-  const parsedLimit = Number(limitRaw ?? '20');
-  const limit = Number.isFinite(parsedLimit) ? parsedLimit : 20;
-
+  const offset = normalizeTrainingJobsQueryOffset(c.req.query('offset'));
+  const { requestedLimit, appliedLimit } = normalizeTrainingJobsQueryLimit(
+    c.req.query('limit'),
+    DEFAULT_TRAINING_JOBS_QUERY_LIMIT,
+  );
   const jobs = await listTrainingJobs(c.env.DB, {
     voice_id: voiceId || undefined,
-    limit,
+    limit: appliedLimit + 1,
+    offset,
   });
+  const hasMore = jobs.length > appliedLimit;
+  const visibleJobs = hasMore ? jobs.slice(0, appliedLimit) : jobs;
+  const nextOffset = hasMore ? offset + visibleJobs.length : null;
 
-  const hydratedJobs = await Promise.all(
-    jobs.map(async (job) => {
-      try {
-        if (
-          !ACTIVE_JOB_STATUSES.has(job.status) &&
-          !needsCompletedValidation(job) &&
-          !shouldRecoverFailedDependencyJob(c, job)
-        ) {
-          return job;
-        }
-        await reconcileJobStatusWithTimeout(c, job);
-        return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
-      } catch (error) {
-        console.warn(`Failed to hydrate training job ${job.job_id}:`, error);
-        return job;
-      }
-    }),
-  );
-
-  return c.json({ jobs: hydratedJobs.map(serializeTrainingJob) });
+  return c.json({
+    jobs: visibleJobs.map(serializeTrainingJob),
+    requested_limit: requestedLimit,
+    applied_limit: appliedLimit,
+    has_more: hasMore,
+    offset,
+    next_offset: nextOffset,
+  });
 });
 
 app.get('/advice', async (c) => {
@@ -6773,47 +6740,34 @@ app.get('/advice', async (c) => {
     return c.json({ detail: { message: 'Voice not found' } }, 404);
   }
 
-  const limitRaw = c.req.query('limit');
-  const parsedLimit = Number(limitRaw ?? '40');
-  const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(parsedLimit, 100)) : 40;
+  const { requestedLimit, appliedLimit } = normalizeTrainingJobsQueryLimit(
+    c.req.query('limit'),
+    DEFAULT_TRAINING_ADVICE_QUERY_LIMIT,
+  );
   const jobs = await listTrainingJobs(c.env.DB, {
     voice_id: voiceId,
-    limit,
+    limit: appliedLimit + 1,
   });
-
-  const hydratedJobs = await Promise.all(
-    jobs.map(async (job) => {
-      try {
-        if (
-          !ACTIVE_JOB_STATUSES.has(job.status) &&
-          !needsCompletedValidation(job) &&
-          !shouldRecoverFailedDependencyJob(c, job)
-        ) {
-          return job;
-        }
-        await reconcileJobStatusWithTimeout(c, job);
-        return (await getTrainingJob(c.env.DB, job.job_id)) ?? job;
-      } catch (error) {
-        console.warn(`Failed to hydrate training advice job ${job.job_id}:`, error);
-        return job;
-      }
-    }),
-  );
+  const hasMore = jobs.length > appliedLimit;
+  const visibleJobs = hasMore ? jobs.slice(0, appliedLimit) : jobs;
 
   let advice: ReturnType<typeof buildTrainingAdvice> = null;
   try {
-    advice = await buildLLMTrainingAdvice(c.env, voice, hydratedJobs);
+    advice = await buildLLMTrainingAdvice(c.env, voice, visibleJobs);
   } catch (error) {
     console.warn('LLM advisor error, falling back to heuristic:', error);
   }
   if (!advice) {
-    advice = buildTrainingAdvice(voice, hydratedJobs);
+    advice = buildTrainingAdvice(voice, visibleJobs);
   }
 
   return c.json({
     advice,
     voice_id: voiceId,
-    jobs_considered: hydratedJobs.length,
+    jobs_considered: visibleJobs.length,
+    requested_limit: requestedLimit,
+    applied_limit: appliedLimit,
+    has_more: hasMore,
   });
 });
 app.get('/rounds', async (c) => {
